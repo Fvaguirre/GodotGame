@@ -15,6 +15,7 @@ public partial class Hud : Control
     private const float Tau = Mathf.Pi * 2f;
 
     public Rect2 RPauseMusic, RPauseSens, RPauseResume, RPauseDmg, ROver, RChangeWitch;
+    public Rect2 ROverRetry, ROverCharSelect, ROverEnd;   // (NEW) MP game-over host options
     public Rect2 RPauseBloom, RPauseSsao, RPauseSsil;   // (NEW) post-processing toggles
     public Rect2[] RPauseGfx = new Rect2[3];             // (NEW) LOW / MED / HIGH preset buttons
     public Rect2[] RPauseBind = new Rect2[5];
@@ -39,6 +40,14 @@ public partial class Hud : Control
     {
         if (RScrollClose.HasPoint(pos)) return -1;
         for (int i = 0; i < RScroll.Length; i++) if (RScroll[i].Size.X > 0 && RScroll[i].HasPoint(pos)) return i;
+        return -2;
+    }
+    public Rect2[] RShop = new Rect2[12];
+    public Rect2 RShopClose = new Rect2();
+    public int ShopAt(Vector2 pos)
+    {
+        if (RShopClose.Size.X > 0 && RShopClose.HasPoint(pos)) return -1;
+        for (int i = 0; i < RShop.Length; i++) if (RShop[i].Size.X > 0 && RShop[i].HasPoint(pos)) return i;
         return -2;
     }
     public Rect2[] RWitch = { new Rect2(), new Rect2(), new Rect2(), new Rect2(), new Rect2(), new Rect2(), new Rect2() };   // 5th = Gale, 6th = Frost, 7th = Forsaken (NEW)
@@ -174,6 +183,12 @@ public partial class Hud : Control
         { var sp = Plot(g.VendorMystic.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 3.5f * u, new Color(0.4f, 0.95f, 0.9f, 0.95f)); }
         if (g.VendorScroll != null && GodotObject.IsInstanceValid(g.VendorScroll))
         { var sp = Plot(g.VendorScroll.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 3.5f * u, new Color(0.6f, 0.9f, 0.5f, 0.95f)); }
+        var orbCol = new Color(0.62f, 0.86f, 1f, 0.8f);   // (NEW) tiny XP-orb specks (persistent on the map)
+        foreach (var o in g.Orbs)
+        { if (o == null || !GodotObject.IsInstanceValid(o)) continue; var sp = Plot(o.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 1.1f * u, orbCol); }
+        if (g.NetMgr != null && g.NetMgr.Active)
+            foreach (var op in g.NetMgr.RemoteOrbPositions())
+            { var sp = Plot(op, out var ir); if (ir) DrawCircle(sp, 1.1f * u, orbCol); }
         foreach (var e in g.Enemies)
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
@@ -321,7 +336,7 @@ public partial class Hud : Control
         var p = g.Player;
 
         if (g.State == GameState.Lobby) return;
-        if (g.State == GameState.CharSelect) { DrawCharSelect(g, vp, u); DrawToast(g, vp, u); return; }
+        if (g.State == GameState.CharSelect) { DrawToast(g, vp, u); return; }   // the CharSelect Control node draws the roster now
 
         T(_head, new Vector2(m, m + 24 * u), $"Wave {g.Wave}", 26 * u, Gold, HorizontalAlignment.Left, -1, Mathf.RoundToInt(3 * u));
         T(_body, new Vector2(m, m + 50 * u), $"{g.Score} banished", 15 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
@@ -401,6 +416,7 @@ public partial class Hud : Control
         if (g.State == GameState.Roulette && p != null) DrawRoulette(g, p, c, vp, u);
         if (g.State == GameState.Mystic) DrawMystic(g, vp, u);
         if (g.State == GameState.Scroll && p != null) DrawScroll(g, p, vp, u);
+        if (g.State == GameState.Shop && p != null) DrawShop(g, p, vp, u);
         if (g.State == GameState.BindKey && p != null) DrawBindKey(g, p, vp, u);
         if (g.State == GameState.Pause) DrawPause(g, vp, u);
 
@@ -409,12 +425,33 @@ public partial class Hud : Control
             DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.62f));
             T(_head, new Vector2(0f, c.Y - 6 * u), "YOU FELL", 52 * u, new Color(0.95f, 0.4f, 0.45f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
             T(_body, new Vector2(0f, c.Y + 36 * u), $"Wave {g.Wave}  ·  {g.Score} banished  ·  best combo x{p?.BestCombo}", 18 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-            ROver = new Rect2(vp.X / 2f - 130 * u, c.Y + 64 * u, 260 * u, 32 * u);
-            Frame(ROver, new Color(0.95f, 0.4f, 0.45f, 0.6f), 1.5f * u);
-            T(_body, new Vector2(0f, c.Y + 70 * u), "Rise again   [Enter]", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-            RChangeWitch = new Rect2(vp.X / 2f - 130 * u, c.Y + 104 * u, 260 * u, 30 * u);
-            Frame(RChangeWitch, new Color(DamageTypes.Col(DamageType.Lunar).R, DamageTypes.Col(DamageType.Lunar).G, DamageTypes.Col(DamageType.Lunar).B, 0.6f), 1.5f * u);
-            T(_body, new Vector2(0f, c.Y + 109 * u), "Change witch   [C]", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+            ROver = RChangeWitch = ROverRetry = ROverCharSelect = ROverEnd = new Rect2();
+            bool mp = g.NetMgr != null && g.NetMgr.Active;
+            var viol = DamageTypes.Col(DamageType.Lunar);
+            if (!mp)   // solo — scene reload is fine
+            {
+                ROver = new Rect2(vp.X / 2f - 130 * u, c.Y + 64 * u, 260 * u, 32 * u);
+                Frame(ROver, new Color(0.95f, 0.4f, 0.45f, 0.6f), 1.5f * u);
+                T(_body, new Vector2(0f, c.Y + 70 * u), "Rise again   [Enter]", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+                RChangeWitch = new Rect2(vp.X / 2f - 130 * u, c.Y + 104 * u, 260 * u, 30 * u);
+                Frame(RChangeWitch, new Color(viol.R, viol.G, viol.B, 0.6f), 1.5f * u);
+                T(_body, new Vector2(0f, c.Y + 109 * u), "Change witch   [C]", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+            }
+            else if (g.NetMgr.IsHost)   // host decides for the whole group (keeps everyone connected)
+            {
+                float bw = 300 * u, bh = 34 * u, bx = vp.X / 2f - bw / 2f, by = c.Y + 60 * u;
+                void Opt(ref Rect2 r, string label, Color col)
+                {
+                    r = new Rect2(bx, by, bw, bh); Frame(r, new Color(col.R, col.G, col.B, 0.7f), 1.5f * u);
+                    T(_body, new Vector2(0f, by + 8 * u), label, 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+                    by += 44 * u;
+                }
+                Opt(ref ROverRetry, "Retry — same witches", new Color(0.5f, 0.9f, 0.55f));
+                Opt(ref ROverCharSelect, "Character Select", viol);
+                Opt(ref ROverEnd, "End Game", new Color(0.95f, 0.4f, 0.45f));
+            }
+            else   // client waits for the host's call
+                T(_body, new Vector2(0f, c.Y + 74 * u), "waiting for the host to decide…", 17 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
         }
 
         DrawToast(g, vp, u);
@@ -450,6 +487,9 @@ public partial class Hud : Control
         Player.UltKind.Blizzard => "Blizzard",             // (NEW)
         Player.UltKind.FrostElemental => "Frost Elemental",// (NEW)
         Player.UltKind.DeepFreeze => "Deep Freeze",        // (NEW)
+        Player.UltKind.HexCircle => "Hex Circle",          // (NEW)
+        Player.UltKind.LifeDrain => "Life Drain",          // (NEW)
+        Player.UltKind.LifeCurse => "Life Curse",          // (NEW)
         _ => "—"
     };
 
@@ -473,6 +513,9 @@ public partial class Hud : Control
         Player.UltKind.Blizzard => "Call a huge storm at your reticle — swirling snow and falling icicles grind every foe inside, with a chance to freeze them solid. Bigger + stronger + likelier to freeze as you upgrade it (10% → 50%).",   // (NEW)
         Player.UltKind.FrostElemental => "Summon a giant rolling snowball elemental that wanders the field toward the thickest crowds, grinding foes for frost damage and flinging the smaller ones as it rolls through them. Lasts longer at higher tiers; sized by AoE cards.",   // (NEW)
         Player.UltKind.DeepFreeze => "Ice over a large circle at your reticle — every foe inside is frozen solid on cast, and any that wander in during its brief active window freeze too.",   // (NEW)
+        Player.UltKind.HexCircle => "Curse the ground around you for ~10s: every foe inside is dragged into one huge shared tether-group and piles on curse stacks, so damage to any of them cascades across the whole crowd. (Plaguebearer: bigger, and the ground festers with a curse DoT.)",   // (NEW)
+        Player.UltKind.LifeDrain => "Rise into the air and fly freely (Space up / Ctrl down) while draining every foe in a wide radius — damaging them, healing you, and banking the stolen life. When it ends, detonate for the full banked amount. Fewer foes = you focus more on each. (Rapture: also drags them all toward you.)",   // (NEW)
+        Player.UltKind.LifeCurse => "Erupt a curse rune beneath you. Each foe takes a share of its MAX health — the LOWER your current HP, the bigger the share (up to half; bosses capped). A desperation nuke. (Blood Rite: siphons some of the damage back as health.)",   // (NEW)
         _ => ""
     };
 
@@ -771,6 +814,58 @@ public partial class Hud : Control
         Frame(RScrollClose, new Color(Gold.R, Gold.G, Gold.B, 0.5f), 1.5f * u);
         T(_body, new Vector2(RScrollClose.Position.X, RScrollClose.Position.Y + 8 * u), "leave  [Esc]", 14 * u, GoldDim, HorizontalAlignment.Center, RScrollClose.Size.X, Mathf.RoundToInt(1 * u));
         if (ttTitle != null) DrawTooltip(GetGlobalMousePosition(), vp, ttTitle, ttBody, ttCol, u);   // (NEW) hover description popup
+    }
+
+    // the peddler shop — 3 columns (boons / finishers / modifiers), 4 cards each, priced in gold; click to buy.
+    private void DrawShop(Game g, Player p, Vector2 vp, float u)
+    {
+        DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0.03f, 0.02f, 0.01f, 0.92f));
+        var gold = new Color(1f, 0.82f, 0.34f);
+        T(_head, new Vector2(0, vp.Y * 0.055f), "THE PEDDLER", 32 * u, gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
+        T(_body, new Vector2(0, vp.Y * 0.055f + 34 * u), $"gold: {g.Gold}", 16 * u, gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+
+        string[] heads = { "BOONS", "FINISHERS", "MODIFIERS" };
+        for (int i = 0; i < RShop.Length; i++) RShop[i] = new Rect2(-1, -1, 0, 0);
+        string ttTitle = null, ttBody = null; Color ttCol = gold;
+
+        float cw = 230 * u, chh = 74 * u, gx = 26 * u, gyy = 12 * u;
+        float totalW = 3 * cw + 2 * gx, x0 = vp.X / 2f - totalW / 2f, y0 = vp.Y * 0.22f;
+        for (int sec = 0; sec < 3; sec++)
+        {
+            float cx = x0 + sec * (cw + gx);
+            T(_head, new Vector2(cx, y0 - 28 * u), heads[sec], 15 * u, gold, HorizontalAlignment.Center, cw, Mathf.RoundToInt(2 * u));
+            for (int row = 0; row < 4; row++)
+            {
+                int idx = sec * 4 + row;
+                if (idx >= g.ShopCards.Count) continue;
+                var card = g.ShopCards[idx];
+                var r = new Rect2(cx, y0 + row * (chh + gyy), cw, chh);
+                RShop[idx] = r;
+                bool sold = g.ShopSold[idx];
+                bool empty = card == null;
+                Color rc = empty ? new Color(0.4f, 0.4f, 0.4f) : Rarities.Col(card.Rarity);
+                bool hover = !sold && !empty && r.HasPoint(GetGlobalMousePosition());
+                DrawRect(r, new Color(Panel.R, Panel.G, Panel.B, 0.96f));
+                DrawRect(r, new Color(rc.R, rc.G, rc.B, hover ? 0.28f : 0.13f));
+                Frame(r, hover ? gold : rc, (hover ? 3.5f : 2f) * u);
+                if (empty || sold)
+                {
+                    DrawRect(r, new Color(0f, 0f, 0f, 0.55f));
+                    T(_head, new Vector2(cx, r.Position.Y + chh / 2f - 9 * u), empty ? "—" : "SOLD", 15 * u, GoldDim, HorizontalAlignment.Center, cw, Mathf.RoundToInt(1 * u));
+                    continue;
+                }
+                int price = g.ShopPrices[idx];
+                bool afford = g.Gold >= price;
+                T(_head, new Vector2(cx, r.Position.Y + 12 * u), card.Title, 15 * u, Gold, HorizontalAlignment.Center, cw, Mathf.RoundToInt(2 * u));
+                T(_body, new Vector2(cx, r.Position.Y + 36 * u), Rarities.Name(card.Rarity), 11 * u, rc, HorizontalAlignment.Center, cw, Mathf.RoundToInt(1 * u));
+                T(_body, new Vector2(cx, r.Position.Y + 52 * u), $"{price} g", 14 * u, afford ? gold : new Color(0.82f, 0.35f, 0.30f), HorizontalAlignment.Center, cw, Mathf.RoundToInt(1 * u));
+                if (hover) { ttTitle = card.Title; ttBody = card.Desc; ttCol = rc; }
+            }
+        }
+        RShopClose = new Rect2(vp.X / 2f - 90 * u, vp.Y * 0.90f, 180 * u, 30 * u);
+        Frame(RShopClose, new Color(gold.R, gold.G, gold.B, 0.5f), 1.5f * u);
+        T(_body, new Vector2(RShopClose.Position.X, RShopClose.Position.Y + 8 * u), "leave  [Esc]", 14 * u, GoldDim, HorizontalAlignment.Center, RShopClose.Size.X, Mathf.RoundToInt(1 * u));
+        if (ttTitle != null) DrawTooltip(GetGlobalMousePosition(), vp, ttTitle, ttBody, ttCol, u);
     }
 
     private void DrawMinors(Player p, Vector2 vp, float u, float m)
@@ -1080,14 +1175,8 @@ public partial class Hud : Control
             var fill = e.IsGoblin ? new Color(1f, 0.84f, 0.3f) : new Color(0.95f, 0.3f, 0.32f).Lerp(new Color(0.45f, 0.9f, 0.4f), frac);
             DrawRect(new Rect2(x, y, w * frac, h), fill);
             Frame(new Rect2(x, y, w, h), e.Elite ? new Color(1f, 0.86f, 0.25f) : new Color(0, 0, 0, 0.7f), Mathf.Max(1f, 1.4f * u));
-            if (e.Frozen)   // (NEW) blue ice-block bar sits above the real HP bar; damage it to shatter
-            {
-                float by = y - h - 3f * u;
-                DrawRect(new Rect2(x - 1 * u, by - 1 * u, w + 2 * u, h + 2 * u), new Color(0, 0, 0, 0.6f));
-                DrawRect(new Rect2(x, by, w * e.FrozenBlueFrac, h), new Color(0.5f, 0.8f, 1f));
-                Frame(new Rect2(x, by, w, h), new Color(0.72f, 0.92f, 1f, 0.95f), Mathf.Max(1f, 1.4f * u));
-            }
-            else if (e.FreezeStacks > 0.5f)   // (NEW) freeze-stack indicator ❄ N/threshold
+            // (REMOVED the frozen blue "bank" bar — no banking now; the ice-block model already shows a foe is frozen/shatter-able)
+            if (!e.Frozen && e.FreezeStacks > 0.5f)   // (NEW) freeze-stack indicator ❄ N/threshold
             {
                 T(_body, new Vector2(x, y - 14f * u), $"\u2744 {Mathf.CeilToInt(e.FreezeStacks)}/{Mathf.CeilToInt(e.FreezeThreshold)}", 10f * u, new Color(0.62f, 0.86f, 1f), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
             }
@@ -1461,11 +1550,13 @@ public partial class Hud : Control
     public Rect2 RerollBtnRect() { var r = CardRect(0); float u = U; return new Rect2(r.Position.X, r.Position.Y + r.Size.Y + 38 * u, r.Size.X, 34 * u); }
     public Rect2 LuckBtnRect() { var r = CardRect(1); float u = U; return new Rect2(r.Position.X, r.Position.Y + r.Size.Y + 38 * u, r.Size.X, 34 * u); }
     public Rect2 Pick2BtnRect() { var r = CardRect(2); float u = U; return new Rect2(r.Position.X, r.Position.Y + r.Size.Y + 38 * u, r.Size.X, 34 * u); }
-    public int LevelUpBtn(Vector2 pos)   // 1 = reroll, 2 = lucky reroll, 3 = pick two, 100+i = disable card i, 0 = none
+    public Rect2 DeclineBtnRect() { var r0 = CardRect(0); var r2 = CardRect(2); float u = U; float x0 = r0.Position.X, right = r2.Position.X + r2.Size.X, w = (right - x0) * 0.44f; return new Rect2((x0 + right) / 2f - w / 2f, r0.Position.Y + r0.Size.Y + 78 * u, w, 30 * u); }
+    public int LevelUpBtn(Vector2 pos)   // 1 = reroll, 2 = lucky reroll, 3 = pick two, 4 = decline-for-gold, 100+i = disable card i, 0 = none
     {
         if (RerollBtnRect().HasPoint(pos)) return 1;
         if (LuckBtnRect().HasPoint(pos)) return 2;
         if (Pick2BtnRect().HasPoint(pos)) return 3;
+        if (DeclineBtnRect().HasPoint(pos)) return 4;
         var g = Game.I; int n = g?.Choices?.Count ?? 0;
         for (int i = 0; i < n; i++) if (BanBtnRect(i).HasPoint(pos)) return 100 + i;
         return 0;
@@ -1522,8 +1613,13 @@ public partial class Hud : Control
             var pr = Pick2BtnRect(); bool pcan = !g.Pick2Armed && g.Gold >= g.Pick2Cost; bool phov = pr.HasPoint(mouse);
             DrawRect(pr, g.Pick2Armed ? new Color(0.25f, 0.4f, 0.5f, 0.9f) : (phov && pcan ? new Color(0.2f, 0.4f, 0.5f, 0.96f) : (pcan ? new Color(0.14f, 0.3f, 0.38f, 0.85f) : new Color(0.22f, 0.22f, 0.24f, 0.7f))));
             T(_body, new Vector2(pr.Position.X, pr.Position.Y + 8 * u), g.Pick2Armed ? "PICK TWO — active" : $"PICK TWO  {g.Pick2Cost}g", 12 * u, new Color(0.6f, 0.85f, 1f), HorizontalAlignment.Center, pr.Size.X, Mathf.RoundToInt(1 * u));
+            // DECLINE for gold — forgo this pick entirely
+            var dr = DeclineBtnRect(); bool dhov = dr.HasPoint(mouse);
+            DrawRect(dr, dhov ? new Color(0.42f, 0.35f, 0.12f, 0.96f) : new Color(0.3f, 0.26f, 0.1f, 0.85f));
+            Frame(dr, dhov ? Gold : GoldDim, (dhov ? 2.5f : 1.5f) * u);
+            T(_body, new Vector2(dr.Position.X, dr.Position.Y + 7 * u), $"DECLINE — take {g.DeclineGold}g  (0)", 12 * u, new Color(1f, 0.9f, 0.42f), HorizontalAlignment.Center, dr.Size.X, Mathf.RoundToInt(1 * u));
         }
-        T(_body, new Vector2(0f, vp.Y * 0.34f + 290 * u), "click a card   ·   or press  1 / 2 / 3", 14 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(0f, vp.Y * 0.34f + 290 * u), "click a card   ·   press  1 / 2 / 3   ·   0 to decline for gold", 14 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
     }
 
     // ===== swap =====
@@ -1604,9 +1700,10 @@ public partial class Hud : Control
     {
         DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0.02f, 0.01f, 0.05f, 0.86f));
         bool prim = g.PendingAttune == 0;
-        T(_head, new Vector2(0f, vp.Y * 0.22f), prim ? "ATTUNE — PRIMARY" : "ATTUNE — SECONDARY", 34 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
-        T(_body, new Vector2(0f, vp.Y * 0.22f + 30 * u), prim ? "choose a new element for your left-click" : "choose a new element for your charged right-click", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        var current = prim ? p.PrimaryType : p.SecondaryType;
+        bool brand = g.PendingAttune == 2;
+        T(_head, new Vector2(0f, vp.Y * 0.22f), brand ? "CURSEBRAND — 2ND CURSE TYPE" : (prim ? "ATTUNE — PRIMARY" : "ATTUNE — SECONDARY"), 34 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
+        T(_body, new Vector2(0f, vp.Y * 0.22f + 30 * u), brand ? "cursed foes will take your bonus damage from this type too" : (prim ? "choose a new element for your left-click" : "choose a new element for your charged right-click"), 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        var current = brand ? (p.CurseBonusType2 >= 0 ? (DamageType)p.CurseBonusType2 : DamageType.Curse) : (prim ? p.PrimaryType : p.SecondaryType);
 
         var mouse = GetGlobalMousePosition();
         for (int i = 0; i < Game.Elements.Length; i++)

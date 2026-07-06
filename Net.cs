@@ -382,6 +382,12 @@ public partial class Net : Node
                     Game.I.AddChild(m); m.GlobalPosition = new Vector3(xs[i], 0f, zs[i]);
                     Game.I.RemoteMystic = m; _rvendors[id] = m;
                 }
+                else if (kinds[i] == 2)
+                {
+                    var sh = new ShopVendor { NetId = id, Remote = true };
+                    Game.I.AddChild(sh); sh.GlobalPosition = new Vector3(xs[i], 0f, zs[i]);
+                    Game.I.RemoteShop = sh; _rvendors[id] = sh;
+                }
                 else
                 {
                     var s = new ScrollVendor { NetId = id, Remote = true };
@@ -398,6 +404,7 @@ public partial class Net : Node
             {
                 if (Game.I.CurMystic == v) Game.I.RemoteMystic = null;
                 if (Game.I.CurScroll == v) Game.I.RemoteScroll = null;
+                if (Game.I.CurShop == v) Game.I.RemoteShop = null;
                 v.QueueFree();
             }
             _rvendors.Remove(id);
@@ -476,6 +483,18 @@ public partial class Net : Node
     {
         if (IsHost || Game.I == null) return;
         Game.I.GrantRewardLocal(cat);
+    }
+    // (NEW) mutator-clear reward: every warden gets a pick-3 with a guaranteed legendary
+    public void BroadcastMutatorReward()
+    {
+        if (!Active || !IsHost) return;
+        Rpc(nameof(ReceiveMutatorReward));
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveMutatorReward()
+    {
+        if (IsHost || Game.I == null) return;
+        Game.I.GrantMutatorRewardLocal();
     }
 
     // host -> clients: ritual lifecycle banners + sounds (kind: 0 spawned,1 started,2 success,3 fail)
@@ -742,13 +761,13 @@ public partial class Net : Node
     private void ReceiveSfx(int id, float x, float y, float z) { Game.I?.Sfx?.PlayNet(id, new Vector3(x, y, z)); }
 
     // wave/intermission state + vote tally — so clients see the skip prompt and can vote
-    public void BroadcastWaveState(int wave, float gap, int votes)
+    public void BroadcastWaveState(int wave, float gap, int votes, int mutator)
     {
         if (!Active) return;
-        Rpc(nameof(ReceiveWaveState), wave, gap, votes);
+        Rpc(nameof(ReceiveWaveState), wave, gap, votes, mutator);
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
-    private void ReceiveWaveState(int wave, float gap, int votes) { Game.I?.ApplyWaveState(wave, gap, votes); }
+    private void ReceiveWaveState(int wave, float gap, int votes, int mutator) { Game.I?.ApplyWaveState(wave, gap, votes, mutator); }
 
     // cast-pose animation — allies see each other's arm animations (Player.SetArm broadcasts through here)
     public void BroadcastArm(string kind, float dur)
@@ -891,6 +910,10 @@ public partial class Net : Node
             case 56: { var rt = new Vector3(dir.Z, 0, -dir.X).Normalized(); Game.I.Player?.SpawnFrostWalls(o, dir, rt, a, c); break; }   // Glacial Vise walls
             case 57: Game.I.SpawnCurseBeamSeg(o, dir.Normalized(), a); break;                       // Forsaken suck-beam
             case 58: Game.I.SpawnGroundSigil(o, a, c); Game.I.Sfx?.CurseCrush(o); break;                  // Forsaken voodoo-crush sigil + sound
+            case 59: Game.I.SpawnGroundSigil(o, a, c); break;                                             // Hex Circle field pulse (a=radius) — repeats while it's up
+            case 60: Game.I.VfxRing(o, c, a, 0.35f); break;                                               // Life Drain aura pulse (a=radius)
+            case 61: Game.I.SpawnGroundSigil(o, a, c); Game.I.VfxRing(o, c, a, 0.7f); Game.I.Sfx?.CurseCrush(o); break;   // Life Curse / Life Drain release burst
+            case 62: Game.I.SpawnMoonshard(o, a, remote: true, net: false); break;                                       // Moonfall asteroid ghost (a = size; visual only, host owns the damage)
         }
     }
 
@@ -988,6 +1011,13 @@ public partial class Net : Node
         foreach (var kv in _remotes) if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value)) list.Add(kv.Value.GlobalPosition);
         return list;
     }
+    // (NEW) client-side XP-orb ghost positions, for the minimap specks (host reads Game.Orbs directly)
+    public System.Collections.Generic.List<Vector3> RemoteOrbPositions()
+    {
+        var list = new System.Collections.Generic.List<Vector3>();
+        foreach (var kv in _rpickups) if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value) && kv.Value.Kind == 0) list.Add(kv.Value.GlobalPosition);
+        return list;
+    }
 
     // called by the LOCAL player when it goes down or gets revived
     public void LocalDowned(bool d)
@@ -1020,6 +1050,40 @@ public partial class Net : Node
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveGameOver() { Game.I?.GameOver(); }
+
+    // ---- char-select ready gate (NEW): every warden locks in, host waits for all, then broadcasts BeginRun ----
+    private readonly System.Collections.Generic.HashSet<long> _ready = new();
+    public void ResetReady() { _ready.Clear(); _downed.Clear(); if (Game.I != null) Game.I.ReadyCount = 0; }
+    public void ReportReady()
+    {
+        if (!Active) return;
+        if (IsHost) { _ready.Add(Multiplayer.GetUniqueId()); HostSyncReady(); }
+        else RpcId(1, nameof(HostReceiveReady));
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void HostReceiveReady() { if (IsHost) { _ready.Add(Multiplayer.GetRemoteSenderId()); HostSyncReady(); } }
+    private void HostSyncReady()
+    {
+        if (!IsHost) return;
+        int total = PlayerCount();
+        if (Game.I != null) Game.I.ReadyCount = _ready.Count;
+        if (NetConnected()) Rpc(nameof(ReceiveReadyCount), _ready.Count);   // update everyone's "X/Y ready" tally
+        if (_ready.Count >= total) { _ready.Clear(); if (NetConnected()) Rpc(nameof(ReceiveBeginRun)); Game.I?.BeginRunFromSelect(); }
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveReadyCount(int n) { if (Game.I != null) Game.I.ReadyCount = n; }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveBeginRun() { Game.I?.BeginRunFromSelect(); }
+
+    // ---- MP game-over decision (NEW): host chooses for the group; 0 = char-select, 1 = retry same witches, 2 = end ----
+    public void BroadcastGameOverChoice(int choice)
+    {
+        if (!IsHost) return;
+        if (NetConnected()) Rpc(nameof(ReceiveGameOverChoice), choice);
+        Game.I?.ApplyGameOverChoice(choice);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveGameOverChoice(int choice) { Game.I?.ApplyGameOverChoice(choice); }
 
     public bool NearestDownedAlly(Vector3 me, float range, out long peer, out float d2)
     {
@@ -1252,6 +1316,7 @@ public partial class Net : Node
         if (_ghostEnts.TryGetValue(id, out var gl)) { foreach (var g in gl) if (GodotObject.IsInstanceValid(g)) g.QueueFree(); _ghostEnts.Remove(id); }
         if (_ghostGuardians.TryGetValue(id, out var gg)) { if (GodotObject.IsInstanceValid(gg)) gg.QueueFree(); _ghostGuardians.Remove(id); }
         if (IsHost) { _downed.Remove(id); EvalGameOver(); }
+        if (IsHost) { _ready.Remove(id); if (Game.I != null && Game.I.State == GameState.CharSelect) HostSyncReady(); }   // don't wait on a warden who left char-select
         if (IsHost) Game.I?.ShowToast("A player disconnected.");
     }
     private void OnConnectedToServer() { Status = "connected"; Game.I?.ShowToast("Connected to host!"); }
@@ -1435,6 +1500,8 @@ public partial class Net : Node
                 if (mys != null && GodotObject.IsInstanceValid(mys)) { vid.Add(mys.NetId); vk.Add(0); vx.Add(mys.GlobalPosition.X); vz.Add(mys.GlobalPosition.Z); }
                 var scr = Game.I.CurScroll;
                 if (scr != null && GodotObject.IsInstanceValid(scr)) { vid.Add(scr.NetId); vk.Add(1); vx.Add(scr.GlobalPosition.X); vz.Add(scr.GlobalPosition.Z); }
+                var shp = Game.I.CurShop;   // peddler (kind 2) — not claimable; lingers so both players can shop
+                if (shp != null && GodotObject.IsInstanceValid(shp)) { vid.Add(shp.NetId); vk.Add(2); vx.Add(shp.GlobalPosition.X); vz.Add(shp.GlobalPosition.Z); }
                 Rpc(nameof(VendorSnapshot), vid.ToArray(), vk.ToArray(), vx.ToArray(), vz.ToArray());
 
                 // roulette wheels (up to 3)
@@ -1452,18 +1519,18 @@ public partial class Net : Node
     }
 
     // ---- client hit -> host applies damage on the real enemy ----
-    public void ReportHit(int netId, float dmg, int type)
+    public void ReportHit(int netId, float dmg, int type, bool crit = false)
     {
         if (!Active || IsHost) return;
-        RpcId(1, nameof(ReceiveHit), netId, dmg, type);
+        RpcId(1, nameof(ReceiveHit), netId, dmg, type, crit);
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
-    private void ReceiveHit(int netId, float dmg, int type)
+    private void ReceiveHit(int netId, float dmg, int type, bool crit)
     {
         if (!IsHost || Game.I == null) return;
         foreach (var e in Game.I.Enemies)
             if (e != null && GodotObject.IsInstanceValid(e) && !e.Dead && e.NetId == netId)
-            { e.Hurt(dmg, (DamageType)type, true); break; }
+            { e.Hurt(dmg, (DamageType)type, true, crit); break; }   // (NEW) carry crit → armor-bypass (Sentinel core) + crit plink resolve on the host
     }
 
     // ---- Gale storm authority (Cyclone pull / Hurricane fling / area grind) ----
@@ -1554,26 +1621,26 @@ public partial class Net : Node
                 case 3: e.Mark(a, b, (int)c); break;
                 case 4: e.Poison(a, b, (int)Multiplayer.GetRemoteSenderId()); break;   // (NEW) poison now routes to the host, attributed to its caster
                 case 5: e.AddFreeze(a, b, c); break;   // (NEW) frost witch freeze stacks + caster's frost profile (threshMul=b, durBonus=c) — best-of on the host
-                case 7: e.ConsumeCurse(a, b); break;   // (NEW) Forsaken voodoo crush: a=frac of stacks, b=damage per stack
+                case 7: e.ConsumeCurse(a, b, c); break;   // (NEW) Forsaken voodoo crush: a=frac of stacks, b=damage per stack, c=effective-stack cap
             }
             return;
         }
     }
 
     // (NEW) Forsaken curse application (6 args, so it can't ride ReportStatus's 3 slots)
-    public void ReportCurse(int netId, float amt, int group, int bonusType, float bonusMul, float shareFrac)
+    public void ReportCurse(int netId, float amt, int group, int bonusType, float bonusMul, float shareFrac, int bonusType2 = -1)
     {
         if (!Active || IsHost) return;
-        RpcId(1, nameof(ReceiveCurse), netId, amt, group, bonusType, bonusMul, shareFrac);
+        RpcId(1, nameof(ReceiveCurse), netId, amt, group, bonusType, bonusMul, shareFrac, bonusType2);
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
-    private void ReceiveCurse(int netId, float amt, int group, int bonusType, float bonusMul, float shareFrac)
+    private void ReceiveCurse(int netId, float amt, int group, int bonusType, float bonusMul, float shareFrac, int bonusType2)
     {
         if (!IsHost || Game.I == null) return;
         foreach (var e in Game.I.Enemies)
         {
             if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead || e.Remote || e.NetId != netId) continue;
-            e.AddCurse(amt, group, (DamageType)bonusType, bonusMul, shareFrac);
+            e.AddCurse(amt, group, (DamageType)bonusType, bonusMul, shareFrac, bonusType2);
             return;
         }
     }

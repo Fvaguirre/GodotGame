@@ -15,6 +15,7 @@ public class Stats
     public float Lifesteal = 0f;
     public float DmgResist = 0f;       // fraction of incoming damage ignored (0..~0.8)
     public float JumpMul = 1f;         // jump-height multiplier
+    public float PickupRange = 1.8f;   // (NEW) XP-orb collection radius — small by default; orbs persist until you're near or a magnet pulls them
 
     public float ComboPow = 0.03f;
     public int   ComboCap = 8;

@@ -266,10 +266,17 @@ public partial class Enemy : Node3D
     private bool _remoteCursed = false;              // (NEW) client-proxy cursed mirror
     public bool Cursed => Remote ? _remoteCursed : CurseT > 0f;
     private DamageType _curseBonusType = DamageType.Curse;
+    private int _curseBonusType2 = -1;   // (NEW) optional 2nd bonus type from the Cursebrand legendary (-1 = none)
     private float _curseBonusMul = 1.35f, _curseShareFrac = 0.35f;
     private bool _curseShareGuard = false;           // guards the shared-damage broadcast against recursion
+    // (NEW) per-frame ceilings on the two runaway fan-outs (curse-group share + Shatter Cascade chaining). A big shatter
+    // into a large curse group is O(hits × groupSize) Hurt calls, each snapshotting the enemy list — that combinatorial
+    // burst is what froze the game in MP. These caps bound the work per frame (self-reset via the process-frame counter).
+    private static ulong _shareFrame; private static int _shareBudget; private static bool _shareWarned;
+    private static ulong _cascFrame; private static int _cascBudget; private static bool _cascWarned;
     public float FreezeThreshold => Mathf.Clamp(1f + MaxHp / 120f, 1f, 240f) * 1.25f * _freezeThreshMul;   // +25% stacks to freeze (across the board); Brittle (best-of) still lowers it
     private float _freezeExpT = 0f;                  // stacks all expire together 2s after the last one
+    private bool _radiatesCold = false;              // (NEW) only beam/shatter freezes radiate Deep Winter; ambient-frozen foes don't (no chain)
     private float _freezeThreshMul = 1f, _freezeDurBonus = 0f;   // (NEW) best-of frost profile accumulated from contributing witches
     private float _deepWinterT = 0f;                 // (NEW) Deep Winter spread throttle
     private float _frozenBlue = 0f, _frozenBlueMax = 0f, _frozenBlueDmg = 0f;   // temp blue bar while frozen
@@ -349,10 +356,12 @@ public partial class Enemy : Node3D
     private float _catchMul = 1f;   // distant enemies speed up to re-engage
     private StandardMaterial3D _mat;
     private float _flash = 0f, _baseEnergy;
+    private float _hitSndT = 0f;   // (NEW) per-enemy throttle for the universal damage-tick sound (keeps DoTs a gentle pulse, not a machine-gun)
     private MeshInstance3D _markRing, _statusRing, _eliteRing;
     private MeshInstance3D _curseRing;              // (NEW) cursed ground ring
     private Godot.Label3D _curseLabel;              // (NEW) overhead curse-stacks counter
     private OmniLight3D _light;
+    private MeshInstance3D _sentinelCore;           // (NEW) the Sentinel's exposed glowing weakpoint — hitting it auto-crits (bypasses the armor)
 
     public void Configure(string type, int wave)
     {
@@ -393,6 +402,12 @@ public partial class Enemy : Node3D
             default:       MaxHp = 14 * hs; Speed = 4.0f; Dmg = 10; Score = 10; Radius = 1.3f; Col = new Color(0.54f, 0.47f, 0.84f); _behav = EBehav.Melee; break;
         }
         Dmg *= ds; _boltDmg *= ds;   // contact + projectile damage scale with depth (host-authoritative, so MP-consistent)
+        // (NEW) named wave mutators: Blood Moon / Surge foes move faster (bosses excepted, they have their own pacing)
+        if (!IsBoss && Game.I != null)
+        {
+            if (Game.I.ActiveMutator == WaveMutator.BloodMoon) Speed *= 1.3f;
+            else if (Game.I.ActiveMutator == WaveMutator.Surge) Speed *= 1.18f;
+        }
         float dmul = Game.I?.DirectorStatMul ?? 1f;   // enemy director: extra HP/damage when the party is dominating
         MaxHp *= dmul; Dmg *= dmul; _boltDmg *= dmul;
         int players = (Game.I != null) ? Game.I.WardenCount : 1;
@@ -670,6 +685,25 @@ public partial class Enemy : Node3D
         _creature = new Creature();
         AddChild(_creature);
         _creature.Build(kind, Radius, _mat, limbMat, accentMat);
+        if (_type == "sentinel")   // (NEW) exposed glowing core on the chest — a bright, caged weak spot; hitting it auto-crits and melts the armor
+        {
+            float cs = Radius * 0.4f;
+            var coreCol = new Color(1f, 0.5f, 0.12f);
+            _sentinelCore = new MeshInstance3D { Mesh = new SphereMesh { Radius = cs, Height = cs * 2f }, MaterialOverride = Game.ToonEmissive(coreCol, 5.5f, 0f) };
+            _sentinelCore.Position = new Vector3(0, Radius * 1.05f, Radius * 0.78f);   // front chest, protruding forward; child of the creature so it rides its facing
+            _creature.AddChild(_sentinelCore);
+            var cageMat = Game.Toon(new Color(0.10f, 0.10f, 0.12f), 0.9f, 0.35f, 0f);   // dark bars caging the core so it reads as an exposed weak point
+            for (int b = 0; b < 3; b++)
+            {
+                var bar = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(cs * 2.4f, cs * 0.24f, cs * 0.24f) }, MaterialOverride = cageMat };
+                bar.Position = new Vector3(0, (b - 1) * cs * 0.62f, cs * 0.55f);
+                _sentinelCore.AddChild(bar);
+            }
+            _sentinelCore.AddChild(new OmniLight3D { OmniRange = Radius * 2.6f, LightColor = coreCol, LightEnergy = 1.8f });
+            var cpulse = _sentinelCore.CreateTween(); cpulse.SetLoops();   // pulse so it draws the eye
+            cpulse.TweenProperty(_sentinelCore, "scale", Vector3.One * 1.18f, 0.55f).SetTrans(Tween.TransitionType.Sine);
+            cpulse.TweenProperty(_sentinelCore, "scale", Vector3.One * 0.9f, 0.55f).SetTrans(Tween.TransitionType.Sine);
+        }
         if (_type == "swarmer" && _creature != null)
         {
             _creature.Rotation = new Vector3(0, _faceYaw, 0);   // (NEW) spread initial facing so a whole batch doesn't spot you at once
@@ -717,6 +751,7 @@ public partial class Enemy : Node3D
         if (Game.I == null || !Game.I.WorldRunning) return;
         if (Game.I.State != GameState.Playing) return;   // freeze AI/animation/firing/DoTs while a menu or card screen is open (NEW)
         float dt = (float)delta;
+        if (_hitSndT > 0f) _hitSndT -= dt;   // (NEW) damage-tick throttle (ticks for remote proxies too — this runs before the Remote return below)
         if (!_shimmerDone)   // (NEW) small "arrival" shimmer the first time the local camera catches this foe
         {
             var scam = Game.I.Player?.Cam;
@@ -806,7 +841,7 @@ public partial class Enemy : Node3D
         {
             FrozenT -= dt;
             if (_iceBlock != null) _iceBlock.RotationDegrees = new Vector3(0, _iceBlock.RotationDegrees.Y + dt * 20f, 0);
-            if (!Remote && Game.I.Player != null && Game.I.Player.DeepWinter)   // (NEW legendary) chill neighbours toward freezing
+            if (!Remote && _radiatesCold && Game.I.Player != null && Game.I.Player.DeepWinter)   // (NEW legendary) chill neighbours toward freezing — only REAL freezes radiate (no cascade)
             {
                 _deepWinterT -= dt;
                 if (_deepWinterT <= 0f)
@@ -815,7 +850,7 @@ public partial class Enemy : Node3D
                     var dw = Game.I.Player;
                     foreach (var o in Game.I.Enemies.ToArray())
                         if (o != null && o != this && !o.Dead && !o.Frozen && !o.Remote && GodotObject.IsInstanceValid(o) && o.GlobalPosition.DistanceTo(GlobalPosition) < 7f)
-                            o.AddFreeze(o.FreezeThreshold * 0.12f, dw != null ? dw.FreezeThreshMul : 1f, dw != null ? dw.FrostDurBonus : 0f);
+                            o.AddFreeze(o.FreezeThreshold * 0.12f, dw != null ? dw.FreezeThreshMul : 1f, dw != null ? dw.FrostDurBonus : 0f, canRadiate: false);   // ambient chill can't itself spread further
                 }
             }
             if (FrozenT <= 0f) ShatterFreeze();
@@ -1267,7 +1302,25 @@ public partial class Enemy : Node3D
     public bool IsCharging => _bossCharging;                                                                   // HUD: boss winding up an attack (NEW)
     public string BossAttackName => _bossPatPending switch { 1 => "RADIAL BURST", 3 => "NOVA", 4 => "PESTILENCE", 5 => "STOMP", 6 => "ROCK THROW", 7 => "MINES", _ => "VOLLEY" };   // (NEW) attack meter label
     // (NEW) hitting high — the head or a shoulder goblin — always crits THE HOLLOW MOON
-    public bool IsCritZone(Vector3 hitPos) => IsBoss && _type == "boss" && (hitPos.Y - GlobalPosition.Y) > Radius * 0.7f;
+    public bool IsCritZone(Vector3 hitPos)
+    {
+        if (IsBoss && _type == "boss") return (hitPos.Y - GlobalPosition.Y) > Radius * 0.7f;   // THE HOLLOW MOON's head/shoulders
+        if (_type == "sentinel" && _sentinelCore != null && GodotObject.IsInstanceValid(_sentinelCore))
+            return hitPos.DistanceTo(_sentinelCore.GlobalPosition) < Radius * 0.9f;   // (NEW) strike the exposed core → auto-crit through the armor
+        return false;
+    }
+
+    // (NEW) capsule hit test — the visual model builds UP from ~the feet (origin sits low, head is ~Radius*1.9 above it),
+    // so a sphere at the origin only covered the legs of tall foes ("can only hit their feet"). This tests distance to the
+    // whole body spine (feet → head) so any point on the model registers. Radial girth stays ~Radius (matches the mesh width).
+    public bool HitBy(Vector3 point, float pad)
+    {
+        Vector3 a = GlobalPosition + Vector3.Down * Radius * 0.7f;   // near the feet
+        Vector3 b = GlobalPosition + Vector3.Up * Radius * 1.9f;     // near the top of the head
+        Vector3 ab = b - a;
+        float t = Mathf.Clamp((point - a).Dot(ab) / ab.LengthSquared(), 0f, 1f);
+        return point.DistanceTo(a + ab * t) < Radius + pad;
+    }
     public string PingName => !string.IsNullOrEmpty(Label) ? Label : _type switch   // (NEW) nice name for the ping nameplate
     {
         "shade" => "Shade", "swarmer" => "Zombie", "caster" => "Caster", "flyer" => "Flyer", "brute" => "Brute",
@@ -1958,14 +2011,27 @@ public partial class Enemy : Node3D
     private DamageType _lastType = DamageType.Lunar;
     private bool _lastCombo = false;
 
+    // (NEW) universal damage-instance feedback: a soft "tick" on any hit, a bright "plink" on a crit. Spatial at the foe,
+    // played on whichever machine resolves the hit (so the attacker always hears their own hits, host or client). Throttled
+    // per-enemy so DoTs pulse instead of buzzing; a crit always plinks (and re-arms the throttle so a tick doesn't stack on it).
+    private void HitFeedback(bool crit)
+    {
+        Vector3 at = GlobalPosition + Vector3.Up * Radius * 0.6f;
+        if (crit) { Game.I.Sfx?.DamageTick(at, true); _hitSndT = 0.06f; return; }
+        if (_hitSndT > 0f) return;
+        _hitSndT = 0.08f;
+        Game.I.Sfx?.DamageTick(at, false);
+    }
+
     public void Hurt(float dmg, DamageType type = DamageType.Lunar, bool fromCombo = false, bool crit = false)
     {
         if (Dead) return;
         if (Remote)
         {
-            // a client landed a hit: the host owns this enemy, so route the damage there
-            Game.I.NetMgr?.ReportHit(NetId, dmg, (int)type);
+            // a client landed a hit: the host owns this enemy, so route the damage there (but give this machine local feedback)
+            Game.I.NetMgr?.ReportHit(NetId, dmg, (int)type, crit);
             if (Game.I.DmgNumbers) { _popAccum += dmg; _popCol = DamageTypes.Col(type); if (crit) _popCrit = true; _flash = 0.12f; }
+            HitFeedback(crit);
             return;
         }
         if (IsGoblin && Game.I.GoblinTime < 0f) Game.I.GoblinTime = 12f;   // chase clock starts on first strike
@@ -1973,27 +2039,28 @@ public partial class Enemy : Node3D
         if (pl != null) dmg *= pl.LunarNightMul(type);   // Lunar Witch: ALL lunar damage waxes stronger at night
         _lastType = type; _lastCombo = fromCombo;
         float dealt = dmg * MarkAmp;
-        if (CurseT > 0f && type == _curseBonusType) dealt *= _curseBonusMul;   // (NEW) cursed foes take extra from the curse-bonus type (Curse by default; a legendary can add another)
+        if (CurseT > 0f && (type == _curseBonusType || (int)type == _curseBonusType2)) dealt *= _curseBonusMul;   // (NEW) cursed foes take extra from the curse-bonus type(s) — Curse by default; Cursebrand adds a 2nd
         if (_armorDR > 0f && !crit) dealt *= (1f - _armorDR);                 // armored: crits punch through
         if (_shield > 0f) { float s = Mathf.Min(_shield, dealt); _shield -= s; dealt -= s; }   // shielded soak
-        if (FrozenT > 0f)   // FROZEN: damage banks into the ice block's blue bar. It does NOT shatter on its own —
-        {                   // only a Frost witch's full-charge spear (or Glacial Impaler) detonates it. Banked damage is applied when it melts.
-            _frozenBlueDmg = Mathf.Min(_frozenBlueMax, _frozenBlueDmg + dealt);
-            _frozenBlue = _frozenBlueMax - _frozenBlueDmg;
-            Game.I.NoteEnemyDamage(dealt);
-            _flash = 0.12f;
-            if (Game.I.DmgNumbers) { _popAccum += dealt; _popCol = new Color(0.55f, 0.82f, 1f); if (crit) _popCrit = true; }
-            if (crit && !Remote) Game.I.Sfx?.CritHit();
-            return;
-        }
+        // (REMOVED the frozen "blue bank" — frozen foes now take NORMAL damage; a charged-RMB spear SHATTERS them for a flat burst + execute, no banking step)
         Hp -= dealt;
         Game.I.NoteEnemyDamage(dealt);   // (NEW) feeds the boss-wave DPS director + heat
         if (CurseGroup != 0 && !_curseShareGuard && _curseShareFrac > 0f && dealt > 0.5f)   // (NEW) tethered curse group shares this damage instance
         {
-            float shared = dealt * _curseShareFrac;
-            foreach (var o in Game.I.Enemies.ToArray())
-                if (o != null && o != this && !o.Dead && !o.Remote && GodotObject.IsInstanceValid(o) && o.CurseGroup == CurseGroup)
-                { o._curseShareGuard = true; o.Hurt(shared, DamageType.Curse); o._curseShareGuard = false; }
+            ulong fr = Engine.GetProcessFrames();
+            if (fr != _shareFrame) { _shareFrame = fr; _shareBudget = 1500; _shareWarned = false; }   // per-frame ceiling on shared-damage instances
+            if (_shareBudget > 0)
+            {
+                float shared = dealt * _curseShareFrac;
+                foreach (var o in Game.I.Enemies.ToArray())
+                {
+                    if (_shareBudget <= 0) break;
+                    if (o == null || o == this || o.Dead || o.Remote || !GodotObject.IsInstanceValid(o) || o.CurseGroup != CurseGroup) continue;
+                    _shareBudget--;
+                    o._curseShareGuard = true; o.Hurt(shared, DamageType.Curse); o._curseShareGuard = false;
+                }
+            }
+            else if (!_shareWarned) { _shareWarned = true; GD.PushWarning($"[perf] curse-share budget exhausted this frame ({Game.I.Enemies.Count} enemies, group {CurseGroup}) — capping the cascade to avoid a hang"); }
         }
         _flash = 0.12f;
         if (Game.I.DmgNumbers)
@@ -2003,7 +2070,7 @@ public partial class Enemy : Node3D
             if (MarkAmp > 1.01f) _popAmp = true;
             if (crit) _popCrit = true;
         }
-        if (crit && !Remote) Game.I.Sfx?.CritHit();   // (NEW) crit ping for ALL crit sources (melee, spells, AoE, bolts)
+        HitFeedback(crit);   // (NEW) universal hit tick / crit plink for ALL damage sources (melee, spells, AoE, bolts, DoTs)
         if (Hp <= 0)
         {
             if (pl != null && pl.Ult == Player.UltKind.Eclipse && pl.UltActive) pl.OnEclipseKill(GlobalPosition);
@@ -2041,28 +2108,32 @@ public partial class Enemy : Node3D
 
     // (NEW) The suck-beam builds curse; when it spreads, callers pass the same group id to tether foes together.
     // Tether/curse duration = the stack count in seconds (5 stacks → 5s), floored at 2s.
-    public void AddCurse(float amt, int group, DamageType bonusType, float bonusMul, float shareFrac)
+    public void AddCurse(float amt, int group, DamageType bonusType, float bonusMul, float shareFrac, int bonusType2 = -1)
     {
-        if (Remote) { Game.I.NetMgr?.ReportCurse(NetId, amt, group, (int)bonusType, bonusMul, shareFrac); return; }
+        if (Remote) { Game.I.NetMgr?.ReportCurse(NetId, amt, group, (int)bonusType, bonusMul, shareFrac, bonusType2); return; }
         if (Dead) return;
         CurseStacks += amt;
         CurseT = Mathf.Max(CurseT, Mathf.Max(2f, CurseStacks));
         if (group != 0) CurseGroup = group;
-        _curseBonusType = bonusType; _curseBonusMul = bonusMul; _curseShareFrac = shareFrac;
+        _curseBonusType = bonusType; _curseBonusMul = bonusMul; _curseShareFrac = shareFrac; _curseBonusType2 = bonusType2;
     }
 
     // (NEW) The voodoo-doll crush (right-click): consume `frac` of the stacks and detonate them for curse damage.
     // Untethers this foe's group; foes that still have their own stacks can re-form a new one on the next beam tick.
-    public void ConsumeCurse(float frac, float perStack)
+    public void ConsumeCurse(float frac, float perStack, float stackCap = 5f)
     {
-        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 7, frac, perStack, 0f); return; }
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 7, frac, perStack, stackCap); return; }
         if (Dead || CurseStacks <= 0f) return;
         float consumed = Mathf.Clamp(frac, 0f, 1f) * CurseStacks;
         if (frac < 0.999f) consumed = Mathf.Max(1f, Mathf.Floor(consumed));   // a tap always eats at least 1 stack
         consumed = Mathf.Min(consumed, CurseStacks);
         CurseStacks -= consumed;
         int grp = CurseGroup;
-        Hurt(perStack * consumed, DamageType.Curse, true);   // detonation damage scales with stacks crushed (shared to the group before it breaks)
+        // detonation damage tapers with diminishing returns toward a ceiling of `stackCap` EFFECTIVE stacks. tanh keeps the
+        // first few stacks counting ~fully (1→~1, 2→~1.9), then flattens toward the ceiling (cap 5: 8 stacks→~4.6, ∞→5).
+        // Keeps a fully-fed target from scaling to absurd numbers at base kit; affinity cards raise the ceiling.
+        float effStacks = stackCap > 0.01f ? stackCap * (float)System.Math.Tanh(consumed / stackCap) : consumed;
+        Hurt(perStack * effStacks, DamageType.Curse, true);   // (stacks REMOVED are still `consumed`; only the damage is tapered)
         if (grp != 0)   // break this group's tether (members keep their OWN stacks and can re-link later)
             foreach (var o in Game.I.Enemies.ToArray())
                 if (o != null && !o.Dead && GodotObject.IsInstanceValid(o) && o.CurseGroup == grp) { o.CurseGroup = 0; }
@@ -2071,7 +2142,10 @@ public partial class Enemy : Node3D
     }
 
     // add freeze stacks (routes to host if a client applies it). Reaching the HP-scaled threshold encases the enemy in ice.
-    public void AddFreeze(float amt, float threshMul = 1f, float durBonus = 0f)
+    // canRadiate: whether a freeze CAUSED by this application may itself spread Deep Winter's chill. The beam/shatter pass
+    // true; Deep Winter's own aura passes false — so ambient-frozen foes DON'T re-radiate, capping the spread to one ring
+    // around a genuine freeze instead of chain-freezing the whole map.
+    public void AddFreeze(float amt, float threshMul = 1f, float durBonus = 0f, bool canRadiate = true)
     {
         if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 5, amt, threshMul, durBonus); return; }   // route to host WITH the caster's frost profile
         if (Dead || FrozenT > 0f) return;   // can't stack a frozen enemy
@@ -2080,13 +2154,13 @@ public partial class Enemy : Node3D
         FreezeStacks += amt;
         _freezeExpT = 2f;   // a new stack refreshes the whole stack's timeout
         Slow(0.5f, Mathf.Clamp(1f - (FreezeStacks / Mathf.Max(1f, FreezeThreshold)) * 0.6f, 0.4f, 0.95f));   // the longer the beam holds, the more it slows
-        if (FreezeStacks >= FreezeThreshold) Freeze();
+        if (FreezeStacks >= FreezeThreshold) { _radiatesCold = canRadiate; Freeze(); }
     }
 
     private void Freeze()
     {
         FrozenT = 5f + _freezeDurBonus; FreezeStacks = 0f; _freezeExpT = 0f;
-        _frozenBlueMax = Mathf.Max(1f, Hp * 0.5f); _frozenBlue = _frozenBlueMax; _frozenBlueDmg = 0f;
+        _frozenBlueMax = 0f; _frozenBlue = 0f; _frozenBlueDmg = 0f;   // no blue bank anymore (FrozenBlueFrac stays 0 → the bar isn't drawn)
         RootT = Mathf.Max(RootT, FrozenT);   // held in place
         EnsureIceBlock(true);
         Game.I.Sfx?.Freeze(GlobalPosition);
@@ -2101,28 +2175,36 @@ public partial class Enemy : Node3D
     public void ShatterFreeze(bool detonate)
     {
         if (FrozenT <= 0f) return;
-        float hpRatio = MaxHp > 0f ? Mathf.Clamp(Hp / MaxHp, 0f, 1f) : 1f;
-        float t = Mathf.Clamp((1f - hpRatio) / 0.9f, 0f, 1f);          // 0 at full HP, 1 at ≤10% HP
-        float shatterPct = 0.10f + 0.90f * t * t;                      // 10% → 100% (quadratic ramp) — a finisher
-        float depleted = _frozenBlueMax > 0f ? Mathf.Clamp(_frozenBlueDmg / _frozenBlueMax, 0f, 1f) : 0f;
         var pw = Game.I.Player;
-        float real = shatterPct * Hp * depleted * (detonate && pw != null ? pw.ShatterPowerMul : 1f);
-        FrozenT = 0f; if (_iceBlock != null) _iceBlock.Visible = false;
+        // (REDESIGN) No blue-bank at all. A frozen foe takes normal damage; a DETONATE (full-charge spear) SHATTERS it for a
+        // flat, player-scaled burst + a %-max-HP execute — an immediate payoff the moment you see the ice, no pre-banking.
+        float burst = 0f;
+        if (detonate)
+        {
+            float missing = MaxHp > 0f ? Mathf.Clamp(1f - Hp / MaxHp, 0f, 1f) : 0f;
+            float powMul = pw != null ? pw.ShatterPowerMul : 1f;
+            burst = ((pw != null ? pw.ShatterBurstDmg() : 24f) + MaxHp * (0.05f + 0.15f * missing)) * powMul;
+        }
+        float real = burst;   // detonate = the burst; melt = 0 (the foe already took its damage normally while frozen)
+        FrozenT = 0f; _radiatesCold = false; if (_iceBlock != null) _iceBlock.Visible = false;
         _freezeThreshMul = 1f; _freezeDurBonus = 0f;   // next freeze accumulates its profile fresh
         if (detonate)
         {
             Game.I.SpawnFrostShatter(GlobalPosition, Radius);
             Game.I.Sfx?.IceShatter(GlobalPosition);
             Game.I.NetMgr?.BroadcastVfx(49, GlobalPosition, Vector3.Zero, Radius, 0f, DamageTypes.Col(DamageType.Frost));
-            float area = 5.5f * (pw != null ? pw.S.SpellArea : 1f);   // (NERF) smaller base burst; still scales with AoE cards
-            float shard = real * 0.25f;                               // (NERF) shards deal less of the converted damage
+            float area = 7.5f * (pw != null ? pw.S.SpellArea : 1f);   // bigger shatter burst radius; still scales with AoE cards
+            float shard = burst * 0.3f;                               // modest AoE splash — Frost's strength is the single-target snipe (Forsaken keeps the AoE crown)
             bool cascade = pw != null && pw.ShatterCascade;
+            ulong cfr = Engine.GetProcessFrames();
+            if (cfr != _cascFrame) { _cascFrame = cfr; _cascBudget = 24; _cascWarned = false; }   // per-frame ceiling on chained shatters (a huge cluster can't blow up the frame)
             foreach (var o in Game.I.Enemies.ToArray())
             {
                 if (o == null || o == this || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
                 if (o.GlobalPosition.DistanceTo(GlobalPosition) < area + o.Radius)
                 {
-                    if (cascade && o.Frozen) o.ShatterInstant();   // Shatter Cascade legendary chains the detonation
+                    if (cascade && o.Frozen && _cascBudget <= 0 && !_cascWarned) { _cascWarned = true; GD.PushWarning($"[perf] shatter-cascade budget exhausted this frame ({Game.I.Enemies.Count} enemies) — capping the chain to avoid a hang"); }
+                    if (cascade && o.Frozen && _cascBudget > 0) { _cascBudget--; o.ShatterInstant(); }   // Shatter Cascade legendary chains the detonation (budget-capped)
                     else { o.Hurt(Mathf.Min(shard, o.MaxHp * 0.5f), DamageType.Frost); o.AddFreeze(pw != null ? pw.ShatterFreezeStacks : 1f, pw != null ? pw.FreezeThreshMul : 1f, pw != null ? pw.FrostDurBonus : 0f); }
                 }
             }
@@ -2131,9 +2213,9 @@ public partial class Enemy : Node3D
         }
         else
         {
-            if (_frozenBlueDmg > 0.5f) { Game.I.SpawnFrostShatter(GlobalPosition, Radius * 0.5f); Game.I.Sfx?.IceShatter(GlobalPosition); }   // a quiet crack — no explosion/AoE/spread
+            Game.I.SpawnFrostShatter(GlobalPosition, Radius * 0.5f); Game.I.Sfx?.IceShatter(GlobalPosition);   // freeze wore off — a quiet crack as the ice melts (no damage/AoE)
         }
-        Hp -= real;   // the enemy takes the banked damage either way (detonated big, or melted quietly)
+        Hp -= real;   // detonated → the shatter burst; melted → 0 (the foe took its damage normally while frozen)
         if (Hp <= 0f) { var pl = Game.I.Player; if (pl != null && pl.Ult == Player.UltKind.Eclipse && pl.UltActive) pl.OnEclipseKill(GlobalPosition); Die(); }
     }
 
@@ -2169,7 +2251,7 @@ public partial class Enemy : Node3D
         Dead = true;
         if (_type == "swarmer") Game.I.Sfx?.ZombieDeath(GlobalPosition);   // (NEW)
         if (_type == "taker") { ReleaseGrab(); Game.I.Sfx?.TakerDeath(GlobalPosition); }   // (NEW) free the captive
-        if (Affix == 4) Explode();                                   // volatile: blast on death
+        if (Affix == 4 || (Game.I != null && Game.I.ActiveMutator == WaveMutator.Volatile && !IsBoss && !IsGoblin)) Explode();   // volatile affix OR the Volatile mutator: blast on death (players only, never other enemies)
         if (_splitter) { for (int i = 0; i < 2; i++) Game.I.SpawnEnemyAt("spawnling", GlobalPosition); }   // splitter: spawn two (host → synced)
         Game.I.Player?.OnBloodAuraKill(GlobalPosition);        // local blood witch: ANY death in her aura banks a stack
         Game.I.NetMgr?.BroadcastEnemyDeath(GlobalPosition);   // ally blood witches check their own aura too
@@ -2219,7 +2301,7 @@ public partial class Enemy : Node3D
         {
             var orb = new Orb { Xp = (Score * 0.5f + 2.5f) / orbs, Tint = Col, NetId = Game.I.NextPickupId() };   // XP per kill trimmed (was Score*0.6+4) — slows early leveling; the flat term dominated trash-heavy waves (NEW)
             Game.I.AddChild(orb);
-            Game.I.Orbs.Add(orb);
+            Game.I.AddXpOrb(orb);   // capped add — persistent orbs can't pile up unbounded
             var off = new Vector3((float)GD.RandRange(-1.5, 1.5), 1.2f, (float)GD.RandRange(-1.5, 1.5));
             orb.GlobalPosition = new Vector3(GlobalPosition.X, 1.2f, GlobalPosition.Z) + off;
         }

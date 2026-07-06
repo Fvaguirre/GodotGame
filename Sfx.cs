@@ -40,6 +40,8 @@ public partial class Sfx : Node
     private AudioStreamWav _enemyGrowl, _enemyShoot, _bossRoar;
     private System.Collections.Generic.Dictionary<DamageType, AudioStreamWav> _cast, _impact, _charge, _release;
     private AudioStreamWav _death, _discord, _riteWin, _riteFail;
+    private AudioStreamWav _damageTick, _critPlink;              // (NEW) universal per-hit confirm; crit → satisfying plink
+    private AudioStreamPlayer3D[] _hitPool; private int _hpi = 0; // dedicated spatial pool so hit ticks don't starve enemy ambience
     public bool EventActive = false;     // a ritual is live → push the mix harder
 
     private void InitSpellSounds()
@@ -48,6 +50,9 @@ public partial class Sfx : Node
         for (int i = 0; i < _pool.Length; i++) { _pool[i] = new AudioStreamPlayer(); AddChild(_pool[i]); }
         _pool3d = new AudioStreamPlayer3D[10];
         for (int i = 0; i < _pool3d.Length; i++) { _pool3d[i] = new AudioStreamPlayer3D { MaxDistance = 55f, UnitSize = 8f }; AddChild(_pool3d[i]); }
+        _hitPool = new AudioStreamPlayer3D[6];
+        for (int i = 0; i < _hitPool.Length; i++) { _hitPool[i] = new AudioStreamPlayer3D { MaxDistance = 55f, UnitSize = 7f }; AddChild(_hitPool[i]); }
+        _damageTick = BuildDamageTick(); _critPlink = BuildCritPlink();
         _enemyGrowl = BuildEnemyGrowl(); _enemyShoot = BuildEnemyShoot(); _bossRoar = BuildBossRoar();
         _cast = new(); _impact = new(); _charge = new(); _release = new();
         foreach (DamageType t in System.Enum.GetValues(typeof(DamageType)))
@@ -82,8 +87,8 @@ public partial class Sfx : Node
     public void BossRoar(Vector3 pos)   { At(_bossRoar, pos, 0f, 95f); }
     public void BossTell(Vector3 pos)   { At(BuildBossTell(), pos, -4f, 80f); }   // short rising guttural wind-up grunt (NEW)
     public void CrunchAt(Vector3 pos)   { At(BuildCrunch(), pos, -5f, 55f); }   // smashed pumpkin: wet caving-in splat + rind cracks (NEW)
-    public void SplashAt(Vector3 pos)   { At(BuildSplash(), pos, -7f, 45f); }   // water displacement: plunk + splashy hiss (NEW)
-    public void WadeAt(Vector3 pos)     { At(BuildWade(), pos, -16f, 26f); }    // soft muffled wade swish for walking in water — deliberately quiet (NEW)
+    public void SplashAt(Vector3 pos)   { At(BuildSplash(), pos, -12f, 42f, 0.9f + GD.Randf() * 0.3f); }   // water displacement — softer + slight pitch variation so jumps don't grate (NEW)
+    public void WadeAt(Vector3 pos)     { At(BuildWade(), pos, -21f, 22f, 0.8f + GD.Randf() * 0.45f); }    // quiet muffled wade swish; randomized pitch so repeated steps don't sound identical (NEW)
     // (NEW) charged-modifier one-shots (spatial)
     public void ModFrost(Vector3 pos, bool net = true)   { At(BuildFrostShatter(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModFrost, pos); }
     public void ModBramble(Vector3 pos, bool net = true) { At(BuildBrambleSnap(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModBramble, pos); }
@@ -168,11 +173,22 @@ public partial class Sfx : Node
             case Snd.Thud: Thud(pos, false); break;
         }
     }
-    private void At(AudioStreamWav w, Vector3 pos, float db, float maxDist)
+    private void At(AudioStreamWav w, Vector3 pos, float db, float maxDist, float pitch = 1f)
     {
         if (_pool3d == null || w == null) return;
         var p = _pool3d[_pi3]; _pi3 = (_pi3 + 1) % _pool3d.Length;
-        p.Stream = w; p.VolumeDb = db; p.MaxDistance = maxDist; p.GlobalPosition = pos; p.Play();
+        p.Stream = w; p.VolumeDb = db; p.MaxDistance = maxDist; p.PitchScale = pitch; p.GlobalPosition = pos; p.Play();   // reset pitch each play (was leaking a prior caller's pitch)
+    }
+
+    // (NEW) universal damage-instance feedback — a soft "tick" on every hit, a bright "plink" on a crit.
+    // Spatial at the struck foe; plays on whichever machine resolves the hit (attacker hears their own). Its own pool.
+    public void DamageTick(Vector3 pos, bool crit)
+    {
+        if (_hitPool == null) return;
+        var w = crit ? _critPlink : _damageTick;
+        if (w == null) return;
+        var p = _hitPool[_hpi]; _hpi = (_hpi + 1) % _hitPool.Length;
+        p.Stream = w; p.VolumeDb = crit ? -6f : -15f; p.MaxDistance = crit ? 62f : 46f; p.GlobalPosition = pos; p.Play();
     }
 
     private static AudioStreamWav BuildWade()
@@ -806,52 +822,45 @@ public partial class Sfx : Node
     }
 
     // looping 80s drum-machine pattern, same length as the arp so they phase together
+    // ritual / tribal drum bed (fades in with tension) — deep heartbeat toms + a rattling shaker, to sit under the witchy
+    // arp. stepDur matches BuildArp so the two stay phase-locked when SetTempo scales them together.
     private static AudioStreamWav BuildDrums()
     {
         int rate = 22050;
-        float stepDur = 0.14f;
+        float stepDur = 0.15f;
         int steps = 16, stepN = (int)(rate * stepDur), n = stepN * steps;
         var s = new float[n];
         var rng = new System.Random(13);
 
-        void Kick(int at)
+        void Tom(int at, float f0, float f1, float amp)   // ritual tom / hand-drum: a pitched thump sliding down
         {
-            int dur = (int)(rate * 0.18f);
+            int dur = (int)(rate * 0.24f);
             for (int j = 0; j < dur && at + j < n; j++)
             {
                 float t = j / (float)rate;
-                float f = Mathf.Lerp(130f, 48f, Mathf.Min(1f, t * 12f));
-                s[at + j] += Mathf.Sin(t * Tau * f) * Mathf.Exp(-t * 16f) * 0.9f;
+                float f = Mathf.Lerp(f0, f1, Mathf.Min(1f, t * 9f));
+                s[at + j] += Mathf.Sin(t * Tau * f) * Mathf.Exp(-t * 11f) * amp;
             }
         }
-        void Snare(int at)
+        void Shaker(int at, float amp)   // dry rattle/shaker — witchy hand percussion
         {
-            int dur = (int)(rate * 0.16f);
+            int dur = (int)(rate * 0.06f);
             for (int j = 0; j < dur && at + j < n; j++)
             {
                 float t = j / (float)rate;
                 float noise = (float)(rng.NextDouble() * 2 - 1);
-                float tone = Mathf.Sin(t * Tau * 190f);
-                s[at + j] += (noise * 0.6f + tone * 0.4f) * Mathf.Exp(-t * 22f) * 0.55f;
-            }
-        }
-        void Hat(int at, bool open)
-        {
-            int dur = (int)(rate * (open ? 0.12f : 0.045f));
-            for (int j = 0; j < dur && at + j < n; j++)
-            {
-                float t = j / (float)rate;
-                float noise = (float)(rng.NextDouble() * 2 - 1);
-                s[at + j] += noise * Mathf.Exp(-t * (open ? 24f : 60f)) * 0.3f;
+                s[at + j] += noise * Mathf.Exp(-t * 55f) * amp;
             }
         }
 
         for (int st = 0; st < steps; st++)
         {
             int at = st * stepN;
-            if (st % 4 == 0) Kick(at);          // four-on-the-floor
-            if (st % 8 == 4) Snare(at);         // backbeat
-            if (st % 2 == 0) Hat(at, st % 8 == 6);   // eighth hats, an open accent
+            if (st % 8 == 0) Tom(at, 150f, 52f, 0.95f);   // deep heartbeat on the 1
+            if (st % 8 == 3) Tom(at, 120f, 60f, 0.55f);   // syncopated low answer
+            if (st % 8 == 6) Tom(at, 195f, 92f, 0.65f);   // mid tom
+            if (st % 2 == 1) Shaker(at, 0.26f);           // off-beat rattle
+            if (st % 4 == 2) Shaker(at, 0.16f);
         }
 
         var w = Wav(s, rate);
@@ -885,36 +894,53 @@ public partial class Sfx : Node
         return Wav(s, rate);
     }
 
-    // looping 80s-style minor arpeggio with a sub drone (Stranger-Things-ish)
+    // looping WITCHY bell arpeggio in A harmonic minor — the raised 7th (G#) and flat 6th (F) give the eerie, gothic
+    // colour. Music-box / celeste-like notes ring with long tails that wrap the loop, layering into a haunting pad over a
+    // low drone with a slow uneasy sway. Tempo + intensity are still applied EXTERNALLY (PitchScale + volume via
+    // SetTempo/SetIntensity), so it speeds up and swells with the game state exactly like the old arp did.
     private static AudioStreamWav BuildArp()
     {
         int rate = 22050;
+        float A3 = 220f, B3 = 246.94f, C4 = 261.63f, E4 = 329.63f, F4 = 349.23f, Gs4 = 415.30f, A4 = 440f;
         float[] seq = {
-            130.81f, 155.56f, 196f, 233.08f, 261.63f, 233.08f, 196f, 155.56f,
-            130.81f, 155.56f, 196f, 233.08f, 311.13f, 261.63f, 233.08f, 196f
+            A3, E4, C4, E4,   A3, F4, E4, C4,
+            B3, E4, Gs4, E4,  A3, C4, E4, A4
         };
-        float stepDur = 0.14f;
+        float stepDur = 0.15f;
         int stepN = (int)(rate * stepDur);
         int n = stepN * seq.Length;
         float loopSec = n / (float)rate;
-        float subF = Mathf.Round(65.41f * loopSec) / loopSec;   // whole cycles → clean loop
         var s = new float[n];
+        // low drone (A1) + its fifth + octave, whole cycles → seamless; slow tremolo = an uneasy sway (2 per loop)
+        float droneF = Mathf.Round(55f * loopSec) / loopSec;
+        float fifthF = Mathf.Round(82.41f * loopSec) / loopSec;
+        for (int i = 0; i < n; i++)
+        {
+            float gt = i / (float)rate;
+            float trem = 0.85f + 0.15f * Mathf.Sin(gt * Tau * (2f / loopSec));
+            float drone = (Mathf.Sin(gt * Tau * droneF) * 0.5f + Mathf.Sin(gt * Tau * fifthF) * 0.16f + Mathf.Sin(gt * Tau * droneF * 2f) * 0.10f) * trem;
+            s[i] += drone * 0.15f;
+        }
+        // bell / celeste notes with long ringing tails that wrap the loop (so it's seamless AND lush)
+        int tailN = (int)(rate * 0.5f);
         for (int step = 0; step < seq.Length; step++)
         {
             float f = seq[step];
-            for (int j = 0; j < stepN; j++)
+            int start = step * stepN;
+            for (int j = 0; j < tailN; j++)
             {
-                int i = step * stepN + j;
+                int idx = (start + j) % n;
                 float t = j / (float)rate;
-                float env = Mathf.Exp(-t * 7f) * Mathf.Min(1f, t * 120f);   // plucky synth
-                float saw = 0f;
-                for (int h = 1; h <= 6; h++) saw += Mathf.Sin(t * Tau * f * h) / h;
-                saw *= 0.34f;
-                float gt = i / (float)rate;
-                float sub = Mathf.Sin(gt * Tau * subF) * 0.2f + Mathf.Sin(gt * Tau * subF * 1.5f) * 0.06f;
-                s[i] = (saw * env + sub * 0.55f) * 0.5f;
+                float env = Mathf.Exp(-t * 7f) * Mathf.Min(1f, t * 250f);   // sharp pluck, ~0.4s ring
+                float vib = 1f + 0.004f * Mathf.Sin(t * Tau * 5.2f);
+                float bell = Mathf.Sin(t * Tau * f * vib) * 0.5f
+                           + Mathf.Sin(t * Tau * f * 2f) * 0.26f
+                           + Mathf.Sin(t * Tau * f * 3f) * 0.13f
+                           + Mathf.Sin(t * Tau * f * 4.2f) * 0.08f;   // inharmonic partial = glassy shimmer
+                s[idx] += bell * env * 0.26f;
             }
         }
+        for (int i = 0; i < n; i++) s[i] = (float)System.Math.Tanh(s[i] * 1.1) * 0.85f;   // gentle limiter for the overlapping tails
         var w = Wav(s, rate);
         w.LoopMode = AudioStreamWav.LoopModeEnum.Forward;
         w.LoopBegin = 0;
@@ -1326,6 +1352,38 @@ public partial class Sfx : Node
             float env2 = t > 0.03f ? Mathf.Exp(-(t - 0.03f) * 24f) : 0f;
             v += Mathf.Sin(t * Tau * 5240f) * 0.45f * env2;   // quick second ping
             s[i] = v * env * 0.6f;
+        }
+        return Wav(s, rate);
+    }
+
+    private static AudioStreamWav BuildDamageTick()   // (NEW) soft universal hit-confirm — a short punchy un-pitched "tick"
+    {
+        int rate = 22050, n = (int)(rate * 0.05f);
+        var s = new float[n];
+        var rng = new System.Random(31);
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float env = Mathf.Exp(-t * 95f);                                          // very fast decay → a click, not a tone
+            float noise = (float)(rng.NextDouble() * 2 - 1);
+            float body = Mathf.Sin(t * Tau * 300f) * 0.6f + Mathf.Sin(t * Tau * 520f) * 0.28f;   // little low thump under the click
+            s[i] = (body * 0.7f + noise * 0.45f) * env * 0.5f;
+        }
+        return Wav(s, rate);
+    }
+
+    private static AudioStreamWav BuildCritPlink()   // (NEW) satisfying bright bell "plink" for crits — clean high ping + sparkle tail
+    {
+        int rate = 22050, n = (int)(rate * 0.22f);
+        var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float env = Mathf.Exp(-t * 19f);
+            float v = Mathf.Sin(t * Tau * 1560f) * 0.6f + Mathf.Sin(t * Tau * 2340f) * 0.34f + Mathf.Sin(t * Tau * 3120f) * 0.2f;   // fundamental + fifth + octave
+            float spark = t > 0.018f ? Mathf.Exp(-(t - 0.018f) * 32f) : 0f;
+            v += Mathf.Sin(t * Tau * 4680f) * 0.3f * spark;   // bright leading sparkle
+            s[i] = v * env * 0.55f;
         }
         return Wav(s, rate);
     }

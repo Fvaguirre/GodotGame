@@ -314,7 +314,7 @@ public partial class Bolt : Node3D
                     float dy = GlobalPosition.Y - e.GlobalPosition.Y;
                     hitE = flat < e.Radius + Radius + 0.6f && dy > -(e.Radius + 0.6f) && dy < e.Radius * 3f;
                 }
-                else hitE = GlobalPosition.DistanceTo(e.GlobalPosition) < Radius + e.Radius + 0.4f;
+                else hitE = e.HitBy(GlobalPosition, Radius + 0.4f);   // (FIX) capsule spanning the whole body — was a sphere at the feet, so tall foes could only be hit low
                 if (hitE)
                 {
                     _hit.Add(e.GetInstanceId());

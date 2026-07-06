@@ -70,7 +70,7 @@ public static class UpgradePool
             var d = pool[rng.RandiRange(0, pool.Count - 1)];
             var card = d.Make(r, Rarities.Mag(r));
             if (card.Hidden) continue;
-            if (card.AttuneSlot >= 0) continue;             // skip attunes (need the element chooser)
+            if (card.AttuneSlot == 0 || card.AttuneSlot == 1) continue;   // attack-retune attunes are Mystic-vendor-only; slot 2 (Cursebrand) rolls normally
             if (outl.Exists(c => c.Title == card.Title)) continue;
             outl.Add(card);
         }
@@ -84,11 +84,9 @@ public static class UpgradePool
                 if (card.AttuneSlot < 0 && outl.Count > 0) outl[0] = card;
             }
         }
-        if (p.Ult != Player.UltKind.None && rng.Randf() < 0.15f)
-        {
-            var mod = UltModCard(p);
-            if (mod != null && outl.Count > 0) outl[rng.RandiRange(0, outl.Count - 1)] = mod;
-        }
+        // NOTE: ult-mod injection lives ONLY in Game.RollChoices now (cooldown- + grace-gated). It used to ALSO be here at
+        // 15% with no cooldown, which double-dipped and ignored the post-bind grace — that's why legendary ult-mods flooded
+        // right after level 10. Do not re-add it here.
         return outl;
     }
 
@@ -102,10 +100,95 @@ public static class UpgradePool
         {
             var d = legPool[rng.RandiRange(0, legPool.Count - 1)];
             var card = d.Make(Rarity.Legendary, Rarities.Mag(Rarity.Legendary));
-            if (card.AttuneSlot >= 0) continue;   // attunes need the element chooser
+            if (card.Hidden) continue;   // wrong-witch / already-owned legendaries return Hidden — don't hand one back
+            if (card.AttuneSlot == 0 || card.AttuneSlot == 1) continue;   // attack-retune attunes are vendor-only; slot 2 (Cursebrand) is fine
             return card;
         }
         return null;
+    }
+
+    // ==== SHOP (the peddler vendor) rollers ==========================================================
+    // Cost by rarity, tuned so a Legendary lands at ~500 gold.
+    public static int RarityCost(Rarity r) => r switch {
+        Rarity.Common => 60, Rarity.Uncommon => 130, Rarity.Rare => 240, Rarity.Epic => 370, Rarity.Legendary => 500, _ => 60 };
+
+    // §1 — boons: blessings + this witch's signature upgrade cards, plus the ult-mod if she owns an ult but not its mod yet.
+    public static List<UpgradeCard> RollShopBoons(Player p, RandomNumberGenerator rng, int count)
+    {
+        if (_defs == null) Build();
+        var outl = new List<UpgradeCard>();
+        if (p.Ult != Player.UltKind.None) { var um = UltModCard(p); if (um != null) outl.Add(um); }   // ult upgrade card
+        int guard = 0;
+        while (outl.Count < count && guard++ < 400)
+        {
+            var r = Rarities.Roll(rng, p.S.Luck);
+            var pool = _defs.FindAll(d => Array.IndexOf(d.Rars, r) >= 0);
+            if (pool.Count == 0) continue;
+            var card = pool[rng.RandiRange(0, pool.Count - 1)].Make(r, Rarities.Mag(r));
+            if (card.Hidden || card.FinKind.HasValue || card.ModKind.HasValue) continue;   // boons only — finishers/modifiers have their own sections
+            if (card.AttuneSlot == 0 || card.AttuneSlot == 1) continue;                     // attack-retunes stay Mystic-vendor-only
+            if (outl.Exists(c => c.Title == card.Title)) continue;
+            outl.Add(card);
+        }
+        return outl;
+    }
+
+    // §2 — finishers: 2 of the witch's element + 2 from the wider pool. Only ones she doesn't own OR a strict rarity upgrade.
+    public static List<UpgradeCard> RollShopFinishers(Player p, RandomNumberGenerator rng)
+    {
+        var elem = new List<FinType>(); var other = new List<FinType>();
+        foreach (FinType t in Enum.GetValues(typeof(FinType)))
+        {
+            if (t == FinType.Crescendo || t == FinType.Fullmod) continue;    // not offered (mirrors the scroll vendor)
+            if (p.FinisherRank(t) >= (int)Rarity.Legendary) continue;        // already max rarity → nothing to upgrade to
+            (FinMeta.DType(t) == p.PrimaryType ? elem : other).Add(t);
+        }
+        var outl = new List<UpgradeCard>();
+        void take(List<FinType> src, int want)
+        {
+            while (want > 0 && src.Count > 0)
+            {
+                var t = src[rng.RandiRange(0, src.Count - 1)]; src.Remove(t);
+                int owned = p.FinisherRank(t);
+                Rarity r = Rarities.Roll(rng, p.S.Luck);
+                if (owned >= 0 && (int)r <= owned) r = (Rarity)(owned + 1);   // owned → guarantee this is an upgrade
+                if ((int)r > (int)Rarity.Legendary) continue;
+                int every = r == Rarity.Common ? 8 : r == Rarity.Uncommon ? 7 : 6;
+                outl.Add(FinCard(r, t, every, 0.9f + Rarities.Mag(r) * 0.22f, FinMeta.Desc(t)));
+                want--;
+            }
+        }
+        take(elem, 2); take(other, 2);
+        if (outl.Count < 4) { take(elem, 4 - outl.Count); take(other, 4 - outl.Count); }   // backfill if a bucket ran dry
+        return outl;
+    }
+
+    // §3 — right-click modifiers: same rule as finishers.
+    public static List<UpgradeCard> RollShopModifiers(Player p, RandomNumberGenerator rng)
+    {
+        var elem = new List<ModType>(); var other = new List<ModType>();
+        foreach (ModType t in Enum.GetValues(typeof(ModType)))
+        {
+            if (p.ModifierRank(t) >= (int)Rarity.Legendary) continue;
+            (ModMeta.DType(t) == p.PrimaryType ? elem : other).Add(t);
+        }
+        var outl = new List<UpgradeCard>();
+        void take(List<ModType> src, int want)
+        {
+            while (want > 0 && src.Count > 0)
+            {
+                var t = src[rng.RandiRange(0, src.Count - 1)]; src.Remove(t);
+                int owned = p.ModifierRank(t);
+                Rarity r = Rarities.Roll(rng, p.S.Luck);
+                if (owned >= 0 && (int)r <= owned) r = (Rarity)(owned + 1);
+                if ((int)r > (int)Rarity.Legendary) continue;
+                outl.Add(ModCard(r, t, Rarities.Mag(r), ModMeta.Desc(t)));
+                want--;
+            }
+        }
+        take(elem, 2); take(other, 2);
+        if (outl.Count < 4) { take(elem, 4 - outl.Count); take(other, 4 - outl.Count); }
+        return outl;
     }
 
     // a legendary ultimate-modification, specific to the equipped ultimate (null if none available)
@@ -166,6 +249,15 @@ public static class UpgradePool
                 break;
             case Player.UltKind.DeepFreeze:   // (NEW)
                 if (!p.ModDeepFreeze) return Card(Rarity.Legendary, "Absolute Zero", "Deep Freeze lasts longer, and any foe that dies inside it shatters, chaining frost to its neighbours", x => x.ModDeepFreeze = true);
+                break;
+            case Player.UltKind.HexCircle:   // (NEW)
+                if (!p.ModPlague) return Card(Rarity.Legendary, "Plaguebearer", "the Hex Circle is larger and its ground festers, dealing a curse DoT to everyone inside", x => x.ModPlague = true);
+                break;
+            case Player.UltKind.LifeDrain:   // (NEW)
+                if (!p.ModRapture) return Card(Rarity.Legendary, "Rapture", "Life Drain also drags every foe in range toward you as you channel", x => x.ModRapture = true);
+                break;
+            case Player.UltKind.LifeCurse:   // (NEW)
+                if (!p.ModRite) return Card(Rarity.Legendary, "Blood Rite", "Life Curse siphons a portion of the damage it deals back to you as health", x => x.ModRite = true);
                 break;
         }
         return null;
@@ -256,6 +348,16 @@ public static class UpgradePool
             Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.FrostWitch || pl.ShatterCascade) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Shatter Cascade","shattering an ice block detonates every nearby frozen foe too — chain the whole crowd", p=>p.ShatterCascade=true); }),   // (NEW legendary)
             Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.FrostWitch || pl.DeepWinter) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Deep Winter","frozen foes radiate cold, rapidly freezing the enemies around them", p=>p.DeepWinter=true); }),   // (NEW legendary)
             Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.FrostWitch || pl.GlacialImpaler) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Glacial Impaler","your icicle spear pierces every foe in a line and shatters frozen ones at ANY charge", p=>p.GlacialImpaler=true); }),   // (NEW legendary)
+            // --- Forsaken affinity (curse / tethers / siphon) (NEW) ---
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Wasting Curse",$"+{(0.6f*m):0.0} curse stacks/sec from your beam", p=>p.CurseRate+=0.6f*m); }),
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Deepening Hex",$"+{(1.5f*m):0.0} to your crush's damage ceiling (effective stacks)", p=>p.CurseStackCap+=1.5f*m); }),
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Leeching Beam",$"+{Mathf.RoundToInt(12*m)}% of your beam damage healed back", p=>p.CurseBeamLifesteal=Mathf.Min(1f,p.CurseBeamLifesteal+0.12f*m)); }),
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Sympathetic Pain",$"+{Mathf.RoundToInt(8*m)}% of damage shared across a tether group", p=>p.CurseShareFrac=Mathf.Min(1f,p.CurseShareFrac+0.08f*m)); }),
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Virulent Hex",$"+{Mathf.RoundToInt(12*m)}% bonus damage to cursed foes", p=>p.CurseBonusMul+=0.12f*m); }),
+            Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch || pl.MaxLinks>=12) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Binding Ritual",$"+1 max tether link & +{Mathf.RoundToInt(2*m)}u curse-spread range", p=>{ p.MaxLinks=Mathf.Min(12,p.MaxLinks+1); p.CurseSpreadRange+=2f*m; }); }),
+            Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch || pl.SoulTether) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Soul Tether","your curse groups have no link limit — bind the whole horde into one shared web of pain", p=>{ p.SoulTether=true; p.MaxLinks=99; }); }),   // (NEW legendary)
+            Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch || pl.WitheringPresence) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Withering Presence","your very presence curses and rots every foe near you, steadily draining their health", p=>p.WitheringPresence=true); }),   // (NEW legendary)
+            Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.ForsakenWitch || pl.CurseBonusType2>=0) return new UpgradeCard { Rarity=r, Hidden=true }; return AttuneCard(r, 2, "Cursebrand", "choose a 2nd damage type — cursed foes take your bonus damage from it too, on top of Curse"); }),   // (NEW legendary: opens the element chooser)
             // --- Lunar affinity (moon / night / crescent) ---
             Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || pl.WitchIndex!=0) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Waxing Crescent","+1 crescent pierce & +20% crescent size", p=>{ p.CrescentPierceBonus++; p.CrescentSizeMul=Mathf.Min(2.4f,p.CrescentSizeMul+0.2f); }); }),
             Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || pl.WitchIndex!=0) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Nightfall's Gift",$"+{Mathf.RoundToInt(6*m)}% Lunar damage (doubled at night)", p=>p.LunarBonus+=0.06f*m); }),
@@ -268,9 +370,8 @@ public static class UpgradePool
             Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.CrimsonWitch || pl.SanguineFrenzy) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Sanguine Frenzy","deal up to +25% damage the lower your health falls", p=>p.SanguineFrenzy=true); }),
             Def(UncRareEpic,(r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.CrimsonWitch) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Crimson Communion","+aura radius; aura kills heal more", p=>{ p.AuraBonusR=Mathf.Min(4f,p.AuraBonusR+1f); p.AuraHealMul=Mathf.Min(2.5f,p.AuraHealMul+0.3f); }); }),
             Def(LegP,       (r,m)=>{ var pl=Game.I?.Player; if (pl==null || !pl.CrimsonWitch || pl.Hemoclast) return new UpgradeCard { Rarity=r, Hidden=true }; return WitchCard(r,"Hemoclast","spending Blood Stacks also erupts a blood nova (scales with stacks spent)", p=>p.Hemoclast=true); }),
-            // ---- elemental attunement (re-type the witch's lunar attacks) ----
-            Def(EpicP,      (r,m)=>AttuneCard(r, 0, "Primary Attunement",   "retune your left-click to an element of your choosing")),
-            Def(EpicP,      (r,m)=>AttuneCard(r, 1, "Secondary Attunement", "retune your charged right-click to an element of your choosing")),
+            // (removed: Primary/Secondary Attunement + the Mystic vendor — re-typing a witch's attacks muddied her identity.
+            //  Cursebrand (AttuneSlot 2) is unrelated and stays — it only adds a 2nd curse-bonus type.)
             // ---- right-click charge modifiers (2 slots, 4 max) ----
             Def(UncRareEpic,(r,m)=>ModCard(r,ModType.Frost,    m, $"chill foes in an area ({Mathf.RoundToInt(40+10*m)}% slow)")),
             Def(RareP,      (r,m)=>ModCard(r,ModType.Bramble,  m, $"root foes in the blast {(1.6f+0.3f*m):0.0}s")),
@@ -304,6 +405,7 @@ public static class UpgradePool
             Def(LegP,       (r,m)=>Card(r,"Coven's Reach", "+1 charged-modifier slot (max 4)",               p=>{ if(p.S.ModSlots<4) p.S.ModSlots++; })),
             // ---- blessings ----
             Def(AllR,       (r,m)=>Card(r,"Featherfall",   $"+{Mathf.RoundToInt(8*m)}% jump height",          p=>p.S.JumpMul += 0.08f*m)),
+            Def(AllR,       (r,m)=>Card(r,"Lodestone Heart", $"+{(0.9f*m):0.0}u XP-orb pickup range",          p=>p.S.PickupRange += 0.9f*m)),
             Def(AllR,       (r,m)=>Card(r,"Warded Skin",   $"+{Mathf.RoundToInt(4*m)}% damage resistance",     p=>p.S.DmgResist = Mathf.Min(0.75f, p.S.DmgResist + 0.04f*m))),
             // ---- crit / spell sizing / luck (small, gradual) ----
             Def(AllR,       (r,m)=>Card(r,"Keen Eye",      $"+{Mathf.RoundToInt(1*m)}% crit chance (direct hits)", p=>p.S.CritChance = Mathf.Min(0.6f, p.S.CritChance + 0.01f*m))),

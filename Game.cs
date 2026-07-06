@@ -11,7 +11,10 @@ using System.Collections.Generic;
 // Game.I is the singleton; Game.IsAuthority / WardenCount gate host-only logic. Difficulty tuning
 // (spawn formulas, elite/affix chances, co-op multiplier) lives in the wave block — see DEV_GUIDE.md
 // §7.3. The HUD reads this object every frame; menu states pause the world (WorldRunning).
-public enum GameState { Lobby, CharSelect, Playing, LevelUp, Swap, Stats, Element, Ult, UltMenu, Roulette, Mystic, Scroll, BindKey, Pause, Over }
+public enum GameState { Lobby, CharSelect, Playing, LevelUp, Swap, Stats, Element, Ult, UltMenu, Roulette, Mystic, Scroll, Shop, BindKey, Pause, Over }
+// (NEW) named wave mutators — a hot streak can turn the next wave into one of these. Blood Moon = faster foes + more loot;
+// Eclipse = dense fog / short sight; Surge = a dense fast-trash rush. Lasts one wave; synced to clients via the wave state.
+public enum WaveMutator { None, BloodMoon, Eclipse, Surge, Moonfall, Volatile }
 
 // Shared witchy palette (mirrors the web build).
 public static class Palette
@@ -38,6 +41,7 @@ public partial class Game : Node3D
     public GameState State = GameState.Playing;
     public int Score = 0;
     public int Wave = 0;
+    public WaveMutator ActiveMutator = WaveMutator.None;   // (NEW) the current wave's named mutator (None most waves)
 
     public Player Player;   // the local player (canonical reference used throughout)
     public bool ConsoleOpen = false;   // (NEW) dev console open → suspends local control so typing can't drive the game
@@ -308,7 +312,7 @@ public partial class Game : Node3D
     public int SkipVotes => IsAuthority ? _skipVotes.Count : _netSkipVotes;   // (NEW) HUD (clients read the synced tally)
     public int SkipNeeded => Mathf.Max(1, WardenCount);       // (NEW) all players must vote
     public void RegisterSkipVote(long peer) { if (IsAuthority) _skipVotes.Add(peer); }   // (NEW) host records a vote (own = peer 1; clients pass their sender id via RPC)
-    public void ApplyWaveState(int wave, float gap, int votes) { if (IsAuthority) return; Wave = wave; _waveGap = gap; _netSkipVotes = votes; }   // (NEW) clients mirror the host's wave/intermission + tally so InIntermission + the vote UI work
+    public void ApplyWaveState(int wave, float gap, int votes, int mutator = 0) { if (IsAuthority) return; Wave = wave; _waveGap = gap; _netSkipVotes = votes; var m = (WaveMutator)mutator; if (m != ActiveMutator) { ActiveMutator = m; if (m != WaveMutator.None) MutatorBanner(); } }   // (NEW) clients mirror the host's wave/intermission + tally + active mutator (drives the env visuals in ApplyDayNight)
     public float WaveGap => _waveGap;
     public float WaveGapFrac => Mathf.Clamp(_waveGap / WaveGapMax, 0f, 1f);
     public bool InIntermission => _toSpawn.Count == 0 && Enemies.Count == 0 && _waveGap > 0f && Wave >= 1;
@@ -405,7 +409,19 @@ public partial class Game : Node3D
         _skyMat.SetShaderParameter("star_amt", night);
         _skyMat.SetShaderParameter("aurora_amt", night * 0.6f);
         if (_sun != null) { _sun.LightColor = sunc; _sun.LightEnergy = sune; _sun.RotationDegrees = new Vector3(Mathf.Lerp(-20f, -78f, Mathf.Sin(DayTime * Mathf.Pi)), -38f, 0f); }
-        if (_env != null) { _env.AmbientLightEnergy = amb; _env.FogLightColor = horiz.Darkened(0.3f); }
+        if (_env != null)
+        {
+            // (NEW) named-mutator visuals compose on top of day/night here, so they auto-restore when ActiveMutator → None
+            float ambMul = ActiveMutator == WaveMutator.Eclipse ? 0.42f : 1f;   // eclipse darkens the whole grove
+            _env.AmbientLightEnergy = amb * ambMul;
+            var fogCol = horiz.Darkened(0.3f);
+            if (ActiveMutator == WaveMutator.BloodMoon) fogCol = fogCol.Lerp(new Color(0.55f, 0.06f, 0.05f), 0.7f);   // crimson blood haze
+            else if (ActiveMutator == WaveMutator.Eclipse) fogCol = fogCol.Darkened(0.65f);
+            _env.FogLightColor = fogCol;
+            _env.FogDensity = ActiveMutator == WaveMutator.Eclipse ? 0.05f : (ActiveMutator == WaveMutator.BloodMoon ? 0.013f : 0.007f);   // eclipse = thick fog → short sight
+            if (_skyMat != null)
+                _skyMat.SetShaderParameter("moon_color", V3lin(ActiveMutator == WaveMutator.BloodMoon ? new Color(0.95f, 0.18f, 0.12f) : new Color(0.95f, 0.96f, 1.0f)));   // blood moon glows red
+        }
     }
 
     private float ComputeTension()
@@ -483,6 +499,9 @@ public partial class Game : Node3D
         AddChild(lobbyLayer);
         LobbyUi = new Lobby();
         lobbyLayer.AddChild(LobbyUi);
+        CharSelectUi = new CharSelect();
+        lobbyLayer.AddChild(CharSelectUi);
+        CharSelectUi.Hide();
 
         if (s_witch >= 0) { LobbyUi.Hide(); StartGame(); }   // restart kept the chosen witch — skip lobby
         else { State = GameState.Lobby; LobbyUi.Show(); Input.MouseMode = Input.MouseModeEnum.Visible; }
@@ -491,6 +510,8 @@ public partial class Game : Node3D
     // ---- lobby callbacks ----
     public Net NetMgr;
     public Lobby LobbyUi;
+    public CharSelect CharSelectUi;
+    public int ReadyCount = 0;   // (NEW) MP char-select: how many wardens have locked in (synced from host)
     // solo or host = we own/drive the world; a connected client does not
     public void GrantSharedXp(float amt)
     {
@@ -546,6 +567,11 @@ public partial class Game : Node3D
         {
             float d = (_scroll.GlobalPosition - me).LengthSquared();
             if (d < best) { best = d; var s = _scroll; act = () => { if (!IsAuthority) NetMgr?.ClaimVendor(s.NetId); OpenScroll(s); }; prompt = "Hold E — the Scrolls"; }
+        }
+        if (_shop != null && GodotObject.IsInstanceValid(_shop))   // NOT claimed — the peddler lingers so both players can shop
+        {
+            float d = (_shop.GlobalPosition - me).LengthSquared();
+            if (d < best) { best = d; var sh = _shop; act = () => OpenShop(sh); prompt = "Hold E — the Peddler"; }
         }
         foreach (var r in _roulettes)
         {
@@ -621,7 +647,7 @@ public partial class Game : Node3D
     {
         GameState.Pause => 1,
         GameState.LevelUp or GameState.Swap or GameState.Roulette or GameState.Element or GameState.BindKey => ChestPick ? 0 : 2,
-        GameState.Playing or GameState.Stats or GameState.Ult or GameState.UltMenu or GameState.Mystic or GameState.Scroll => 0,
+        GameState.Playing or GameState.Stats or GameState.Ult or GameState.UltMenu or GameState.Mystic or GameState.Scroll or GameState.Shop => 0,
         _ => 0
     };
     // local player may act only while playing AND the shared world is running
@@ -669,6 +695,22 @@ public partial class Game : Node3D
     {
         if (LobbyUi != null) LobbyUi.Hide();
         State = GameState.CharSelect; Input.MouseMode = Input.MouseModeEnum.Visible;
+        ReadyCount = 0; NetMgr?.ResetReady();
+        if (CharSelectUi != null) { CharSelectUi.Show(); CharSelectUi.Refresh(); }
+    }
+
+    // (NEW) called by the CharSelect UI when a warden locks in. Solo starts at once; in co-op we report ready and WAIT
+    // for every connected warden before the host begins the run (Net.ReportReady → all ready → Net broadcasts BeginRun).
+    public void ConfirmWitch(int i)
+    {
+        s_witch = i;
+        if (NetMgr != null && NetMgr.Active) NetMgr.ReportReady();
+        else StartGame();
+    }
+    public void BeginRunFromSelect()
+    {
+        if (CharSelectUi != null) CharSelectUi.Hide();
+        StartGame();
     }
 
     // ---- transient on-screen popup ----
@@ -683,7 +725,9 @@ public partial class Game : Node3D
     {
         if (_started) return;
         _started = true;
+        if (CharSelectUi != null) CharSelectUi.Hide();
         ConfigureWitch(s_witch < 0 ? 0 : s_witch);
+        Player.Hp = Player.S.MaxHp; Player.Mana = Player.S.ManaMax; Player.DashStock = Player.S.DashCharges; Player.Downed = false;   // full vitals (also covers an MP retry after a soft-reset)
         // in co-op, host and joiner spawn a few steps apart at the same area so they can see each other
         if (NetMgr != null && NetMgr.Active)
             Player.GlobalPosition = NetMgr.IsHost ? new Vector3(-2.5f, 0, 0) : new Vector3(2.5f, 0, 0);
@@ -1057,6 +1101,7 @@ public partial class Game : Node3D
         Action("charge", new InputEventMouseButton { ButtonIndex = MouseButton.Right });
         Action("dash",   new InputEventKey { PhysicalKeycode = Key.Shift });
         Action("jump",   new InputEventKey { PhysicalKeycode = Key.Space });
+        Action("descend", new InputEventKey { PhysicalKeycode = Key.Ctrl });   // Life Drain flight: lower altitude (NEW)
         Action("fin1",   new InputEventKey { PhysicalKeycode = Key.Key1 });
         Action("fin2",   new InputEventKey { PhysicalKeycode = Key.Key2 });
         Action("fin3",   new InputEventKey { PhysicalKeycode = Key.Key3 });
@@ -2101,6 +2146,30 @@ void fragment(){
         var r = new BossRock { Remote = remote }; AddChild(r); r.Init(from, target, dmg);
         if (net) NetMgr?.BroadcastVfx(44, from, target, dmg, 0f, Colors.White);
     }
+    // ---- Moonfall mutator: rain varied moon-fragment asteroids over the field ----
+    private float _moonfallT = 0f;
+    private void MoonfallTick(float dt)
+    {
+        if (!IsAuthority || !WorldRunning) return;
+        _moonfallT -= dt;
+        if (_moonfallT > 0f) return;
+        _moonfallT = (float)GD.RandRange(0.5, 1.1);   // cadence of impacts
+        // anchor each impact on a RANDOM player (host + allies), then a modest offset — so shards rain around whoever's
+        // chosen, threatening the whole party over the wave rather than only the host.
+        var anchors = new List<Vector3>();
+        if (Player != null && GodotObject.IsInstanceValid(Player) && !Player.Downed) anchors.Add(Player.GlobalPosition);
+        if (NetMgr != null && NetMgr.Active) anchors.AddRange(NetMgr.AllyPositions());
+        Vector3 pc = anchors.Count > 0 ? anchors[_rng.RandiRange(0, anchors.Count - 1)] : (Player != null ? Player.GlobalPosition : Vector3.Zero);
+        float a = (float)GD.RandRange(0.0, Mathf.Tau), d = (float)GD.RandRange(0.0, 18.0);   // near the chosen player (dodgeable)
+        var pos = new Vector3(pc.X + Mathf.Cos(a) * d, 0f, pc.Z + Mathf.Sin(a) * d);
+        float size = (float)GD.RandRange(0.6, 1.7);   // small → large fragments
+        SpawnMoonshard(pos, size, remote: false, net: true);
+    }
+    public void SpawnMoonshard(Vector3 pos, float size, bool remote, bool net = true)
+    {
+        var m = new Moonshard { Remote = remote }; AddChild(m); m.Init(pos, size);
+        if (net) NetMgr?.BroadcastVfx(62, pos, Vector3.Zero, size, 0f, Colors.White);
+    }
     // non-zombie goblin mines: scatter armed mines around a spot (host); each is broadcast as a ghost to clients
     public void SpawnBossMines(Vector3 center, int count, float dmg)
     {
@@ -2833,11 +2902,25 @@ void sky(){
     private void NextWave()
     {
         Wave++;
+        // named wave mutator: a hot streak (high Heat) can turn a normal, non-boss wave into a Blood Moon / Eclipse / Surge
+        var clearedMutator = ActiveMutator;   // the mutator on the wave that just ended
+        ActiveMutator = WaveMutator.None;
+        if (IsAuthority && clearedMutator != WaveMutator.None)   // survived a mutator wave → every warden gets a pick-3 with a guaranteed legendary
+        {
+            GrantMutatorRewardLocal();
+            NetMgr?.BroadcastMutatorReward();
+        }
+        // (TUNED) lowered the bar so mutators actually show up: Heat > 1.05 (was 1.22 — rarely reached) and 55% roll (was 35%),
+        // and eligible from wave 3 (was 4). Chance also scales up a touch with Heat so a real hot streak nearly guarantees one.
+        if (IsAuthority && Wave >= 3 && Wave % 5 != 0 && Heat > 1.05f && _rng.Randf() < 0.55f + (Heat - 1.05f) * 0.5f)
+            ActiveMutator = (WaveMutator)_rng.RandiRange(1, 5);
+        ShopSpawnCheck();                      // peddler: maybe appear / warn it's leaving / pack up (wave-driven)
         if (Wave % 10 == 0) SpawnRoulette();   // ~1 wheel of fortune every 10 waves (capped at 3, spaced)
         if (Player != null && Player.DivineWitch && Wave > 1 && Wave % 10 == 1)
             Player.Interventions = Mathf.Min(2, Player.Interventions + 1);   // refreshes each 10-wave cycle
         var list = new List<string>();
         float cm = (1f + 0.55f * (WardenCount - 1)) * Heat;   // bodies per warden, amplified by the director's Heat
+        if (ActiveMutator == WaveMutator.Surge) cm *= 1.7f;   // Surge: a dense rush of fast trash
         void add(string t, int n) { int c = Mathf.Max(n > 0 ? 1 : 0, Mathf.RoundToInt(n * cm)); for (int i = 0; i < c; i++) list.Add(t); }
 
         add("shade", 5 + Mathf.FloorToInt(Wave * 1.8f));
@@ -2860,6 +2943,7 @@ void sky(){
         // director "smart" composition: a hot run gets extra pressure units (ranged/divers/hexers), not just more trash
         if (Heat > 1.12f && Wave >= 2) { add("caster", 1); add("diver", 1); }
         if (Heat > 1.30f && Wave >= 4) add("hexer", 1);
+        if (ActiveMutator == WaveMutator.Volatile) add("bomber", 4 + Wave / 3);   // Volatile: extra powderkegs on top of the everyone-explodes rule
 
         var rng = new RandomNumberGenerator(); rng.Randomize();
         for (int i = list.Count - 1; i > 0; i--) { int j = rng.RandiRange(0, i); (list[i], list[j]) = (list[j], list[i]); }
@@ -2874,8 +2958,8 @@ void sky(){
         if (Wave % 10 == 0) SpawnEnemy("boss");
         else if (Wave % 5 == 0) SpawnEnemy("miniboss");
 
-        // rare loot goblin
-        if (Goblin == null && rng.Randf() < 0.14f) SpawnGoblin();
+        // rare loot goblin — the Blood Moon draws them out (its "more loot": goblins drop for whoever downs them, so it's fair in MP)
+        if (Goblin == null && rng.Randf() < (ActiveMutator == WaveMutator.BloodMoon ? 0.45f : 0.14f)) SpawnGoblin();
 
         // ritual events (grant spell-combo finishers). Steady cadence so endless always has a mana sink / boon source.
         if (Wave >= 2 && Rituals.Count == 0)
@@ -2887,7 +2971,19 @@ void sky(){
             if (_eventsThisBlock < perBlock && rng.Randf() < chance) SpawnRitual();
         }
 
-        Hud?.Banner(Wave % 10 == 0 ? "THE HOLLOW MOON" : $"Wave {Wave}");
+        if (ActiveMutator != WaveMutator.None) MutatorBanner();
+        else Hud?.Banner(Wave % 10 == 0 ? "THE HOLLOW MOON" : $"Wave {Wave}");
+    }
+    private void MutatorBanner()
+    {
+        switch (ActiveMutator)
+        {
+            case WaveMutator.BloodMoon: Hud?.Banner("BLOOD MOON — the horde runs red and fast"); break;
+            case WaveMutator.Eclipse:   Hud?.Banner("ECLIPSE — darkness swallows the grove"); break;
+            case WaveMutator.Surge:     Hud?.Banner("SURGE — they come in a flood"); break;
+            case WaveMutator.Moonfall:  Hud?.Banner("MOONFALL — the sky is falling, keep moving!"); break;
+            case WaveMutator.Volatile:  Hud?.Banner("VOLATILE — the dead burst; mind the blasts"); break;
+        }
     }
 
     // spawn an enemy at a specific spot (splitter children) — host only; children sync via the normal snapshot
@@ -3026,6 +3122,17 @@ void sky(){
     private bool _ultOffered = false;
     public readonly System.Collections.Generic.List<Chest> Chests = new();
     public readonly System.Collections.Generic.List<Orb> Orbs = new();
+    // (NEW) XP-orb pickup: tiny base radius (orbs persist on the map until you're near or a magnet pulls them)
+    public float PickupRange => Player != null ? Player.S.PickupRange : 1.8f;
+    private float _magnetT = 0f;
+    public bool MagnetActive => _magnetT > 0f;
+    public void ActivateMagnet(float dur = 4f) { _magnetT = Mathf.Max(_magnetT, dur); }
+    public void AddXpOrb(Orb o)   // persistent orbs → soft-cap the count so a hoard can't tank perf
+    {
+        Orbs.RemoveAll(x => x == null || !GodotObject.IsInstanceValid(x));
+        while (Orbs.Count >= 150) { var old = Orbs[0]; Orbs.RemoveAt(0); if (GodotObject.IsInstanceValid(old)) old.QueueFree(); }   // cap keeps the persistent hoard + its MP snapshot bounded
+        Orbs.Add(o);
+    }
     private int _netPickupSeq = 1;
     public int NextPickupId() => _netPickupSeq++;
     public bool ChestPick = false;   // a card pick that came from a chest — does NOT pause others
@@ -3058,8 +3165,33 @@ void sky(){
             if (mod != null) { list[_rng.RandiRange(0, list.Count - 1)] = mod; _ultModCd = 6; }
         }
         if (_ultModCd > 0) _ultModCd--;
+        if (_guaranteeLegCount > 0)   // (NEW) mutator-clear reward: this pick is guaranteed to contain a legendary
+        {
+            _guaranteeLegCount--;
+            if (!list.Exists(c => c.Rarity == Rarity.Legendary) && list.Count > 0)
+            {
+                var leg = UpgradePool.RollOneLegendary(Player, _rng);
+                if (leg != null) list[_rng.RandiRange(0, list.Count - 1)] = leg;
+            }
+        }
         Player.S.Luck = savedLuck; _luckRerollNext = false;   // (NEW) restore luck; consume the luck-reroll
         return list;
+    }
+    private int _guaranteeLegCount = 0;   // upcoming picks that must include a legendary (mutator-clear rewards)
+
+    // reward every warden a pick-3 with a guaranteed legendary — granted on clearing a named mutator wave (host calls +broadcasts)
+    public void GrantMutatorRewardLocal()
+    {
+        _pendingLevels += 1;
+        _guaranteeLegCount += 1;
+        if (State == GameState.Playing)
+        {
+            Choices = RollChoices();
+            ChoiceGen++; RarityCue(Choices);
+            State = GameState.LevelUp;
+            Input.MouseMode = Input.MouseModeEnum.Visible;
+            SelectLock = 0.3f;
+        }
     }
 
     // ===== level-up card actions: reroll / luck-reroll / disable (ban) =====
@@ -3143,12 +3275,24 @@ void sky(){
     // ===== wandering vendors (Mystic = re-attune for gold; Scroll = pick up finishers/mods you lack) =====
     private Mystic _mystic;
     private ScrollVendor _scroll;
+    private ShopVendor _shop;
     public Mystic VendorMystic => _mystic;          // for the minimap
     public ScrollVendor VendorScroll => _scroll;
+    public ShopVendor VendorShop => _shop;
     public Mystic CurMystic => _mystic;
     public ScrollVendor CurScroll => _scroll;
+    public ShopVendor CurShop => _shop;
     public Mystic RemoteMystic { set { _mystic = value; } }
     public ScrollVendor RemoteScroll { set { _scroll = value; } }
+    public ShopVendor RemoteShop { set { _shop = value; } }
+    // ---- shop (peddler) per-machine state: the local player's instanced inventory ----
+    public readonly System.Collections.Generic.List<UpgradeCard> ShopCards = new();
+    public readonly System.Collections.Generic.List<int> ShopPrices = new();
+    public readonly System.Collections.Generic.List<bool> ShopSold = new();
+    public readonly System.Collections.Generic.List<int> ShopSection = new();   // 0 boons, 1 finishers, 2 modifiers (for the UI columns)
+    private int _shopCleanouts = 0;      // per-run: each full clear boosts the NEXT roll's luck (×2, ×3, …)
+    private bool _returnToShop = false;  // a purchase opened a sub-screen (element chooser / swap) — come back here after
+    private int _shopBuyIdx = -1, _shopBuyPrice = 0;   // the in-flight shop purchase (for refund if a full-slot swap is cancelled)
     public void HostClaimVendor(int netId)   // a client used a vendor; consume it for everyone
     {
         if (_mystic != null && GodotObject.IsInstanceValid(_mystic) && _mystic.NetId == netId) { _mystic.QueueFree(); _mystic = null; return; }
@@ -3210,7 +3354,7 @@ void sky(){
     {
         if (!IsAuthority) return;   // vendors are host-driven; clients don't spawn their own
         int lv = Player != null ? Player.Level : 1;
-        if (lv % 10 == 0 && lv != _lastMysticLvl) { _lastMysticLvl = lv; SpawnMystic(); }
+        // Mystic (re-attunement) vendor removed — retuning a witch's attacks muddied her identity. SpawnMystic() no longer called.
         if (lv % 10 == 5 && lv != _lastScrollLvl) { _lastScrollLvl = lv; SpawnScroll(); }
     }
     // pick a spot near `around` (ring minD..maxD) on DRY ground, anchored to the terrain surface. Replaces the old
@@ -3298,6 +3442,95 @@ void sky(){
     }
     public void CloseScroll() { State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
 
+    // ---- the peddler (shop vendor) -----------------------------------------------------------------
+    private int _shopLastSpawnWave = -99;
+    private void SpawnShop()
+    {
+        if (_shop != null && GodotObject.IsInstanceValid(_shop)) return;
+        var s = new ShopVendor { NetId = NextPickupId(), SpawnedWave = Wave }; AddChild(s); s.GlobalPosition = VendorSpawnPos(); _shop = s;
+        Hud?.Banner("a peddler has set up shop…");
+    }
+    // wave-driven: never in the first 3 waves; guaranteed within every 10-wave window, else ~18%/wave. Lingers ~2 waves —
+    // warns 1 wave in that it's leaving, then packs up. Host-driven (clients receive it via VendorSnapshot).
+    public void ShopSpawnCheck()
+    {
+        if (!IsAuthority) return;
+        if (_shop != null && GodotObject.IsInstanceValid(_shop))
+        {
+            int age = Wave - _shop.SpawnedWave;
+            if (age == 1) Hud?.Banner("the peddler is packing up — last wave to shop!");
+            else if (age >= 2 && State != GameState.Shop) { _shop.QueueFree(); _shop = null; }
+            return;
+        }
+        if (Wave < 4) return;
+        if (Wave - _shopLastSpawnWave >= 10 || _rng.Randf() < 0.18f) { _shopLastSpawnWave = Wave; SpawnShop(); }
+    }
+
+    public void OpenShop(ShopVendor s)   // NOT consumed — the vendor lingers so both players can shop
+    {
+        BuildShopOffer();
+        State = GameState.Shop; Input.MouseMode = Input.MouseModeEnum.Visible; SelectLock = 0.3f;
+    }
+    private void BuildShopOffer()
+    {
+        ShopCards.Clear(); ShopPrices.Clear(); ShopSold.Clear(); ShopSection.Clear();
+        float savedLuck = Player.S.Luck;
+        Player.S.Luck = savedLuck * (1 + _shopCleanouts);   // clean-out escalation: ×1 the first time, then ×2, ×3…
+        var boons = UpgradePool.RollShopBoons(Player, _rng, 4);
+        var fins  = UpgradePool.RollShopFinishers(Player, _rng);
+        var mods  = UpgradePool.RollShopModifiers(Player, _rng);
+        Player.S.Luck = savedLuck;
+        void add(System.Collections.Generic.List<UpgradeCard> src, int section, int count)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                var c = (i < src.Count) ? src[i] : null;
+                ShopCards.Add(c); ShopSection.Add(section);
+                ShopPrices.Add(c != null ? UpgradePool.RarityCost(c.Rarity) : 0);
+                ShopSold.Add(c == null);   // an empty slot (nothing eligible rolled) reads as "sold out"
+            }
+        }
+        add(boons, 0, 4); add(fins, 1, 4); add(mods, 2, 4);
+    }
+    public void ShopBuy(int idx)
+    {
+        if (idx < 0 || idx >= ShopCards.Count || ShopSold[idx]) return;
+        var card = ShopCards[idx];
+        if (card == null) return;
+        int price = ShopPrices[idx];
+        if (Gold < price) { GoldFlash = 1.5f; Sfx?.Fizzle(); return; }
+        Gold -= price; SaveGold();
+        ShopSold[idx] = true;
+        Sfx?.Clink();
+        _shopBuyIdx = idx; _shopBuyPrice = price;   // remember it in case ApplyShopCard opens a full-slot swap the player then cancels
+        ApplyShopCard(card);
+        bool anyLeft = false;
+        for (int i = 0; i < ShopSold.Count; i++) if (!ShopSold[i]) { anyLeft = true; break; }
+        if (!anyLeft) { _shopCleanouts++; Hud?.Banner("you cleaned out the peddler! (next visit rolls richer)"); }
+    }
+    private void ApplyShopCard(UpgradeCard card)
+    {
+        if (card.AttuneSlot >= 0)   // Cursebrand — open the element chooser, return to the shop after
+        { _returnToShop = true; PendingAttune = card.AttuneSlot; State = GameState.Element; Input.MouseMode = Input.MouseModeEnum.Visible; ChoiceGen++; SelectLock = 0.3f; return; }
+        if (card.FinKind.HasValue)
+        {
+            var t = card.FinKind.Value;
+            if (Player.OwnsFinisher(t) || !Player.FinisherFull) Player.EquipFinisher(t, card.FinEvery, card.FinPow, card.Rarity);
+            else { _returnToShop = true; SwapIsFin = true; _swFin = t; _swEvery = card.FinEvery; _swPow = card.FinPow; _swRar = card.Rarity; State = GameState.Swap; Input.MouseMode = Input.MouseModeEnum.Visible; ChoiceGen++; SelectLock = 0.3f; }
+            return;
+        }
+        if (card.ModKind.HasValue)
+        {
+            var t = card.ModKind.Value;
+            if (Player.OwnsModifier(t) || !Player.ModifierFull) Player.EquipModifier(t, card.ModMag, card.Rarity);
+            else { _returnToShop = true; SwapIsFin = false; _swMod = t; _swMag = card.ModMag; _swRar = card.Rarity; State = GameState.Swap; Input.MouseMode = Input.MouseModeEnum.Visible; ChoiceGen++; SelectLock = 0.3f; }
+            return;
+        }
+        card.Apply(Player); Player.Hp = Mathf.Min(Player.S.MaxHp, Player.Hp);   // a boon / blessing / witch upgrade / ult-mod
+    }
+    public void CloseShop() { State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
+    private void ReturnToShop() { State = GameState.Shop; Input.MouseMode = Input.MouseModeEnum.Visible; SelectLock = 0.3f; }
+
     private void SpawnRoulette()
     {
         if (!IsAuthority) return;   // clients receive roulettes via snapshot
@@ -3331,6 +3564,7 @@ void sky(){
         : (Player != null && Player.VerdantWitch) ? new[] { Player.UltKind.GroveGuardian, Player.UltKind.WildSwarm, Player.UltKind.Barkskin }
         : (Player != null && Player.GaleWitch) ? new[] { Player.UltKind.Cyclone, Player.UltKind.Hurricane, Player.UltKind.Stormform }   // (NEW)
         : (Player != null && Player.FrostWitch) ? new[] { Player.UltKind.Blizzard, Player.UltKind.FrostElemental, Player.UltKind.DeepFreeze }   // (NEW)
+        : (Player != null && Player.ForsakenWitch) ? new[] { Player.UltKind.HexCircle, Player.UltKind.LifeDrain, Player.UltKind.LifeCurse }   // (NEW)
         : new[] { Player.UltKind.Eclipse, Player.UltKind.LunarLight, Player.UltKind.Crescent };
     public void OpenUltMenu() { State = GameState.UltMenu; Input.MouseMode = Input.MouseModeEnum.Visible; SelectLock = 0.3f; }
     private void CloseUltMenu() { State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
@@ -3342,6 +3576,7 @@ void sky(){
         Player.ModShield = Player.ModJudge = Player.ModDivinity = false;
         Player.ModTsunami = Player.ModExsang = Player.ModRot = false;
         Player.ModGuardian = Player.ModSwarm = Player.ModBark = false;
+        Player.ModPlague = Player.ModRapture = Player.ModRite = false;   // forsaken (NEW)
         Hud?.Banner("ultimate bound");
         _ultModCd = 4;   // grace: don't dangle the ult-mod in the very next few level-ups after binding it
         if (_pendingLevels > 0) { Choices = RollChoices(); ChoiceGen++; RarityCue(Choices); State = GameState.LevelUp; SelectLock = 0.3f; }
@@ -3395,8 +3630,15 @@ void sky(){
             AddChild(f); f.GlobalPosition = new Vector3(at.X, 0.04f, at.Z);
             Hud?.Banner("a healing font");
         }
-        else if (r < 0.82f) { GiveChestCard(openerPeer); }
-        else if (r < 0.92f) { GiveWard(openerPeer); }   // one random armor charge (blood or thorn)
+        else if (r < 0.80f) { GiveChestCard(openerPeer); }
+        else if (r < 0.88f) { GiveWard(openerPeer); }   // one random armor charge (blood or thorn)
+        else if (r < 0.96f)   // (NEW) a lodestone — vacuums every XP orb on the map to the party
+        {
+            ActivateMagnet(4.5f);
+            VfxRing(at, new Color(0.7f, 0.85f, 1f), 6f, 0.6f);
+            Sfx?.Clink();
+            Hud?.Banner("a lodestone — the orbs rush to you!");
+        }
         else
         {
             Hud?.Banner("an ambush!");
@@ -3612,20 +3854,14 @@ void sky(){
             switch (State)
             {
                 case GameState.CharSelect:
-                    if (Hud.RWitch[0].HasPoint(pos)) ChooseWitch(0);
-                    else if (Hud.RWitch.Length > 1 && Hud.RWitch[1].HasPoint(pos)) ChooseWitch(1);
-                    else if (Hud.RWitch.Length > 2 && Hud.RWitch[2].HasPoint(pos)) ChooseWitch(2);
-                    else if (Hud.RWitch.Length > 3 && Hud.RWitch[3].HasPoint(pos)) ChooseWitch(3);
-                    else if (Hud.RWitch.Length > 4 && Hud.RWitch[4].HasPoint(pos)) ChooseWitch(4);   // Gale witch (NEW)
-                    else if (Hud.RWitch.Length > 5 && Hud.RWitch[5].HasPoint(pos)) ChooseWitch(5);   // Frost witch (NEW)
-                    else if (Hud.RWitch.Length > 6 && Hud.RWitch[6].HasPoint(pos)) ChooseWitch(6);   // Forsaken witch (NEW)
-                    break;
+                    break;   // the CharSelect Control node handles its own clicks
                 case GameState.LevelUp:
                 {
                     int btn = Hud.LevelUpBtn(pos);
                     if (btn == 1) { RerollChoices(); break; }
                     if (btn == 2) { LuckRerollChoices(); break; }
                     if (btn == 3) { BuyPick2(); break; }
+                    if (btn == 4) { DeclineChoice(); break; }
                     if (btn >= 100) { BanChoice(btn - 100); break; }
                     int idx = Hud.CardAt(pos); if (idx >= 0) ApplyChoice(idx);
                     break;
@@ -3651,6 +3887,8 @@ void sky(){
                     break;
                 case GameState.Scroll:
                     { int idx = Hud.ScrollAt(pos); if (idx == -1) CloseScroll(); else if (idx >= 0) ScrollPick(idx); break; }
+                case GameState.Shop:
+                    { int idx = Hud.ShopAt(pos); if (idx == -1) CloseShop(); else if (idx >= 0) ShopBuy(idx); break; }
                 case GameState.Pause:
                     { int bi = Hud.PauseBindAt(pos); if (bi >= 0) { RebindFinisher(bi); break; } }
                     if (Hud.RPauseResume.HasPoint(pos)) { SaveGold(); State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
@@ -3663,7 +3901,16 @@ void sky(){
                     else { for (int gi = 0; gi < 3; gi++) if (Hud.RPauseGfx[gi].HasPoint(pos)) { SetGfxQuality(gi); SaveGold(); break; } }
                     break;
                 case GameState.Over:
-                    if (Hud.ROver.HasPoint(pos)) GetTree().ReloadCurrentScene();
+                    if (NetMgr != null && NetMgr.Active)   // MP: only the host may choose, and it applies to everyone
+                    {
+                        if (NetMgr.IsHost)
+                        {
+                            if (Hud.ROverRetry.HasPoint(pos)) NetMgr.BroadcastGameOverChoice(1);
+                            else if (Hud.ROverCharSelect.HasPoint(pos)) NetMgr.BroadcastGameOverChoice(0);
+                            else if (Hud.ROverEnd.HasPoint(pos)) NetMgr.BroadcastGameOverChoice(2);
+                        }
+                    }
+                    else if (Hud.ROver.HasPoint(pos)) GetTree().ReloadCurrentScene();
                     else if (Hud.RChangeWitch.HasPoint(pos)) { s_witch = -1; GetTree().ReloadCurrentScene(); }
                     break;
                 case GameState.Stats:
@@ -3717,6 +3964,25 @@ void sky(){
         else { card.Apply(Player); Player.Hp = Mathf.Min(Player.S.MaxHp, Player.Hp); FinishStep(); }
     }
 
+    // (NEW) forgo this pick-3 for gold instead — scaled by the best rarity offered (~40% of its shop value)
+    public int DeclineGold
+    {
+        get
+        {
+            if (Choices == null || Choices.Count == 0) return 0;
+            int best = 0; foreach (var c in Choices) best = Mathf.Max(best, (int)c.Rarity);
+            return Mathf.RoundToInt(UpgradePool.RarityCost((Rarity)best) * 0.4f);
+        }
+    }
+    public void DeclineChoice()
+    {
+        if (State != GameState.LevelUp || Choices == null) return;
+        int g = DeclineGold;
+        AddGold(g);
+        Hud?.Banner($"declined — +{g} gold");
+        FinishStep();
+    }
+
     // damage types offered when re-attuning an attack
     public static readonly DamageType[] Elements = { DamageType.Arcane, DamageType.Nature, DamageType.Frost, DamageType.Curse, DamageType.Holy, DamageType.Ember, DamageType.Lunar, DamageType.Wind };
 
@@ -3725,16 +3991,26 @@ void sky(){
         if (idx >= 0 && idx < Elements.Length)
         {
             var ty = Elements[idx];
-            if (PendingAttune == 0) Player.PrimaryType = ty; else Player.SecondaryType = ty;
-            Player.RetintHands();
-            Sfx?.Element(ty);
-            var beam = new ElementBeam();
-            AddChild(beam);
-            beam.GlobalPosition = new Vector3(Player.GlobalPosition.X, 0f, Player.GlobalPosition.Z);
-            beam.Init(DamageTypes.Col(ty));
+            if (PendingAttune == 2)   // Cursebrand: pick a 2nd type that also gets the curse-bonus amp — no hand retint (her attacks are unchanged)
+            {
+                Player.CurseBonusType2 = (int)ty;
+                Sfx?.Element(ty);
+                var beam2 = new ElementBeam(); AddChild(beam2); beam2.GlobalPosition = new Vector3(Player.GlobalPosition.X, 0f, Player.GlobalPosition.Z); beam2.Init(DamageTypes.Col(ty));
+            }
+            else
+            {
+                if (PendingAttune == 0) Player.PrimaryType = ty; else Player.SecondaryType = ty;
+                Player.RetintHands();
+                Sfx?.Element(ty);
+                var beam = new ElementBeam();
+                AddChild(beam);
+                beam.GlobalPosition = new Vector3(Player.GlobalPosition.X, 0f, Player.GlobalPosition.Z);
+                beam.Init(DamageTypes.Col(ty));
+            }
         }
         PendingAttune = -1;
         if (_mysticAttune) { _mysticAttune = false; State = GameState.Mystic; Input.MouseMode = Input.MouseModeEnum.Visible; SelectLock = 0.3f; return; }
+        if (_returnToShop) { _returnToShop = false; ReturnToShop(); return; }   // Cursebrand bought from the shop → back to shopping
         FinishStep();
     }
 
@@ -3758,6 +4034,15 @@ void sky(){
         {
             if (SwapIsFin) Player.ReplaceFinisher(idx, _swFin, _swEvery, _swPow, _swRar);
             else Player.ReplaceModifier(idx, _swMod, _swMag, _swRar);
+        }
+        if (_returnToShop)   // this swap came from a shop purchase
+        {
+            _returnToShop = false;
+            if (idx < 0 && _shopBuyIdx >= 0)   // cancelled ("Keep current") → refund the gold + restock that shop slot
+            { Gold += _shopBuyPrice; SaveGold(); if (_shopBuyIdx < ShopSold.Count) ShopSold[_shopBuyIdx] = false; }
+            _shopBuyIdx = -1;
+            ReturnToShop();
+            return;
         }
         FinishStep();
     }
@@ -3939,23 +4224,22 @@ void sky(){
             if (IsAuthority && NetMgr != null && NetMgr.Active)   // (NEW) sync wave/intermission + vote tally so clients see the prompt and can vote
             {
                 _waveSyncT -= dt;
-                if (_waveSyncT <= 0f) { _waveSyncT = 0.2f; NetMgr.BroadcastWaveState(Wave, _waveGap, _skipVotes.Count); }
+                if (_waveSyncT <= 0f) { _waveSyncT = 0.2f; NetMgr.BroadcastWaveState(Wave, _waveGap, _skipVotes.Count, (int)ActiveMutator); }
             }
         }
 
-        if (State == GameState.CharSelect)
-        {
-            if (Input.IsActionJustPressed("pick1")) ChooseWitch(0);
-            else if (Input.IsActionJustPressed("pick2")) ChooseWitch(1);
-            else if (Input.IsActionJustPressed("pick3")) ChooseWitch(2);
-            else if (Input.IsActionJustPressed("pick4")) ChooseWitch(3);
-            else if (Input.IsActionJustPressed("pick5")) ChooseWitch(4);   // Gale witch (NEW)
-            else if (Input.IsActionJustPressed("pick6")) ChooseWitch(5);   // Frost witch (NEW)
-            else if (Input.IsActionJustPressed("pick7")) ChooseWitch(6);   // Forsaken witch (NEW)
-            return;
-        }
+        if (State == GameState.CharSelect) return;   // the CharSelect Control node handles selection/confirm
         if (State == GameState.Over)
         {
+            if (NetMgr != null && NetMgr.Active)   // MP: host uses the on-screen buttons; keys only shortcut the host's choices
+            {
+                if (NetMgr.IsHost)
+                {
+                    if (Input.IsActionJustPressed("restart")) NetMgr.BroadcastGameOverChoice(1);
+                    else if (Input.IsActionJustPressed("changewitch")) NetMgr.BroadcastGameOverChoice(0);
+                }
+                return;
+            }
             if (Input.IsActionJustPressed("restart")) GetTree().ReloadCurrentScene();
             else if (Input.IsActionJustPressed("changewitch")) { s_witch = -1; GetTree().ReloadCurrentScene(); }
             return;
@@ -3999,6 +4283,7 @@ void sky(){
                 if (Input.IsActionJustPressed("pick1")) ApplyChoice(0);
                 else if (Input.IsActionJustPressed("pick2")) ApplyChoice(1);
                 else if (Input.IsActionJustPressed("pick3")) ApplyChoice(2);
+                else if (Input.IsActionJustPressed("pick0")) DeclineChoice();   // (NEW) 0 = forgo the pick for gold
             }
             return;
         }
@@ -4026,6 +4311,11 @@ void sky(){
                 else if (Input.IsActionJustPressed("pick6")) ScrollPick(5);
                 else if (Input.IsActionJustPressed("pick7")) ScrollPick(6);
             }
+            return;
+        }
+        if (State == GameState.Shop)
+        {
+            if (SelectLock <= 0f && Input.IsActionJustPressed("release_mouse")) CloseShop();   // Esc to leave; buying is click-only (12 items)
             return;
         }
         if (State == GameState.Swap)
@@ -4090,8 +4380,11 @@ void sky(){
         if (State == GameState.Playing && Input.IsActionJustPressed("ult")) Player.TryUlt();
         if (State == GameState.Playing && Input.IsActionJustPressed("ultmenu") && Player.Ult != Player.UltKind.None) { OpenUltMenu(); return; }
 
-        // Playing — spawn pacing
-        _waveTimer += dt;
+        // Playing — spawn pacing. (FIX) count ONLY active combat toward the clear time — NOT the between-wave rest. It used
+        // to run through the whole ~30s intermission too, so `clear` was always ≥30s and the director's fast-clear up-ramps
+        // (<16s / <26s) were unreachable unless you skipped the rest — which is why Heat never climbed past 1.0.
+        if (_toSpawn.Count > 0 || Enemies.Count > 0) _waveTimer += dt;
+        if (_magnetT > 0f) _magnetT -= dt;   // chest lodestone: orbs vacuum to the party while it's active
         if (IsAuthority && Player != null && State == GameState.Playing)   // feed the director
         {
             float hp = Player.S.MaxHp > 0 ? Player.Hp / Player.S.MaxHp : 1f;
@@ -4160,6 +4453,8 @@ void sky(){
             }
         }
 
+        if (ActiveMutator == WaveMutator.Moonfall) MoonfallTick(dt);   // rain moon-fragment asteroids across the field this wave
+
         if (_toSpawn.Count > 0)
         {
             _spawnT -= dt;
@@ -4215,6 +4510,24 @@ void sky(){
     public int ImpactDecalCap => GfxQuality == 0 ? 8 : GfxQuality == 1 ? 18 : 28;   // fewer ground marks on lower presets
     public float ParticleScale => GfxQuality == 0 ? 0.4f : GfxQuality == 1 ? 0.7f : 1f;   // thinner particle trails on lower presets
 
+    // (NEW) screen / resolution settings (Options → Screen tab)
+    public static readonly Vector2I[] ResChoices = { new Vector2I(1280, 720), new Vector2I(1600, 900), new Vector2I(1920, 1080), new Vector2I(2560, 1440) };
+    public int WindowMode = 0;   // 0 windowed, 1 borderless fullscreen
+    public int ResIndex = 2;     // index into ResChoices (default 1920×1080)
+    public bool VSync = true;
+    public void ApplyWindow()
+    {
+        DisplayServer.WindowSetVsyncMode(VSync ? DisplayServer.VSyncMode.Enabled : DisplayServer.VSyncMode.Disabled);
+        if (WindowMode == 1) { DisplayServer.WindowSetMode(DisplayServer.WindowMode.Fullscreen); return; }
+        DisplayServer.WindowSetMode(DisplayServer.WindowMode.Windowed);
+        int scr = DisplayServer.WindowGetCurrentScreen();
+        var usable = DisplayServer.ScreenGetUsableRect(scr);   // excludes the taskbar
+        var r = ResChoices[Mathf.Clamp(ResIndex, 0, ResChoices.Length - 1)];
+        r = new Vector2I(Mathf.Min(r.X, usable.Size.X), Mathf.Min(r.Y, usable.Size.Y));   // never bigger than the screen
+        DisplayServer.WindowSetSize(r);
+        DisplayServer.WindowSetPosition(usable.Position + (usable.Size - r) / 2);          // centered in the work area
+    }
+
     // Toggles are authoritative — ApplyGraphics uses the individual flags directly, so a user can override any
     // single effect regardless of preset. Picking a preset just sets sensible defaults for those flags.
     public void ApplyGraphics()
@@ -4244,6 +4557,9 @@ void sky(){
         cfg.SetValue("options", "gfxbloom", GfxBloom);
         cfg.SetValue("options", "gfxssao", GfxSsao);
         cfg.SetValue("options", "gfxssil", GfxSsil);
+        cfg.SetValue("options", "windowmode", WindowMode);
+        cfg.SetValue("options", "resindex", ResIndex);
+        cfg.SetValue("options", "vsync", VSync);
         cfg.Save("user://grove_save.cfg");
     }
 
@@ -4260,7 +4576,11 @@ void sky(){
             GfxBloom = cfg.GetValue("options", "gfxbloom", true).AsBool();
             GfxSsao = cfg.GetValue("options", "gfxssao", true).AsBool();
             GfxSsil = cfg.GetValue("options", "gfxssil", true).AsBool();
+            WindowMode = cfg.GetValue("options", "windowmode", 0).AsInt32();
+            ResIndex = cfg.GetValue("options", "resindex", 2).AsInt32();
+            VSync = cfg.GetValue("options", "vsync", true).AsBool();
             ApplyGraphics();   // no-op if the environment isn't built yet; BuildWorld re-applies
+            ApplyWindow();
         }
     }
 
@@ -4273,6 +4593,45 @@ void sky(){
         if (State == GameState.Over) return;
         State = GameState.Over;
         Input.MouseMode = Input.MouseModeEnum.Visible;
+    }
+
+    // (NEW) MP game-over: the host's choice, applied on every peer. 0 = char-select, 1 = retry same witches, 2 = end session.
+    public void ApplyGameOverChoice(int choice)
+    {
+        if (choice == 2)   // End Game — tear down the session and return to the home screen (scene reload is fine, we're ending)
+        {
+            NetMgr?.Disconnect();
+            s_witch = -1;
+            GetTree().ReloadCurrentScene();
+            return;
+        }
+        SoftResetRun();
+        if (choice == 0) GoCharSelect();   // back to character select — the ready-gate runs again
+        else StartGame();                  // retry with the witches everyone already has (each peer keeps its own s_witch)
+    }
+
+    // Reset the RUN in place — clears the world's entities + each warden's progress WITHOUT reloading the scene, so the
+    // network session survives (a scene reload would drop everyone). Used only by the MP game-over flow.
+    public void SoftResetRun()
+    {
+        foreach (var e in Enemies.ToArray()) if (GodotObject.IsInstanceValid(e)) e.QueueFree();
+        Enemies.Clear(); _toSpawn.Clear();
+        foreach (var o in Orbs.ToArray()) if (GodotObject.IsInstanceValid(o)) o.QueueFree(); Orbs.Clear();
+        foreach (var r in Rituals.ToArray()) if (GodotObject.IsInstanceValid(r)) r.QueueFree(); Rituals.Clear();
+        foreach (var c in Chests.ToArray()) if (GodotObject.IsInstanceValid(c)) c.QueueFree(); Chests.Clear();
+        Wave = 0; Heat = 1f; Score = 0; _waveTimer = 0f; _magnetT = 0f; ActiveMutator = WaveMutator.None;
+        _started = false; ReadyCount = 0; NetMgr?.ResetReady();
+        if (Player != null)
+        {
+            Player.Fin.Clear(); Player.Mods.Clear(); Player.Minors.Clear();
+            Player.S = new Stats();
+            Player.DamageMul = 1f; Player.NightAffinity = false; Player.Interventions = 0;
+            Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = false;
+            Player.Level = 1; Player.Xp = 0f; Player.XpNext = 28f; Player.Combo = 0; Player.BestCombo = 0;
+            Player.Ult = Player.UltKind.None; Player.UltCharge = 0f; Player.UltActive = false;
+            Player.Downed = false; Player.ReviveProg = 0f;
+            NetMgr?.LocalDowned(false);   // clear my downed avatar on everyone else + the host's tally
+        }
     }
 
     // just the holy pillar of light (used by the network receiver)

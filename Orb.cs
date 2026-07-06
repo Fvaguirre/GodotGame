@@ -14,11 +14,11 @@ public partial class Orb : Node3D
     public override void _Ready()
     {
         _bob = (float)GD.RandRange(0, 6.28);
-        _mesh = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.5f, 0.5f, 0.5f) } };
-        _mesh.MaterialOverride = Game.Emissive(Tint, 1.4f);
+        _mesh = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.32f, 0.32f, 0.32f) } };   // small persistent speck
+        _mesh.MaterialOverride = Game.Emissive(Tint, 1.6f);
         _mesh.RotationDegrees = new Vector3(45, 0, 45);
         AddChild(_mesh);
-        AddChild(new OmniLight3D { OmniRange = 4f, LightColor = Tint, LightEnergy = 0.9f });
+        AddChild(new OmniLight3D { OmniRange = 2.6f, LightColor = Tint, LightEnergy = 0.7f });
     }
 
     public override void _Process(double delta)
@@ -26,26 +26,25 @@ public partial class Orb : Node3D
         if (Game.I == null || !Game.I.WorldRunning || Game.I.State != GameState.Playing) return;   // freeze while paused (no mid-menu pickups) (NEW)
         float dt = (float)delta;
         _bob += dt * 3f;
-        Life -= dt;
         _mesh.RotateY(dt * 2f);
         if (Remote) return;   // client ghost: host handles collection; position comes from the snapshot
 
-        // home toward the nearest player (host or ally); collection grants XP to everyone
+        // orbs now PERSIST (no despawn) and only collect within the small PickupRange — unless a chest lodestone (magnet) is
+        // active, which vacuums every orb to the party. Homing to the nearest player; collection grants XP to everyone.
         Vector3 pp = Game.I.ResolveEnemyTarget(GlobalPosition, false, out long _, out bool _);
+        float d = new Vector2(GlobalPosition.X - pp.X, GlobalPosition.Z - pp.Z).Length();
+        var here = GlobalPosition;
+        float gy = Game.I.SurfaceHeight(GlobalPosition, 1e9f);   // sit above the actual (hilly) ground
+        here.Y = gy + 0.7f + Mathf.Sin(_bob) * 0.15f;            // a low, small persistent speck
+        bool magnet = Game.I.MagnetActive;
+        float range = Game.I.PickupRange;
+        if (magnet || d < range)
         {
-            float d = new Vector2(GlobalPosition.X - pp.X, GlobalPosition.Z - pp.Z).Length();
-            var here = GlobalPosition;
-            float gy = Game.I.SurfaceHeight(GlobalPosition, 1e9f);   // (NEW) sit above the actual (hilly) ground, not a fixed world Y
-            here.Y = gy + 1.2f + Mathf.Sin(_bob) * 0.2f;
-            if (d < 10f)
-            {
-                var target = new Vector3(pp.X, gy + 1.4f, pp.Z);
-                here = here.Lerp(target, Mathf.Clamp(dt * (3f + (10f - d)), 0, 1));
-            }
-            GlobalPosition = here;
-            if (d < 2.4f) { Game.I.GrantSharedXp(Xp); QueueFree(); return; }
+            var target = new Vector3(pp.X, gy + 1.2f, pp.Z);
+            float speed = magnet ? 15f : (6f + (range - d) * 4f);
+            here = here.Lerp(target, Mathf.Clamp(dt * speed, 0f, 1f));
+            if (new Vector2(here.X - pp.X, here.Z - pp.Z).Length() < 1.0f) { Game.I.GrantSharedXp(Xp); QueueFree(); return; }
         }
-
-        if (Life <= 0) QueueFree();
+        GlobalPosition = here;
     }
 }

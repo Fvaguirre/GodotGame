@@ -90,8 +90,8 @@ public partial class World : Node3D
     }
 
     // ---- materials --------------------------------------------------------
-    private static StandardMaterial3D Matte(Color c, float rough = 0.95f, bool outline = true)
-        => Game.Toon(c, rough, 0.22f, outline ? 0.03f : 0f);
+    private static Material Matte(Color c, float rough = 0.95f, bool outline = true)
+        => PropMat(c, outline ? 0.03f : 0f);   // (NEW) procedural toon-detail prop material (was flat Game.Toon)
 
     // ---- water shader (NEW) -----------------------------------------------
     // A stylized surface: world-space gerstner-ish sine waves displace the mesh (so it visibly rolls and is
@@ -108,6 +108,108 @@ public partial class World : Node3D
         }
         return _waterMat;
     }
+
+    // ---- terrain shader (NEW) --------------------------------------------
+    // Procedural ground detail so the floor reads as textured earth instead of flat paint: world-space fbm noise gives
+    // patchy light/dark variation, flat lit areas grass over (green), dips go dirt-brown, steep faces turn rocky-dark, and a
+    // fine speckle adds close-up grain. Uses WORLD position so it's seamless across chunks. One shared material; each chunk's
+    // biome tint is fed in via the per-instance `base_color`. Pairs with the rolling-hill geometry + SSAO/SSIL for real depth.
+    private static ShaderMaterial _terrainMat;
+    public static ShaderMaterial TerrainMat()
+    {
+        if (_terrainMat == null) _terrainMat = new ShaderMaterial { Shader = new Shader { Code = TerrainCode } };
+        return _terrainMat;
+    }
+    private const string TerrainCode = @"
+shader_type spatial;
+render_mode cull_disabled;
+
+instance uniform vec3 base_color = vec3(0.06, 0.07, 0.09);
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+float vnoise(vec2 p) {
+    vec2 i = floor(p); vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+float fbm(vec2 p) {
+    float v = 0.0; float a = 0.5;
+    for (int i = 0; i < 4; i++) { v += a * vnoise(p); p *= 2.03; a *= 0.5; }
+    return v;
+}
+
+varying vec3 wpos;
+varying vec3 wnorm;
+
+void vertex() {
+    wpos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    wnorm = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
+}
+
+void fragment() {
+    vec2 p = wpos.xz;
+    float n = fbm(p * 0.35) * 0.6 + fbm(p * 1.4) * 0.28 + fbm(p * 5.5) * 0.12;   // multi-scale ground variation
+    vec3 col = base_color * (0.66 + 0.66 * n);                                    // patchy moonlit earth
+    float flatness = clamp(wnorm.y, 0.0, 1.0);
+    // witchy/fairytale palette: cool enchanted moss on flat lit ground, moonlight pooling violet-blue in the dips
+    vec3 moss = col * vec3(0.72, 1.16, 0.92);        // faintly luminous magical green
+    vec3 dip  = col * vec3(0.86, 0.80, 1.10);        // cool violet-blue where moonlight settles
+    col = mix(dip, moss, smoothstep(0.42, 0.96, flatness) * (0.4 + 0.6 * n));
+    col = mix(vec3(0.085, 0.085, 0.125), col, smoothstep(0.34, 0.72, flatness));  // shadowed blue-violet stone on steep faces (not drab grey)
+    col += vec3(0.015, 0.045, 0.05) * smoothstep(0.74, 1.0, n);                    // a whisper of moonlit teal shimmer in the brightest patches
+    col *= 0.94 + 0.12 * fbm(p * 22.0);                                            // fine close-up speckle
+    ALBEDO = col;
+    ROUGHNESS = 0.95;
+    SPECULAR = 0.2;
+}
+";
+
+    // ---- prop shader (NEW) -----------------------------------------------
+    // Cel-shaded like the old toon material (diffuse_toon/specular_toon + ink outline via next_pass), but with object-space
+    // fbm grain layered onto the flat colour so trees/rocks/structures read with surface dimension instead of one flat tone,
+    // plus a rim glow for the fairytale feel. Cached per colour so a forest reuses one material.
+    private static Shader _propShader;
+    private static readonly System.Collections.Generic.Dictionary<uint, ShaderMaterial> _propMats = new();
+    public static ShaderMaterial PropMat(Color c, float outline = 0.03f)
+    {
+        uint key = c.ToRgba32() ^ (outline > 0f ? 1u : 0u);
+        if (_propMats.TryGetValue(key, out var cached)) return cached;
+        _propShader ??= new Shader { Code = PropCode };
+        var m = new ShaderMaterial { Shader = _propShader };
+        m.SetShaderParameter("base_color", c);
+        if (outline > 0f) m.NextPass = Game.Outline(outline);
+        _propMats[key] = m;
+        return m;
+    }
+    private const string PropCode = @"
+shader_type spatial;
+render_mode cull_back, diffuse_toon, specular_toon;
+
+uniform vec4 base_color : source_color = vec4(0.4, 0.4, 0.4, 1.0);
+uniform float rim_amt = 0.28;
+
+float hash3(vec3 p) { return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
+float n3(vec3 p) {
+    vec3 i = floor(p); vec3 f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash3(i + vec3(0,0,0)), hash3(i + vec3(1,0,0)), f.x),
+                   mix(hash3(i + vec3(0,1,0)), hash3(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), f.x),
+                   mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+varying vec3 opos;
+void vertex() { opos = VERTEX; }
+void fragment() {
+    float nz = n3(opos * 3.4) * 0.62 + n3(opos * 11.0) * 0.38;   // object-space grain → dimension on the flat toon colour
+    ALBEDO = base_color.rgb * (0.80 + 0.34 * nz);
+    ROUGHNESS = 0.92;
+    RIM = rim_amt;
+    RIM_TINT = 0.4;
+}
+";
 
     private const string WaterCode = @"
 shader_type spatial;
@@ -289,9 +391,8 @@ void fragment() {
 
         // displaced ground patch (rolling hills); double-sided so winding never hides it (NEW)
         var floor = new MeshInstance3D { Mesh = BuildTerrainMesh(c) };
-        var floorMat = Matte(ground, 0.95f, false);
-        floorMat.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
-        floor.MaterialOverride = floorMat;
+        floor.MaterialOverride = TerrainMat();   // (NEW) procedural textured ground, seamless across chunks
+        floor.SetInstanceShaderParameter("base_color", new Vector3(ground.R, ground.G, ground.B));   // feed this chunk's biome tint
         root.AddChild(floor);
 
         // Water is a per-chunk plane, so neighbouring chunks must AGREE at their shared edge or the surface ends

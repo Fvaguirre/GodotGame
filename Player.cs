@@ -55,7 +55,7 @@ public partial class Player : Node3D
     public float DashT = 0f;          // recent-dodge spike for musical tension
 
     // ---- ultimate ----
-    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze }   // …Frost = Blizzard/FrostElemental/DeepFreeze (NEW)
+    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze, HexCircle, LifeDrain, LifeCurse }   // …Forsaken = HexCircle/LifeDrain/LifeCurse (NEW)
     public UltKind Ult = UltKind.None;
     public float UltCharge = 0f;       // 0..1
     public float DmgWindow = 0f;        // damage dealt since last team-damage broadcast (ult-share)
@@ -75,6 +75,12 @@ public partial class Player : Node3D
     public bool ModGuardian = false, ModSwarm = false, ModBark = false;        // verdant legendary ult-mods
     public bool ModCyclone = false, ModHurricane = false, ModStorm = false;   // gale legendary ult-mods (NEW)
     public bool ModBlizzard = false, ModFrostElem = false, ModDeepFreeze = false;   // frost legendary ult-mods (NEW)
+    public bool ModPlague = false, ModRapture = false, ModRite = false;   // forsaken legendary ult-mods (NEW)
+    // ---- Forsaken ult runtime state (NEW) ----
+    private int _hexGroup = 0; private Node3D _hexVfx; private float _hexTickT = 0f, _hexNetT = 0f;   // Hex Circle: the mega-group id + ground field + tick throttles
+    private float _drainBank = 0f, _drainBaseY = 0f, _drainTickT = 0f, _drainNetT = 0f; private Node3D _drainVfx;   // Life Drain: banked lifesteal + hover base + aura
+    private readonly System.Collections.Generic.List<Node3D> _drainLinks = new();
+    public bool LifeDrainActive => Ult == UltKind.LifeDrain && UltActive;
     public bool HurricaneActive => Ult == UltKind.Hurricane && UltActive;      // piloting the hurricane (aloft) (NEW)
     private float _hurriBaseY = 0f;      // ground height she leapt from, to hover above and fall back to (NEW)
     private float _hurriFlingCd = 0f;    // throttles how often the storm re-flings each enemy batch (NEW)
@@ -126,7 +132,12 @@ public partial class Player : Node3D
     public float CurseShareFrac = 0.5f;   // (NEW) fraction of any damage instance shared to a cursed group-mate
     public float CurseSpreadRange = 18f;  // (NEW) how close a foe must be to a beamed foe to get pulled into its curse group
     public DamageType CurseBonusType = DamageType.Curse;   // (NEW) cursed foes take bonus damage from this type (legendary can change it)
+    public int CurseBonusType2 = -1;      // (NEW) legendary "Cursebrand": a SECOND damage type that also gets the bonus vs cursed foes (-1 = none, else a DamageType cast to int)
     public float CurseBonusMul = 1.5f;    // (NEW) how much extra the bonus type deals to cursed foes
+    public float CurseStackCap = 5f;      // (NEW) crush detonation tapers to this many EFFECTIVE stacks (diminishing returns past it); affinity cards raise it
+    public float CurseBeamLifesteal = 0.13f;   // (NEW) fraction of the suck-beam's DoT healed back to her (base-kit sustain)
+    public bool SoulTether = false, WitheringPresence = false;   // (NEW) forsaken affinity legendaries
+    private float _witherT = 0f;          // Withering Presence throttle
     // ---- Grove (Verdant minions) ----
     public System.Collections.Generic.List<Thornling> Ents = new();
     private int _entCombo = 0;
@@ -373,13 +384,12 @@ public partial class Player : Node3D
         }
     }
 
-    private Node3D _beamRig;
-    private MeshInstance3D _beamCore;
+    private SegBeam _beamSeg; private OmniLight3D _beamLight; private const int SpellLanceSegs = 7;
     private float _beamT = 0f, _beamPow = 0f, _beamWidth = 2.2f;
     private float _beamBurnT = 0f, _beamPlasmaT = 0f;   // (NEW) throttle scorch decals + plasma drips
     private Vector3 _beamDir = Vector3.Forward;   // locked at activation
     // ===== FROST WITCH: freezing beam (primary) =====
-    private Node3D _frostBeam; private float _frostBeamNetT = 0f, _frostBeamSndT = 0f, _beamHitT = 0f;
+    private SegBeam _frostSeg; private const int FrostBeamSegs = 7; private float _frostBeamNetT = 0f, _frostBeamSndT = 0f, _beamHitT = 0f, _frostMarkT = 0f;
     private Node3D _frostNock;   // (NEW) nocked ice arrow shown while charging the icicle spear
     public float FreezeRate = 1.6f;   // stacks/sec the beam builds (card-scalable later)
     public float FrostDurBonus = 0f;     // (NEW) Lingering Frost: +frozen seconds
@@ -405,6 +415,7 @@ public partial class Player : Node3D
     private static int Tier(Rarity r) => (int)r;
     private float FrenzyMul() => SanguineFrenzy ? (1f + 0.25f * (1f - Mathf.Clamp(Hp / Mathf.Max(1f, S.MaxHp), 0f, 1f))) : 1f;   // up to +25% near death
     private float Base() => 10f * S.Atk * UltDmgMul * DamageMul * FrenzyMul() * JetstreamMul();   // JetstreamMul = Gale airborne bonus (NEW)
+    public float ShatterBurstDmg() => Base() * 7.0f * ComboMul();   // (NEW) player-scaled flat shatter burst — her signature single-target snipe, tuned to edge out the Forsaken's crush (~68 → shatter ~73+ at full HP)
     public float DamageMul = 1f;   // per-witch base-damage scalar (Divine trades damage for sustain)
     public float ComboMul() => 1f + Mathf.Min(Mathf.Max(Combo - 1, 0), S.ComboCap) * S.ComboPow;
     public float ComboFrac() => Mathf.Clamp((S.ComboWindow - (Now - ComboT)) / S.ComboWindow, 0, 1);
@@ -585,7 +596,7 @@ public partial class Player : Node3D
     {
         float dt = (float)delta;
         if (_iframe > 0) _iframe -= dt;   // (FIX) always decay iframes — opening the console or being grabbed must NOT freeze immunity
-        if (Game.I != null && !Game.I.CanControlLocal()) { if (_frostBeam != null) EndFrostBeam(); if (_curseBeam != null) EndCurseBeam(); return; }
+        if (Game.I != null && !Game.I.CanControlLocal()) { if (_frostSeg != null) EndFrostBeam(); if (_curseSeg != null) EndCurseBeam(); return; }
         if (GodMode) { Hp = Mathf.Min(S.MaxHp, Hp + S.MaxHp * 3f * dt); Mana = S.ManaMax; }   // (NEW) dev god mode: takes hits (numbers show) but fast-regens + never dies
         if (GrabbedBy != 0)   // (NEW) held by a Taker: stunned + carried in its grasp
         {
@@ -622,7 +633,7 @@ public partial class Player : Node3D
 
         if (Game.I == null || !Game.I.CanControlLocal())
         {
-            if (_beamRig != null) { _beamRig.QueueFree(); _beamRig = null; _beamT = 0; }
+            if (_beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; _beamT = 0; }
             return;
         }
 
@@ -675,6 +686,7 @@ public partial class Player : Node3D
         }
 
         if (HurricaneActive) { UpdateHurricane(dt); return; }   // aloft, steering the storm (NEW)
+        if (LifeDrainActive) { UpdateLifeDrain(dt); return; }   // aloft, draining — free flight, then the release burst (NEW)
         if (_galeDiving) { UpdateGaleDive(dt); return; }   // Gale air-slam: rocket to the aimed spot, then slam (NEW)
 
         if (_rushT > 0f)
@@ -761,7 +773,7 @@ public partial class Player : Node3D
             {
                 Game.I.MaybeWaterTrail(GlobalPosition, GlobalPosition.Y, dt);   // silent ripple trail as you wade (NEW)
                 _wadeSndCd -= dt;
-                if (_wadeSndCd <= 0f) { Game.I.Sfx?.WadeAt(GlobalPosition); _wadeSndCd = 0.42f; }   // soft, infrequent wade swish — NOT a splash (NEW)
+                if (_wadeSndCd <= 0f) { Game.I.Sfx?.WadeAt(GlobalPosition); _wadeSndCd = 0.6f + GD.Randf() * 0.25f; }   // soft, infrequent, jittered wade swish — NOT a splash (NEW)
             }
             _flowerGlowCd -= dt;
             if (_flowerGlowCd <= 0f) { Game.I.GlowFlowersNear(GlobalPosition, 2.2f); _flowerGlowCd = 0.12f; }   // flowers light up as you brush past (NEW)
@@ -1575,6 +1587,9 @@ public partial class Player : Node3D
             if ((rel - dir * proj).Length() < e.Radius + 1.1f && proj < bestT) { bestT = proj; hit = e; }
         }
         float beamLen = hit != null ? bestT : len;
+        // when not locked on a foe, terminate the beam on the first surface (pumpkin/tree/wall/ground) so it stops there AND marks it
+        Vector3 fSurf = Vector3.Zero, fNorm = Vector3.Up; bool onSurface = false;
+        if (hit == null && BeamSurfaceHit(eye, dir, len, out fSurf, out fNorm)) { beamLen = (fSurf - eye).Length(); onSurface = true; }
         if (hit != null)
         {
             hit.Hurt(Base() * 1.4f * dt * ComboMul(), DamageType.Frost, true);
@@ -1582,7 +1597,20 @@ public partial class Player : Node3D
             _beamHitT -= dt;
             if (_beamHitT <= 0f) { _beamHitT = Mathf.Max(0.12f, S.FireCd); OnHitDirectNormal(hit, hit.Dead, Base() * 1.4f * _beamHitT, DamageType.Frost); }   // combo + finisher charge + mana, ticked at the normal fire rate
         }
-        EnsureFrostBeam(); PlaceFrostBeam(eye, dir, beamLen);
+        // (NEW) leave a frost mark where the beam lands — a rime patch on the foe it's freezing, or a frost scorch on the ground/wall/pumpkin it's pointed at
+        _frostMarkT -= dt;
+        if (_frostMarkT <= 0f)
+        {
+            _frostMarkT = 0.14f;
+            if (hit != null)
+            {
+                var mn = hit.GlobalPosition - eye; mn.Y *= 0.35f; mn = mn.LengthSquared() > 1e-4f ? -mn.Normalized() : Vector3.Up;
+                Game.I.SpawnImpactMark(hit.GlobalPosition + mn * (hit.Radius * 0.9f), mn, hit, DamageType.Frost, 0.5f);
+            }
+            else if (onSurface)
+            { Game.I.SpawnImpactMark(fSurf, fNorm, null, DamageType.Frost, 0.6f); Game.I.SmashNear(fSurf, 1.1f); }
+        }
+        EnsureFrostBeam(); PlaceFrostBeam(eye, dir, beamLen, dt);
         _frostBeamNetT -= dt;
         if (_frostBeamNetT <= 0f) { _frostBeamNetT = 0.1f; Game.I.NetMgr?.BroadcastVfx(50, eye + new Vector3(0, -0.2f, 0), dir, beamLen, 0f, DamageTypes.Col(DamageType.Frost)); }
         _frostBeamSndT -= dt; if (_frostBeamSndT <= 0f) { _frostBeamSndT = 0.4f; Game.I.Sfx?.Cast(DamageType.Frost); }
@@ -1590,40 +1618,47 @@ public partial class Player : Node3D
     }
     private void EnsureFrostBeam()
     {
-        if (_frostBeam != null) return;
-        _frostBeam = new Node3D(); Game.I.AddChild(_frostBeam);
-        var core = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.12f, BottomRadius = 0.12f, Height = 1f, RadialSegments = 6 }, MaterialOverride = Game.Emissive(new Color(0.65f, 0.88f, 1f), 3f) };
-        core.RotationDegrees = new Vector3(90, 0, 0); core.Name = "core"; _frostBeam.AddChild(core);
-        var glow = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.3f, BottomRadius = 0.3f, Height = 1f, RadialSegments = 6 } };
-        var gm = Game.ToonEmissive(new Color(0.6f, 0.85f, 1f), 1.4f, 0f); gm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; gm.AlbedoColor = new Color(0.7f, 0.9f, 1f, 0.3f);
-        glow.MaterialOverride = gm; glow.RotationDegrees = new Vector3(90, 0, 0); glow.Name = "glow"; _frostBeam.AddChild(glow);
+        if (_frostSeg != null) return;
+        _frostSeg = new SegBeam(FrostBeamSegs);
+        _frostSeg.Build(Game.I, seg =>
+        {
+            var core = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.12f, BottomRadius = 0.12f, Height = 1f, RadialSegments = 6 }, MaterialOverride = Game.Emissive(new Color(0.65f, 0.88f, 1f), 3f) };
+            core.RotationDegrees = new Vector3(90, 0, 0); seg.AddChild(core);
+            var glow = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.3f, BottomRadius = 0.3f, Height = 1f, RadialSegments = 6 } };
+            var gm = Game.ToonEmissive(new Color(0.6f, 0.85f, 1f), 1.4f, 0f); gm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; gm.AlbedoColor = new Color(0.7f, 0.9f, 1f, 0.3f);
+            glow.MaterialOverride = gm; glow.RotationDegrees = new Vector3(90, 0, 0); seg.AddChild(glow);
+        });
     }
-    private void PlaceFrostBeam(Vector3 eye, Vector3 dir, float len)
+    // Frost primary bows/whips as she swings her aim or strafes (SegBeam). Emanates from her hand (down-right of the crosshair).
+    private void PlaceFrostBeam(Vector3 eye, Vector3 dir, float len, float dt)
     {
+        if (_frostSeg == null) return;
         var b = _cam.GlobalTransform.Basis;
-        Vector3 hand = eye + b.X * 0.32f - b.Y * 0.42f + dir * 0.5f;   // emanate from her hand (down-right of the crosshair) so it reads as a beam
+        Vector3 origin = eye + b.X * 0.32f - b.Y * 0.42f + dir * 0.5f;
         Vector3 target = eye + dir * len;
-        Vector3 bdir = (target - hand); float blen = bdir.Length();
-        if (blen < 0.2f) blen = 0.2f; bdir = bdir.Normalized();
-        _frostBeam.GlobalPosition = (hand + target) * 0.5f;
-        _frostBeam.LookAt(_frostBeam.GlobalPosition + bdir, Vector3.Up);
-        foreach (var c in _frostBeam.GetChildren()) if (c is MeshInstance3D mi) mi.Scale = new Vector3(1f + 0.15f * Mathf.Sin(Now * 30f), blen, 1f);
+        float pulse = 1f + 0.15f * Mathf.Sin(Now * 30f);
+        _frostSeg.Place(origin, target, dt, 8f, 24f, pulse);
     }
-    public void EndFrostBeam() { if (_frostBeam != null) { _frostBeam.QueueFree(); _frostBeam = null; } }
+    public void EndFrostBeam() { _frostSeg?.Free(); _frostSeg = null; }
 
     // ===== FORSAKEN WITCH primary: a Moira-style curse-suck beam. Locks the nearest foe to the reticle (med range),
     // builds curse, and ~once a second spreads the curse to a nearby foe — tethering them into a shared-damage group
     // (up to MaxLinks). Low direct damage; the payoff is the group + the right-click crush. =====
-    private Node3D _curseBeam; private Enemy _curseTarget;
+    private Enemy _curseTarget;
+    private const float CurseBeamDmg = 0.78f;   // primary suck-beam DoT coefficient (× Base()); the group-share is where her damage really lives
+    private const int CurseBeamSegs = 7;         // the beam is drawn as this many segments so it can BOW/whip (Moira-style) instead of being a rigid line
+    private SegBeam _curseSeg; private OmniLight3D _curseLight;   // segmented lagging beam + the impact-end light
     private int _curseGroupSeq = 100;
-    private float _curseTickT = 0f, _curseSpreadT = 0f, _curseBeamNetT = 0f;
+    private float _curseTickT = 0f, _curseSpreadT = 0f, _curseBeamNetT = 0f, _curseMarkT = 0f;
     private readonly System.Collections.Generic.List<Node3D> _tetherVis = new();
 
     private bool CurseLockValid(Enemy e)
     {
         if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) return false;
-        var to = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f - EyePos; float d = to.Length();
-        return d > 0.5f && d < 30f * S.SpellRange && AimDir().Dot(to / d) > 0.78f;   // hold a wider cone than acquisition (~39°) so the lock doesn't drop
+        var aimPt = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f;
+        var to = aimPt - EyePos; float d = to.Length();
+        if (d <= 0.5f || d >= 30f * S.SpellRange || AimDir().Dot(to / d) <= 0.78f) return false;   // hold a wider cone than acquisition (~39°) so the lock doesn't drop
+        return !Game.I.SightBlocked(EyePos, aimPt);   // (NEW) a wall coming between us breaks the lock
     }
     private Enemy CurseAimTarget()
     {
@@ -1632,10 +1667,11 @@ public partial class Player : Node3D
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-            var to = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f - o; float d = to.Length();
+            var aimPt = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f;
+            var to = aimPt - o; float d = to.Length();
             if (d < 0.5f || d > 26f * S.SpellRange) continue;
             float dot = f.Dot(to / d);
-            if (dot > bestScore) { bestScore = dot; best = e; }
+            if (dot > bestScore && !Game.I.SightBlocked(o, aimPt)) { bestScore = dot; best = e; }   // (NEW) only lock foes in clear sight
         }
         return best;
     }
@@ -1654,72 +1690,194 @@ public partial class Player : Node3D
         return best;
     }
 
+    // (NEW) march the suck-beam along the reticle and return where it first meets the world — a tree/pillar (Blocker),
+    // a tall wall (Deck), or the ground (SurfaceHeight). Lets the un-locked beam terminate on that surface and scorch it.
+    // Returns false if it reaches maxDist through open air.
+    private bool BeamSurfaceHit(Vector3 eye, Vector3 dir, float maxDist, out Vector3 hit, out Vector3 normal)
+    {
+        hit = eye + dir * maxDist; normal = -dir;
+        const float stepLen = 0.8f;
+        int steps = Mathf.CeilToInt(maxDist / stepLen);
+        for (int i = 1; i <= steps; i++)
+        {
+            Vector3 p = eye + dir * Mathf.Min(i * stepLen, maxDist);
+            foreach (var pk in Game.I.Smashables)   // pumpkins — the beam hits (and, at the call site, smashes) them
+            {
+                if (pk == null || !GodotObject.IsInstanceValid(pk)) continue;
+                float fx = p.X - pk.GlobalPosition.X, fz = p.Z - pk.GlobalPosition.Z;
+                if (fx * fx + fz * fz < 0.85f && p.Y > pk.GlobalPosition.Y - 0.3f && p.Y < pk.GlobalPosition.Y + 1.4f)
+                {
+                    var n = new Vector3(fx, 0f, fz); n = n.LengthSquared() > 1e-4f ? n.Normalized() : -dir;
+                    hit = new Vector3(pk.GlobalPosition.X + n.X * 0.7f, p.Y, pk.GlobalPosition.Z + n.Z * 0.7f); normal = n; return true;
+                }
+            }
+            foreach (var bl in Game.I.Blockers)   // trees / cover pillars (treated as cylinders, matching bolt collision)
+            {
+                float fx = p.X - bl.Pos.X, fz = p.Z - bl.Pos.Z;
+                if (fx * fx + fz * fz < bl.Radius * bl.Radius)
+                {
+                    var n = new Vector3(fx, 0f, fz); n = n.LengthSquared() > 1e-4f ? n.Normalized() : -dir;
+                    hit = new Vector3(bl.Pos.X + n.X * bl.Radius, p.Y, bl.Pos.Z + n.Z * bl.Radius); normal = n; return true;
+                }
+            }
+            foreach (var wl in Game.I.Decks)   // maze / structure walls (tall decks) — hit their side face
+            {
+                if (wl.TopY < 1.8f) continue;
+                if (p.Y < wl.TopY && Mathf.Abs(p.X - wl.Center.X) < wl.Half.X && Mathf.Abs(p.Z - wl.Center.Z) < wl.Half.Y)
+                {
+                    float dx = (p.X - wl.Center.X) / wl.Half.X, dz = (p.Z - wl.Center.Z) / wl.Half.Y;
+                    normal = Mathf.Abs(dx) > Mathf.Abs(dz) ? new Vector3(Mathf.Sign(dx), 0f, 0f) : new Vector3(0f, 0f, Mathf.Sign(dz));
+                    hit = p; return true;
+                }
+            }
+            float gy = Game.I.SurfaceHeight(p, p.Y);   // ground / standable decks / ramps
+            if (p.Y <= gy + 0.1f) { hit = new Vector3(p.X, gy + 0.02f, p.Z); normal = Vector3.Up; return true; }
+        }
+        return false;
+    }
+
     private void UpdateCurseBeam(float dt)
     {
-        Enemy tgt = CurseLockValid(_curseTarget) ? _curseTarget : CurseAimTarget();   // sticky: keep the locked foe while it's alive + roughly aimed at
-        if (tgt == null) { EndCurseBeam(); _curseTarget = null; return; }
+        Enemy tgt = CurseLockValid(_curseTarget) ? _curseTarget : CurseAimTarget();   // sticky: keep the locked foe while it's alive, in sight + roughly aimed at
         _curseTarget = tgt;
-        tgt.AddCurse(dt * CurseRate, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac);   // build stacks on the beamed foe
-        tgt.Hurt(Base() * 0.95f * dt * ComboMul(), DamageType.Curse, true);   // primary DoT — the beam isn't her damage, the group is
-        int anchorCap = Mathf.FloorToInt(tgt.CurseStacks);   // 2 stacks → group of up to 2; 1 stack does nothing (no tether)
-        if (anchorCap >= 2)
+        Vector3 beamEnd;
+        if (tgt != null)
         {
-            if (tgt.CurseGroup == 0 && TotalTethered() < MaxLinks) tgt.CurseGroup = ++_curseGroupSeq;   // anchor a group
-            if (tgt.CurseGroup != 0)
+            beamEnd = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f;
+            tgt.AddCurse(dt * CurseRate, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // build stacks on the beamed foe
+            float beamDmg = Base() * CurseBeamDmg * dt * ComboMul();
+            tgt.Hurt(beamDmg, DamageType.Curse, true);   // primary DoT — the beam isn't her damage, the group is
+            if (CurseBeamLifesteal > 0f && Hp < S.MaxHp) Heal(beamDmg * CurseBeamLifesteal);   // (NEW) small sustain: siphon while beaming a live foe
+            int anchorCap = Mathf.FloorToInt(tgt.CurseStacks);   // 2 stacks → group of up to 2; 1 stack does nothing (no tether)
+            if (anchorCap >= 2)
             {
-                _curseSpreadT -= dt;
-                if (_curseSpreadT <= 0f)
+                if (tgt.CurseGroup == 0 && TotalTethered() < MaxLinks) tgt.CurseGroup = ++_curseGroupSeq;   // anchor a group
+                if (tgt.CurseGroup != 0)
                 {
-                    _curseSpreadT = 0.5f;
-                    if (GroupSize(tgt.CurseGroup) < anchorCap && TotalTethered() < MaxLinks)
+                    _curseSpreadT -= dt;
+                    if (_curseSpreadT <= 0f)
                     {
-                        var near = NearestSpreadTarget(tgt.GlobalPosition, tgt.CurseGroup, CurseSpreadRange);
-                        if (near != null) { near.AddCurse(1f, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac); Game.I.Sfx?.Poof(near.GlobalPosition); }
+                        _curseSpreadT = 0.5f;
+                        if (GroupSize(tgt.CurseGroup) < anchorCap && TotalTethered() < MaxLinks)
+                        {
+                            var near = NearestSpreadTarget(tgt.GlobalPosition, tgt.CurseGroup, CurseSpreadRange);
+                            if (near != null) { near.AddCurse(1f, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2); Game.I.Sfx?.Poof(near.GlobalPosition); }
+                        }
                     }
+                    RefreshGroup(tgt.CurseGroup, Mathf.Max(2f, anchorCap));   // keep the WHOLE group linked for the group duration (refreshed while beaming any member)
                 }
-                RefreshGroup(tgt.CurseGroup, Mathf.Max(2f, anchorCap));   // keep the WHOLE group linked for the group duration (refreshed while beaming any member)
+            }
+            _curseTickT -= dt;
+            if (_curseTickT <= 0f) { _curseTickT = Mathf.Max(0.12f, S.FireCd); OnHitDirectNormal(tgt, tgt.Dead, Base() * CurseBeamDmg * _curseTickT, DamageType.Curse); }
+            _curseMarkT -= dt;
+            if (_curseMarkT <= 0f)   // (NEW) leave a fading curse scorch on the foe the beam is eating (parented → rides with them)
+            {
+                _curseMarkT = 0.14f;
+                var mn = beamEnd - EyePos; mn.Y *= 0.35f; mn = mn.LengthSquared() > 1e-4f ? -mn.Normalized() : Vector3.Up;   // face back toward the caster
+                Game.I.SpawnImpactMark(tgt.GlobalPosition + mn * (tgt.Radius * 0.9f), mn, tgt, DamageType.Curse, 0.5f);
             }
         }
-        _curseTickT -= dt;
-        if (_curseTickT <= 0f) { _curseTickT = Mathf.Max(0.12f, S.FireCd); OnHitDirectNormal(tgt, tgt.Dead, Base() * 0.95f * _curseTickT, DamageType.Curse); }
-        EnsureCurseBeam(); PlaceCurseBeam(EyePos, AimDir(), tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f);
+        else
+        {
+            // (NEW) no lock — the beam still pours out along the reticle. Terminate it on the first surface (ground/wall/tree)
+            // and scorch that spot, so the primary leaves a mark on non-enemy surfaces too; otherwise pour to max range in open air.
+            Vector3 dir = AimDir(); float reach = 30f * S.SpellRange;
+            if (BeamSurfaceHit(EyePos, dir, reach, out var sHit, out var sNorm))
+            {
+                beamEnd = sHit;
+                _curseMarkT -= dt;
+                if (_curseMarkT <= 0f) { _curseMarkT = 0.14f; Game.I.SpawnImpactMark(sHit, sNorm, null, DamageType.Curse, 0.6f); Game.I.SmashNear(sHit, 1.1f); }
+            }
+            else beamEnd = EyePos + dir * reach;
+        }
+        EnsureCurseBeam(); PlaceCurseBeam(beamEnd, dt);
         _curseBeamNetT -= dt;
         if (_curseBeamNetT <= 0f)
         {
             _curseBeamNetT = 0.1f;
-            var end = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f;
-            Game.I.NetMgr?.BroadcastVfx(57, EyePos + new Vector3(0, -0.2f, 0), (end - EyePos), (end - EyePos).Length(), 0f, DamageTypes.Col(DamageType.Curse));
+            Game.I.NetMgr?.BroadcastVfx(57, EyePos + new Vector3(0, -0.2f, 0), (beamEnd - EyePos), (beamEnd - EyePos).Length(), 0f, DamageTypes.Col(DamageType.Curse));
         }
         FireHeat = Mathf.Min(1f, FireHeat + 0.02f);
     }
+    // (NEW) Shared "living beam" renderer. A beam is drawn as N segments whose interior control points LAG toward the
+    // straight origin→target line — most in the middle, least at the ends — so the beam BOWS and whips when either end
+    // moves (Moira-style), then springs back to true when things settle. Used by the curse beam, the frost primary, and
+    // the arcane Spelllance. Layer meshes MUST be built length-along-local-Y (Height / Size.Y = 1, rotated 90° about X);
+    // Place() scales each layer's Y to the segment length and X/Z by the girth pulse.
+    private sealed class SegBeam
+    {
+        private readonly int _n;
+        private readonly Vector3[] _pts;
+        private readonly Node3D[] _segs;
+        private bool _init;
+        public Node3D Root;
+        public SegBeam(int segs) { _n = segs; _pts = new Vector3[segs + 1]; _segs = new Node3D[segs]; }
+        public Vector3 End => _pts[_n];
+        public void Build(Node3D parent, System.Action<Node3D> buildLayers)
+        {
+            Root = new Node3D(); parent.AddChild(Root);
+            for (int s = 0; s < _n; s++) { var seg = new Node3D(); Root.AddChild(seg); buildLayers(seg); _segs[s] = seg; }
+            _init = false;
+        }
+        public void Place(Vector3 origin, Vector3 target, float dt, float lagMid, float lagEnd, float pulse)
+        {
+            if (Root == null) return;
+            if (!_init) { for (int i = 0; i <= _n; i++) _pts[i] = origin.Lerp(target, i / (float)_n); _init = true; }   // spawn straight — no first-frame whip
+            _pts[0] = origin; _pts[_n] = target;
+            for (int i = 1; i < _n; i++)
+            {
+                float f = i / (float)_n;
+                Vector3 ideal = origin.Lerp(target, f);
+                float chase = Mathf.Lerp(lagMid, lagEnd, Mathf.Abs(f - 0.5f) * 2f);   // mid = lagMid (springy) → ends = lagEnd (anchored)
+                _pts[i] = _pts[i].Lerp(ideal, Mathf.Clamp(chase * dt, 0f, 1f));
+            }
+            for (int s = 0; s < _n; s++)
+            {
+                Vector3 a = _pts[s], b = _pts[s + 1], d = b - a;
+                float len = d.Length(); if (len < 0.03f) len = 0.03f;
+                Vector3 dn = d / len;
+                _segs[s].GlobalPosition = (a + b) * 0.5f;
+                _segs[s].LookAt(_segs[s].GlobalPosition + dn, Mathf.Abs(dn.Y) > 0.98f ? Vector3.Forward : Vector3.Up);
+                foreach (var lc in _segs[s].GetChildren()) if (lc is MeshInstance3D mi) mi.Scale = new Vector3(pulse, len, pulse);
+            }
+        }
+        public void Free() { if (Root != null && GodotObject.IsInstanceValid(Root)) Root.QueueFree(); Root = null; }
+    }
+
     private void EnsureCurseBeam()
     {
-        if (_curseBeam != null) return;
-        _curseBeam = new Node3D(); Game.I.AddChild(_curseBeam);
+        if (_curseSeg != null) return;
         var col = DamageTypes.Col(DamageType.Curse);
-        void Layer(float r, Color c, float energy, float alpha)
+        _curseSeg = new SegBeam(CurseBeamSegs);
+        _curseSeg.Build(Game.I, seg =>
         {
-            var mi = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = r, BottomRadius = r, Height = 1f, RadialSegments = 8 } };
-            var m = Game.ToonEmissive(c, energy, 0f);
-            if (alpha < 1f && m is StandardMaterial3D sm) { sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; sm.AlbedoColor = new Color(c.R, c.G, c.B, alpha); }
-            mi.MaterialOverride = m; mi.RotationDegrees = new Vector3(90, 0, 0); mi.Name = "L"; _curseBeam.AddChild(mi);
-        }
-        Layer(0.5f, col, 1.4f, 0.18f);                       // soft outer halo
-        Layer(0.28f, col, 2.4f, 0.45f);                      // purple body
-        Layer(0.12f, col.Lerp(Colors.White, 0.55f), 4f, 1f); // bright inner core
-        _curseBeam.AddChild(new OmniLight3D { OmniRange = 6f, LightColor = col, LightEnergy = 2.2f });
+            void Layer(float r, Color c, float energy, float alpha)
+            {
+                var mi = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = r, BottomRadius = r, Height = 1f, RadialSegments = 8 } };
+                var m = Game.ToonEmissive(c, energy, 0f);
+                if (alpha < 1f && m is StandardMaterial3D sm) { sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; sm.AlbedoColor = new Color(c.R, c.G, c.B, alpha); }
+                mi.MaterialOverride = m; mi.RotationDegrees = new Vector3(90, 0, 0); seg.AddChild(mi);
+            }
+            Layer(0.5f, col, 1.4f, 0.18f);                       // soft outer halo
+            Layer(0.28f, col, 2.4f, 0.45f);                      // purple body
+            Layer(0.12f, col.Lerp(Colors.White, 0.55f), 4f, 1f); // bright inner core
+        });
+        _curseLight = new OmniLight3D { OmniRange = 6f, LightColor = col, LightEnergy = 2.2f };
+        _curseSeg.Root.AddChild(_curseLight);
     }
-    private void PlaceCurseBeam(Vector3 eye, Vector3 dir, Vector3 target)
+    // The beam pours from the LEFT hand (the doll rides the right) to the target, bowing/whipping via SegBeam as she strafes.
+    private void PlaceCurseBeam(Vector3 target, float dt)
     {
-        var b = _cam.GlobalTransform.Basis;
-        Vector3 hand = eye + b.X * 0.3f - b.Y * 0.42f + dir * 0.5f;
-        Vector3 d = target - hand; float len = d.Length(); if (len < 0.2f) len = 0.2f;
-        _curseBeam.GlobalPosition = (hand + target) * 0.5f;
-        _curseBeam.LookAt(_curseBeam.GlobalPosition + d.Normalized(), Vector3.Up);
-        float pulse = 1f + 0.22f * Mathf.Sin(Now * 22f) + (GD.Randf() - 0.5f) * 0.1f;   // living, flowing wobble
-        foreach (var c in _curseBeam.GetChildren()) if (c is MeshInstance3D mi) mi.Scale = new Vector3(pulse, len, pulse);
+        if (_curseSeg == null) return;
+        var basis = _cam.GlobalTransform.Basis;
+        Vector3 origin = (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))
+            ? _handMeshL.GlobalPosition
+            : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;   // fallback: a left-hand-ish offset from the eye
+        float pulse = 1f + 0.18f * Mathf.Sin(Now * 22f) + (GD.Randf() - 0.5f) * 0.08f;   // living, flowing wobble
+        _curseSeg.Place(origin, target, dt, 8f, 24f, pulse);
+        if (_curseLight != null) _curseLight.GlobalPosition = _curseSeg.End;   // omni light rides the impact end
     }
-    public void EndCurseBeam() { if (_curseBeam != null) { _curseBeam.QueueFree(); _curseBeam = null; } }
+    public void EndCurseBeam() { _curseSeg?.Free(); _curseSeg = null; _curseLight = null; }
 
     // draw a faint curse link between each pair of tethered group members (local visual; refreshed each frame)
     private void DrawCurseTethers()
@@ -1747,12 +1905,15 @@ public partial class Player : Node3D
         CamKick(0.3f + 0.35f * c);
         var tgt = CurseAimTarget();
         var col = DamageTypes.Col(DamageType.Curse);
-        if (tgt == null) { Game.I.Sfx?.Fizzle(); return; }   // nothing under the reticle
+        if (tgt == null) { _chargedRefund = false; Game.I.Sfx?.Fizzle(); return; }   // nothing under the reticle → the 0.5 mana is spent, no refund
         float perStack = Base() * 1.4f * ComboMul();   // detonation damage per stack crushed (~90 at 5 stacks after the 1.5x cursed amp)
         if (tgt.Cursed && tgt.CurseStacks > 0f)
-            tgt.ConsumeCurse(c < 0.12f ? 0.001f : c, perStack);   // consume + detonate stacks (shared to the group before it breaks)
+            tgt.ConsumeCurse(c < 0.12f ? 0.001f : c, perStack, CurseStackCap);   // consume + detonate stacks (damage tapers to CurseStackCap effective stacks; shared to the group before it breaks)
         else
             tgt.Hurt(Base() * 1.4f * ComboMul(), DamageType.Curse, true);   // no stacks → still a solid base curse hit
+        if (_chargedRefund) { if (c >= 0.95f) AddMana(1f); _chargedRefund = false; }   // consume the flag FIRST so OnHitDirect's generic any-charge refund is a no-op — hers is full-charge-only (net +0.5); a tap/partial just spends the 0.5
+        OnHitDirect(tgt, tgt.Dead, Base() * 1.4f * ComboMul(), DamageType.Curse);   // (NEW) register the crush as a charged hit: builds spell-combo count + charges spell-combo finishers (+ ult charge), like every other right-click
+        if (c >= 0.95f) ApplyChargedMods(tgt.GlobalPosition);                        // (NEW) full charge fires her equipped right-click modifiers on the struck foe (was only wired through the projectile path)
         // detonation effects at the foe — bigger for a fuller charge
         float fx = 0.7f + 0.9f * c;
         Vector3 at = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.6f;
@@ -1761,7 +1922,7 @@ public partial class Player : Node3D
         Ring(at, col.Lerp(Colors.White, 0.4f), 2.0f * fx, 0.3f);
         Game.I.SpawnPollen(at, 3.2f * fx, col, 12 + Mathf.RoundToInt(c * 10f), 0.6f, net: false);
         CurseImplosion(at, col, fx);                                            // shards of curse yanked inward, then a pop
-        if (_voodoo != null) CurseImplosion(_voodoo.GlobalPosition, col, 0.35f + 0.35f * c);   // the doll bursts in her grip
+        if (_voodoo != null) DollBurst(_voodoo.GlobalPosition, col, 0.6f + 0.5f * c);   // the doll bursts in her grip (compact outward puff — it's right in front of the camera)
         Game.I.NetMgr?.BroadcastVfx(58, tgt.GlobalPosition, Vector3.Up, 3.8f, 0f, col);
         Game.I.Sfx?.CurseCrush(tgt.GlobalPosition);
         Game.I.PlayerSound(GlobalPosition, 1.6f);
@@ -1793,6 +1954,35 @@ public partial class Player : Node3D
         pt.TweenProperty(pop, "scale", Vector3.One * (2.4f * scale), 0.18f + 0.1f * scale).SetEase(Tween.EaseType.Out);
         pt.Parallel().TweenProperty(pop, "transparency", 1f, 0.18f + 0.1f * scale);
         pt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(pop)) pop.QueueFree(); }));
+    }
+
+    // (NEW) the doll popping in her grip on release — a compact OUTWARD burst (central flash + a spray of curse motes).
+    // Deliberately small and outward-throwing: it happens right in front of the camera, where CurseImplosion's big inward
+    // shards read as spikes flying at your face. Uses ToonEmissive (instance-transparency fade, same as the pop above).
+    private void DollBurst(Vector3 at, Color col, float scale)
+    {
+        var pop = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.12f, Height = 0.24f }, MaterialOverride = Game.ToonEmissive(col.Lerp(Colors.White, 0.5f), 4f, 0f) };
+        Game.I.AddChild(pop); pop.GlobalPosition = at; pop.Scale = Vector3.One * 0.35f;
+        var pt = pop.CreateTween(); pt.SetParallel(true);
+        pt.TweenProperty(pop, "scale", Vector3.One * (1.5f * scale), 0.18f).SetEase(Tween.EaseType.Out);
+        pt.TweenProperty(pop, "transparency", 1f, 0.18f);
+        pt.SetParallel(false);
+        pt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(pop)) pop.QueueFree(); }));
+
+        int motes = Mathf.Clamp(Mathf.RoundToInt(8 * scale), 5, 12);
+        var mat = Game.ToonEmissive(col, 3f, 0f);
+        for (int i = 0; i < motes; i++)
+        {
+            var m = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.03f, Height = 0.06f }, MaterialOverride = mat };
+            Game.I.AddChild(m); m.GlobalPosition = at;
+            var dir = new Vector3(GD.Randf() - 0.5f, GD.Randf() * 0.7f + 0.05f, GD.Randf() - 0.5f).Normalized();
+            var tw = m.CreateTween(); tw.SetParallel(true);
+            tw.TweenProperty(m, "global_position", at + dir * (0.45f + GD.Randf() * 0.5f) * scale, 0.3f).SetEase(Tween.EaseType.Out);
+            tw.TweenProperty(m, "scale", Vector3.One * 0.15f, 0.3f);
+            tw.TweenProperty(m, "transparency", 1f, 0.3f);
+            tw.SetParallel(false);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(m)) m.QueueFree(); }));
+        }
     }
 
     private void BuildVoodooDoll()
@@ -2593,6 +2783,8 @@ public partial class Player : Node3D
 
     // ---- finishers ----
     public bool OwnsFinisher(FinType t) => Fin.Exists(f => f.Type == t);
+    public int FinisherRank(FinType t) { var f = Fin.Find(x => x.Type == t); return f != null ? (int)f.Rarity : -1; }   // (NEW) -1 = unowned, else the owned rarity as int (for the shop's "unowned-or-upgrade" filter)
+    public int ModifierRank(ModType t) { var m = Mods.Find(x => x.Type == t); return m != null ? (int)m.Rarity : -1; }
     private int CrescendoEvery() { var f = Fin.Find(s => s.Type == FinType.Crescendo); return f != null ? f.Every : 0; }
 
     // every witch damage source (AoE ticks, crescents, etc.) feeds the combo — throttled so ticks don't spam it
@@ -2814,32 +3006,27 @@ public partial class Player : Node3D
             _beamDir = d.LengthSquared() > 0.01f ? d.Normalized() : flat;
         }
         else _beamDir = flat;
-        if (_beamRig == null)
+        if (_beamSeg == null)
         {
-            _beamRig = new Node3D(); Game.I.AddChild(_beamRig);
             var arc = DamageTypes.Col(DamageType.Arcane);
-            // white-hot filament at the very center
-            var fil = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.3f, 0.3f, BeamLen) }, MaterialOverride = Game.Emissive(Colors.White, 6f) };
-            _beamRig.AddChild(fil);
-            // arcane plasma core
-            _beamCore = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.75f, 0.75f, BeamLen) } };
-            _beamCore.MaterialOverride = Game.Emissive(arc.Lerp(Colors.White, 0.45f), 4.5f);
-            _beamRig.AddChild(_beamCore);
-            // writhing translucent plasma sheath
-            var sheath = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(1.6f, 1.6f, BeamLen) } };
-            var sm = Game.Emissive(arc, 2.6f);
-            sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
-            var scc = sm.AlbedoColor; scc.A = 0.45f; sm.AlbedoColor = scc;
-            sheath.MaterialOverride = sm;
-            _beamRig.AddChild(sheath);
-            // soft outer glow
-            var halo = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(2.6f, 2.6f, BeamLen) } };
-            var hm = Game.Emissive(arc, 1.8f);
-            hm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
-            var hc = hm.AlbedoColor; hc.A = 0.22f; hm.AlbedoColor = hc;
-            halo.MaterialOverride = hm;
-            _beamRig.AddChild(halo);
-            _beamRig.AddChild(new OmniLight3D { OmniRange = 10f, LightColor = arc, LightEnergy = 3.5f, Position = new Vector3(0, 0, -BeamLen / 2f) });
+            _beamSeg = new SegBeam(SpellLanceSegs);
+            _beamSeg.Build(Game.I, seg =>
+            {
+                // each layer is a square-section box built length-along-local-Y (rotated 90° X) so SegBeam can stretch/bend it
+                void Layer(float g, Color c, float energy, float alpha)
+                {
+                    var mi = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(g, 1f, g) } };
+                    var m = Game.Emissive(c, energy);
+                    if (alpha < 1f) { m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; var ac = m.AlbedoColor; ac.A = alpha; m.AlbedoColor = ac; }
+                    mi.MaterialOverride = m; mi.RotationDegrees = new Vector3(90, 0, 0); seg.AddChild(mi);
+                }
+                Layer(0.3f, Colors.White, 6f, 1f);                     // white-hot filament
+                Layer(0.75f, arc.Lerp(Colors.White, 0.45f), 4.5f, 1f); // arcane plasma core
+                Layer(1.6f, arc, 2.6f, 0.45f);                         // translucent plasma sheath
+                Layer(2.6f, arc, 1.8f, 0.22f);                         // soft outer glow
+            });
+            _beamLight = new OmniLight3D { OmniRange = 10f, LightColor = arc, LightEnergy = 3.5f };
+            _beamSeg.Root.AddChild(_beamLight);
         }
         Game.I.NetMgr?.BroadcastVfx(1, EyePos, _beamDir, BeamLen, _beamWidth, DamageTypes.Col(DamageType.Arcane));
     }
@@ -2857,12 +3044,13 @@ public partial class Player : Node3D
             float px = eye.X + dir.X * proj, pz = eye.Z + dir.Z * proj;
             if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius) e.Hurt(_beamPow * dt, DamageType.Arcane, true);
         }
-        if (_beamRig != null)
+        if (_beamSeg != null)
         {
-            _beamRig.GlobalPosition = eye + dir * (BeamLen / 2f) + new Vector3(0, -0.25f, 0);
-            _beamRig.LookAt(eye + dir * BeamLen, Vector3.Up);
-            float pl = 1f + 0.18f * Mathf.Sin(Now * 40f) + (GD.Randf() - 0.5f) * 0.12f;   // pulse + plasma flicker (NEW)
-            _beamCore.Scale = new Vector3(pl, pl, 1f);
+            Vector3 origin = eye + new Vector3(0, -0.25f, 0);
+            Vector3 target = eye + dir * BeamLen + new Vector3(0, -0.25f, 0);
+            float pl = 1f + 0.18f * Mathf.Sin(Now * 40f) + (GD.Randf() - 0.5f) * 0.12f;   // pulse + plasma flicker
+            _beamSeg.Place(origin, target, dt, 8f, 24f, pl);
+            if (_beamLight != null) _beamLight.GlobalPosition = _beamSeg.End;
         }
 
         // plasma bits drip off along the beam and fall to the ground (NEW)
@@ -2910,7 +3098,7 @@ public partial class Player : Node3D
                 }
             }
         }
-        if (_beamT <= 0 && _beamRig != null) { _beamRig.QueueFree(); _beamRig = null; }
+        if (_beamT <= 0 && _beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; }
     }
 
     private void FinVolley(float pow, int t, Color col)
@@ -3150,7 +3338,7 @@ public partial class Player : Node3D
         {
             if (_voodoo == null) BuildVoodooDoll();
             _voodoo.Visible = true;
-            _voodoo.Position = new Vector3(0.03f, -0.03f, -0.17f);
+            _voodoo.Position = new Vector3(0.0f, 0.14f, -0.6f);   // sits in the fist (hand sphere is at Z -0.62): doll rises out of the grip instead of clipping the upper arm
             float clench = Charging ? ChargeAmt : 0f;                                   // squeeze harder the longer she charges
             float pop = (_animDur > 0 && _animKind == "crush") ? Mathf.Sin(Mathf.Clamp(_animT / _animDur, 0f, 1f) * Mathf.Pi) : 0f;   // full crush on release
             float sq = Mathf.Max(clench * 0.6f, pop);
@@ -3549,12 +3737,215 @@ public partial class Player : Node3D
                 CamKick(0.5f); Game.I.Sfx?.Freeze(pos); Game.I.Hud?.Banner("DEEP FREEZE");
                 break;
             }
+            // ---- Forsaken witch ults (NEW) ----
+            case UltKind.HexCircle:
+            {
+                int t = UltTier;
+                float radius = (12f + t * 0.8f) * (ModPlague ? 1.4f : 1f) * S.SpellArea;
+                _hexGroup = ++_curseGroupSeq;                 // one shared mega-group so damage cascades across everyone inside
+                UltActive = true; UltActiveT = 10f + t * 1.5f;
+                _hexTickT = 0f; _hexNetT = 0f;
+                if (_hexVfx != null && GodotObject.IsInstanceValid(_hexVfx)) _hexVfx.QueueFree();
+                _hexVfx = BuildHexField(radius); Game.I.AddChild(_hexVfx);
+                _hexVfx.GlobalPosition = new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z);
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Curse), radius, 0.7f);
+                Game.I.NetMgr?.BroadcastVfx(59, GlobalPosition, Vector3.Zero, radius, UltActiveT, DamageTypes.Col(DamageType.Curse));
+                CamKick(0.5f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.Hud?.Banner("HEX CIRCLE");
+                break;
+            }
+            case UltKind.LifeDrain:
+            {
+                int t = UltTier;
+                float radius = (11f + t * 1.5f) * S.SpellArea;
+                UltActive = true; UltActiveT = 7f + t * 1.0f;   // a proper flight-channel length, in line with Hurricane/Stormform
+                _drainBank = 0f; _drainBaseY = GlobalPosition.Y; _drainTickT = 0f; _drainNetT = 0f;
+                _grounded = false; _vy = 0f; _noFall = Mathf.Max(_noFall, 1f);   // she takes to the air for the channel
+                if (_drainVfx != null && GodotObject.IsInstanceValid(_drainVfx)) _drainVfx.QueueFree();
+                _drainVfx = BuildDrainAura(radius); AddChild(_drainVfx);   // parented to her → the aura rides along as she flies
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Curse), radius, 0.6f);
+                Game.I.NetMgr?.BroadcastVfx(60, GlobalPosition, Vector3.Zero, radius, UltActiveT, DamageTypes.Col(DamageType.Curse));
+                CamKick(0.6f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.Hud?.Banner("LIFE DRAIN — Space/Ctrl to fly, drain then release");
+                break;
+            }
+            case UltKind.LifeCurse:
+                FireLifeCurse(UltTier);   // instant missing-HP rune nuke (no channel)
+                break;
         }
+    }
+
+    // ===== FORSAKEN ULT HELPERS (NEW) =====
+    private Node3D BuildHexField(float radius)   // a curse-stain circle PROJECTED down onto the terrain — a Decal, so it conforms to hills instead of clipping like a flat disc
+    {
+        var col = DamageTypes.Col(DamageType.Curse);
+        var root = new Node3D();
+        var decal = new Decal
+        {
+            TextureAlbedo = Game.FieldTex(),
+            TextureEmission = Game.FieldTex(),
+            EmissionEnergy = 2.2f,
+            Modulate = new Color(col.R, col.G, col.B, 0.85f),
+            Size = new Vector3(radius * 2f, Mathf.Max(10f, radius * 1.6f), radius * 2f)   // Y = projection depth: spans hilly ground
+        };
+        root.AddChild(decal);
+        root.AddChild(new OmniLight3D { OmniRange = radius, LightColor = col, LightEnergy = 1.6f, Position = new Vector3(0, 1.4f, 0) });
+        return root;
+    }
+    private Node3D BuildDrainAura(float radius)   // a faint curse dome around her while she drains (parented to her)
+    {
+        var col = DamageTypes.Col(DamageType.Curse);
+        var root = new Node3D();
+        var dome = new MeshInstance3D { Mesh = new SphereMesh { Radius = radius, Height = radius * 2f } };
+        var dm = Game.ToonEmissive(col, 1.1f, 0f); dm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; dm.AlbedoColor = new Color(col.R, col.G, col.B, 0.11f);
+        dome.MaterialOverride = dm; root.AddChild(dome);
+        root.AddChild(new OmniLight3D { OmniRange = radius * 1.2f, LightColor = col, LightEnergy = 2.2f });
+        return root;
+    }
+    private void ClearDrainLinks() { foreach (var l in _drainLinks) if (l != null && GodotObject.IsInstanceValid(l)) l.QueueFree(); _drainLinks.Clear(); }
+
+    // Hex Circle tick: keep the field beneath her, and every 0.25s curse everyone inside into the one mega-group (+stacks).
+    private void UpdateHexCircle(float dt)
+    {
+        UltActiveT -= dt;
+        int t = UltTier;
+        float radius = (12f + t * 0.8f) * (ModPlague ? 1.4f : 1f) * S.SpellArea;
+        if (_hexVfx != null && GodotObject.IsInstanceValid(_hexVfx))
+            _hexVfx.GlobalPosition = new Vector3(GlobalPosition.X, Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y) + 0.05f, GlobalPosition.Z);   // ride the ground; the decal projects down onto hills
+        _hexTickT -= dt;
+        if (_hexTickT <= 0f)
+        {
+            _hexTickT = 0.25f;
+            foreach (var e in Game.I.Enemies.ToArray())
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+                e.AddCurse(0.5f, _hexGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // ~2 stacks/s and fold into the mega-group so shared damage cascades
+                if (ModPlague) e.Hurt(Base() * 0.3f, DamageType.Curse, true);                 // Plaguebearer: the ring also festers
+            }
+        }
+        _hexNetT -= dt;
+        if (_hexNetT <= 0f) { _hexNetT = 0.5f; Game.I.NetMgr?.BroadcastVfx(59, GlobalPosition, Vector3.Zero, radius, 0.6f, DamageTypes.Col(DamageType.Curse)); }
+        if (UltActiveT <= 0f)
+        {
+            UltActive = false;
+            if (_hexVfx != null && GodotObject.IsInstanceValid(_hexVfx)) { _hexVfx.QueueFree(); _hexVfx = null; }
+        }
+    }
+
+    // Life Drain: free flight + drain-link everything in range, banking the stolen life; on end, detonate for the bank.
+    private void UpdateLifeDrain(float dt)
+    {
+        UltActiveT -= dt;
+        int t = UltTier;
+        float radius = (11f + t * 1.5f) * S.SpellArea;
+        // ---- free flight (Rammatra): rise to a hover, Space climbs, Ctrl descends, movement keys drift ----
+        float minY = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y) + 4f;
+        float maxY = _drainBaseY + 22f;
+        float lift = (Input.IsActionPressed("jump") ? 1f : 0f) - (Input.IsActionPressed("descend") ? 1f : 0f);
+        float wantY = Mathf.Clamp((lift != 0f ? GlobalPosition.Y + lift * 11f * dt : GlobalPosition.Y), minY, maxY);
+        wantY = Mathf.Max(wantY, minY);
+        float ny = Mathf.MoveToward(GlobalPosition.Y, wantY, 16f * dt);
+        Vector3 hdir = InputDir();
+        Vector3 np = (hdir != Vector3.Zero) ? ClampPos(GlobalPosition + hdir * (S.Speed * 0.85f) * dt) : GlobalPosition;
+        GlobalPosition = new Vector3(np.X, ny, np.Z);
+        _grounded = false; _vy = 0f; _noFall = Mathf.Max(_noFall, 0.4f);
+        _bodyModel?.ShowWings(true);
+        // ---- drain everything in range; refresh the tether links every frame ----
+        _drainTickT -= dt; bool tick = _drainTickT <= 0f; if (tick) _drainTickT = 0.1f;
+        ClearDrainLinks();
+        var col = DamageTypes.Col(DamageType.Curse);
+        float bankCap = Base() * (6f + t * 1.5f);
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+            if (tick)
+            {
+                float drain = Base() * 0.7f * 0.1f * ComboMul();   // damage for this 0.1s tick
+                e.Hurt(drain, DamageType.Curse, true);
+                float heal = drain * 0.5f;                          // lifesteal: heal half of what she drains…
+                Heal(heal);
+                _drainBank = Mathf.Min(_drainBank + heal, bankCap);  // …and bank it as the release payload (capped)
+            }
+            _drainLinks.Add(Game.I.SpawnCurseLink(GlobalPosition, e.GlobalPosition + Vector3.Up * e.Radius * 0.5f, col));
+        }
+        if (ModRapture && tick) Game.I.NetMgr?.StormForce(GlobalPosition, radius, 0, 8f);   // Rapture: drag the crowd in toward her
+        _drainNetT -= dt;
+        if (_drainNetT <= 0f) { _drainNetT = 0.2f; Game.I.NetMgr?.BroadcastVfx(60, GlobalPosition, Vector3.Zero, radius, 0.3f, col); }
+        if (UltActiveT <= 0f) { UltActive = false; EndLifeDrainBurst(); }
+    }
+
+    private void EndLifeDrainBurst()   // the Wanda release: cross arms + detonate for the banked lifesteal
+    {
+        var col = DamageTypes.Col(DamageType.Curse);
+        float radius = (11f + UltTier * 1.5f) * S.SpellArea;
+        float burst = _drainBank;
+        SetArm("crush", 0.5f);
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+            e.Hurt(burst, DamageType.Curse, true);
+        }
+        Game.I.DamageWorld(GlobalPosition, radius, burst);
+        Game.I.SpawnGroundSigil(GlobalPosition, radius, col);
+        Ring(GlobalPosition, col, radius, 0.8f);
+        Ring(GlobalPosition, col.Lerp(Colors.White, 0.5f), radius * 0.6f, 0.5f);
+        CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, col, 1.8f);
+        Game.I.NetMgr?.BroadcastVfx(61, GlobalPosition, Vector3.Zero, radius, 0f, col);
+        CamKick(1.0f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.PlayerSound(GlobalPosition, 2.2f);
+        ClearDrainLinks();
+        if (_drainVfx != null && GodotObject.IsInstanceValid(_drainVfx)) { _drainVfx.QueueFree(); _drainVfx = null; }
+        _noFall = 3f;   // safe landing from the hover
+    }
+
+    // Life Curse: an instant rune-nuke. Damage to each foe = a fraction of its MAX HP, and that fraction grows the LOWER
+    // her current HP is (floor 10% → ceiling 50%), with a lower cap for bosses/minibosses so it can't delete their phases.
+    private void FireLifeCurse(int t)
+    {
+        var col = DamageTypes.Col(DamageType.Curse);
+        float radius = (13f + t) * S.SpellArea;
+        float missing = 1f - Mathf.Clamp(Hp / Mathf.Max(1f, S.MaxHp), 0f, 1f);
+        float frac = Mathf.Lerp(0.10f, 0.50f, Mathf.Pow(missing, 1.3f));
+        SetArm("crush", 0.5f);
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+            if (Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) continue;
+            float useFrac = e.IsBoss ? Mathf.Min(frac, 0.22f) : frac;   // IsBoss covers boss + miniboss
+            float dmg = useFrac * e.MaxHp;
+            e.Hurt(dmg, DamageType.Curse, true);                        // cursed foes still eat the curse-bonus amp on top
+            if (!e.Dead) e.AddCurse(2f, 0, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // curse the survivors
+            if (ModRite && !e.Dead) Heal(dmg * 0.05f);                  // Blood Rite: siphon a sliver of the damage back as health
+        }
+        Game.I.DamageWorld(GlobalPosition, radius, frac * 60f);
+        Game.I.SpawnGroundSigil(GlobalPosition, radius, col);
+        Ring(GlobalPosition, col, radius, 0.85f);
+        Ring(GlobalPosition, col.Lerp(Colors.White, 0.4f), radius * 0.6f, 0.5f);
+        CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, col, 1.9f);
+        Game.I.NetMgr?.BroadcastVfx(61, GlobalPosition, Vector3.Zero, radius, 0f, col);
+        CamKick(1.1f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.PlayerSound(GlobalPosition, 2.2f);
+        Game.I.Hud?.Banner("LIFE CURSE");
     }
 
     private void UpdateUlt(float dt)
     {
         if (_galeGuard > 0f) _galeGuard -= dt;   // Tailwind post-dash window decays (NEW)
+        if (WitheringPresence)   // (NEW) legendary: her very presence lightly curses AND rots every foe near her (small tick)
+        {
+            _witherT -= dt;
+            if (_witherT <= 0f)
+            {
+                _witherT = 0.4f;
+                float wr = 10f * S.SpellArea;
+                foreach (var e in Game.I.Enemies.ToArray())
+                {
+                    if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || Flat(e, GlobalPosition) >= wr + e.Radius) continue;
+                    e.AddCurse(0.15f, 0, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // presence curses (light; group 0 → no auto-tether)
+                    e.Hurt(Base() * 0.15f + e.MaxHp * 0.0015f, DamageType.Curse, false);                   // small rot: flat + a hair of max HP so even big foes visibly wither
+                }
+            }
+        }
         if (_windBoonT > 0f) _windBoonT -= dt;   // Eyewall buff decays (NEW)
         if (Cloudfeather && Airborne && !Downed && Hp < S.MaxHp) Heal(S.MaxHp * 0.025f * dt);   // Cloudfeather: mend while aloft (NEW)
         if (_barkT > 0f) { _barkT -= dt; if (_barkT <= 0f) BarkBurst(); }   // Barkskin expiry burst
@@ -3598,6 +3989,7 @@ public partial class Player : Node3D
             UltActiveT -= dt;
             if (UltActiveT <= 0f) { UltActive = false; UltDmgMul = 1f; }
         }
+        if (UltActive && Ult == UltKind.HexCircle) UpdateHexCircle(dt);   // (NEW) Forsaken curse field
         if (UltActive && Ult == UltKind.Crescent)
         {
             UpdateCrescentControl(dt);
@@ -3887,7 +4279,7 @@ public partial class Player : Node3D
         if (Downed) return;
         Downed = true; Hp = 0f; ReviveProg = 0f;
         Charging = false; ChargeAmt = 0f;
-        if (_beamRig != null) { _beamRig.QueueFree(); _beamRig = null; _beamT = 0; }
+        if (_beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; _beamT = 0; }
         Game.I.Hud?.Banner("DOWNED — hold on for an ally");
         Game.I.Sfx?.Discord();
         if (Game.I.NetMgr != null && Game.I.NetMgr.Active) Game.I.NetMgr.LocalDowned(true);
