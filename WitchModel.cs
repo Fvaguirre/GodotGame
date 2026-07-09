@@ -26,6 +26,7 @@ public partial class WitchModel : Node3D
         4 => DamageTypes.Col(DamageType.Wind),    // Gale (NEW)
         5 => DamageTypes.Col(DamageType.Frost),   // Frost (NEW)
         6 => DamageTypes.Col(DamageType.Curse),   // Forsaken (NEW)
+        7 => DamageTypes.Col(DamageType.Ember),   // Ember (NEW)
         _ => DamageTypes.Col(DamageType.Lunar),   // Lunar (default)
     };
 
@@ -36,6 +37,15 @@ public partial class WitchModel : Node3D
         var robe = Game.ToonEmissive(new Color(c.R * 0.5f, c.G * 0.5f, c.B * 0.5f), 0.45f, 0.03f);
         var trim = Game.ToonEmissive(c, 1.5f, 0.02f);
         var skin = Game.ToonEmissive(new Color(0.86f, 0.78f, 0.72f), 0.35f, 0.02f);
+        var gem = Game.ToonEmissive(c, 3.2f, 0f);                       // (GLAM) bright accent for gems / per-witch signatures
+        Material Sheer(float a)                                          // (GLAM) translucent element-tint for capes / overskirts / ribbons
+        {
+            var m = Game.ToonEmissive(c, 0.9f, 0f);
+            m.AlbedoColor = new Color(c.R, c.G, c.B, a);
+            m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+            m.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+            return m;
+        }
 
         _root = new Node3D();
         AddChild(_root);
@@ -49,14 +59,17 @@ public partial class WitchModel : Node3D
         // robe / skirt (wide at the hem) — pivots a touch for a sway
         _skirt = new Node3D { Position = new Vector3(0, 0.78f, 0) };
         _root.AddChild(_skirt);
-        Add(_skirt, new CylinderMesh { TopRadius = 0.2f, BottomRadius = 0.56f, Height = 0.74f }, robe, Vector3.Zero);
+        Add(_skirt, new CylinderMesh { TopRadius = 0.16f, BottomRadius = 0.5f, Height = 0.74f }, robe, Vector3.Zero);         // slimmer waist → hourglass
+        Add(_skirt, new CylinderMesh { TopRadius = 0.22f, BottomRadius = 0.86f, Height = 0.66f }, Sheer(0.5f), new Vector3(0, -0.06f, 0));   // (GLAM) dramatic flared overskirt, translucent
         Add(_skirt, new TorusMesh { InnerRadius = 0.5f, OuterRadius = 0.6f }, trim, new Vector3(0, -0.36f, 0), new Vector3(90, 0, 0));   // glowing hem
 
         // torso
         _torso = new Node3D { Position = new Vector3(0, 1.18f, 0) };
         _root.AddChild(_torso);
-        Add(_torso, new CylinderMesh { TopRadius = 0.18f, BottomRadius = 0.24f, Height = 0.5f }, robe, Vector3.Zero);
+        Add(_torso, new CylinderMesh { TopRadius = 0.18f, BottomRadius = 0.20f, Height = 0.5f }, robe, Vector3.Zero);
         Add(_torso, new CylinderMesh { TopRadius = 0.19f, BottomRadius = 0.19f, Height = 0.08f }, trim, new Vector3(0, 0.12f, 0));   // collar glow
+        Add(_torso, new TorusMesh { InnerRadius = 0.15f, OuterRadius = 0.19f }, trim, new Vector3(0, -0.2f, 0), new Vector3(90, 0, 0));   // (GLAM) cinched waist
+        Add(_torso, new SphereMesh { Radius = 0.06f, Height = 0.12f }, gem, new Vector3(0, -0.2f, 0.18f));                               // (GLAM) belt gem
 
         // legs / feet (peek below the hem so steps read)
         _legL = new Node3D { Position = new Vector3(-0.15f, 0.5f, 0) }; _root.AddChild(_legL);
@@ -86,15 +99,22 @@ public partial class WitchModel : Node3D
 
         if (firstPerson) return;   // local body: skip head/hat/arms — the FP camera hands cover those
 
+        // (GLAM, third-person) sharp shoulder pauldrons — a fierce, high-fashion silhouette
+        Add(_torso, new CylinderMesh { TopRadius = 0.02f, BottomRadius = 0.15f, Height = 0.16f }, trim, new Vector3(-0.23f, 0.19f, 0), new Vector3(0, 0, 62));
+        Add(_torso, new CylinderMesh { TopRadius = 0.02f, BottomRadius = 0.15f, Height = 0.16f }, trim, new Vector3(0.23f, 0.19f, 0), new Vector3(0, 0, -62));
+        // (GLAM) a flowing cape/train from the upper back (translucent element tint)
+        Add(_torso, new CylinderMesh { TopRadius = 0.14f, BottomRadius = 0.42f, Height = 1.05f }, Sheer(0.8f), new Vector3(0, -0.42f, -0.16f), new Vector3(-9, 0, 0));
+
         // head
         Add(_root, new SphereMesh { Radius = 0.17f, Height = 0.34f }, skin, new Vector3(0, 1.62f, 0));
 
         // witch hat (brim + cone), tilts a little while moving
         _hat = new Node3D { Position = new Vector3(0, 1.74f, 0) };
         _root.AddChild(_hat);
-        Add(_hat, new CylinderMesh { TopRadius = 0.42f, BottomRadius = 0.46f, Height = 0.05f }, trim, new Vector3(0, 0f, 0.02f));
-        Add(_hat, new CylinderMesh { TopRadius = 0.0f, BottomRadius = 0.3f, Height = 0.62f }, robe, new Vector3(0, 0.34f, 0.04f), new Vector3(-6, 0, 0));
+        Add(_hat, new CylinderMesh { TopRadius = 0.44f, BottomRadius = 0.5f, Height = 0.05f }, trim, new Vector3(0, 0f, 0.02f));       // wider, sharper brim
+        Add(_hat, new CylinderMesh { TopRadius = 0.0f, BottomRadius = 0.3f, Height = 0.82f }, robe, new Vector3(0, 0.44f, 0.06f), new Vector3(-8, 0, 0));   // taller cone, jauntier tilt
         Add(_hat, new TorusMesh { InnerRadius = 0.16f, OuterRadius = 0.2f }, trim, new Vector3(0, 0.08f, 0.03f), new Vector3(90, 0, 0));
+        Add(_hat, new SphereMesh { Radius = 0.055f, Height = 0.11f }, gem, new Vector3(0, 0.09f, 0.22f));                              // (GLAM) hatband gem
 
         // arms (third-person only; FP uses the camera hands). Pivot at the shoulder, mesh hangs down.
         _armL = new Node3D { Position = new Vector3(-0.27f, 1.32f, 0) }; _root.AddChild(_armL);
@@ -103,6 +123,49 @@ public partial class WitchModel : Node3D
         _armR = new Node3D { Position = new Vector3(0.27f, 1.32f, 0) }; _root.AddChild(_armR);
         Add(_armR, new CapsuleMesh { Radius = 0.07f, Height = 0.55f }, robe, new Vector3(0, -0.26f, 0));
         Add(_armR, new SphereMesh { Radius = 0.075f, Height = 0.15f }, skin, new Vector3(0, -0.52f, 0));
+
+        // ---- per-witch signature flare (third-person; each coven member reads at a glance) ----
+        switch (witchIdx)
+        {
+            case 1:   // Divine — a floating halo above the head
+                Add(_root, new TorusMesh { InnerRadius = 0.17f, OuterRadius = 0.21f }, gem, new Vector3(0, 2.0f, 0), new Vector3(90, 0, 0));
+                break;
+            case 2:   // Crimson — devil horns curling off the hat + a barbed collar
+                Add(_hat, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.06f, Height = 0.34f }, gem, new Vector3(-0.17f, 0.16f, 0.04f), new Vector3(0, 0, 34));
+                Add(_hat, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.06f, Height = 0.34f }, gem, new Vector3(0.17f, 0.16f, 0.04f), new Vector3(0, 0, -34));
+                Add(_torso, new TorusMesh { InnerRadius = 0.14f, OuterRadius = 0.19f }, gem, new Vector3(0, 0.24f, 0), new Vector3(78, 0, 0));
+                break;
+            case 3:   // Verdant — antlers crowning the head
+                Add(_root, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.035f, Height = 0.4f }, gem, new Vector3(-0.13f, 1.74f, 0), new Vector3(0, 0, 46));
+                Add(_root, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.035f, Height = 0.4f }, gem, new Vector3(0.13f, 1.74f, 0), new Vector3(0, 0, -46));
+                Add(_root, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.025f, Height = 0.22f }, gem, new Vector3(-0.22f, 1.9f, 0), new Vector3(0, 0, 60));
+                Add(_root, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.025f, Height = 0.22f }, gem, new Vector3(0.22f, 1.9f, 0), new Vector3(0, 0, -60));
+                break;
+            case 4:   // Gale — trailing shoulder ribbons swept back
+                Add(_torso, new BoxMesh { Size = new Vector3(0.08f, 0.9f, 0.02f) }, Sheer(0.75f), new Vector3(-0.24f, -0.2f, -0.12f), new Vector3(-16, 0, 10));
+                Add(_torso, new BoxMesh { Size = new Vector3(0.08f, 0.9f, 0.02f) }, Sheer(0.75f), new Vector3(0.24f, -0.2f, -0.12f), new Vector3(-16, 0, -10));
+                break;
+            case 5:   // Frost — a crystalline crown of ice shards
+                for (int k = -2; k <= 2; k++)
+                    Add(_hat, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.045f, Height = 0.24f + (2 - Mathf.Abs(k)) * 0.06f }, gem, new Vector3(k * 0.11f, 0.06f, 0.2f), new Vector3(-14, 0, k * -8));
+                break;
+            case 6:   // Forsaken — a jagged crown of curse-runes ringing the head
+                for (int k = 0; k < 5; k++)
+                {
+                    float a = k / 5f * Mathf.Tau;
+                    Add(_root, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.035f, Height = 0.22f }, gem, new Vector3(Mathf.Sin(a) * 0.24f, 1.82f, Mathf.Cos(a) * 0.24f), new Vector3(24, Mathf.RadToDeg(a), 0));
+                }
+                break;
+            case 7:   // Ember — a crown of upward flame-spikes on the hat
+                for (int k = -2; k <= 2; k++)
+                    Add(_hat, new CylinderMesh { TopRadius = 0f, BottomRadius = 0.05f, Height = 0.26f + (2 - Mathf.Abs(k)) * 0.08f }, gem, new Vector3(k * 0.1f, 0.5f, 0.14f), new Vector3(-10, 0, k * 6));
+                break;
+            default:  // Lunar — a crescent moon crowning the hat + tiny orbiting moons
+                Add(_hat, new TorusMesh { InnerRadius = 0.1f, OuterRadius = 0.14f }, gem, new Vector3(0, 0.66f, 0.02f), new Vector3(78, 0, 18));
+                Add(_hat, new SphereMesh { Radius = 0.035f, Height = 0.07f }, gem, new Vector3(-0.22f, 0.5f, 0));
+                Add(_hat, new SphereMesh { Radius = 0.03f, Height = 0.06f }, gem, new Vector3(0.24f, 0.42f, 0.03f));
+                break;
+        }
     }
 
     public void ShowWings(bool on)

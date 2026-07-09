@@ -93,6 +93,33 @@ public partial class Enemy : Node3D
         _poiT = Mathf.Max(_poiT, dur);
         _poiOwner = owner != 0 ? owner : (Game.I != null ? Game.I.LocalPeer : 1);   // (NEW) caster peer (host-applied = host)
     }
+
+    // ---- Ember: burn stacks → Living Bomb (NEW) ----
+    private float _burnStacks = 0f, _burnPerStack = 0f, _burnT = 0f, _burnTick = 0f, _bombFlat = 0f;
+    private int _livingBombStacks = 0, _remoteLivingBomb = 0, _burnOwner = 1;   // _burnOwner = caster peer (for Wildfire Rush burn-tick lifesteal)
+    private float _remoteBurn = 0f;
+    public float BurnStacks => Remote ? _remoteBurn : _burnStacks;
+    public void SetRemoteBurn(float b) { _remoteBurn = b; }   // (NEW) client burn stacks (synced via the snapshot's burn array)
+    public int LivingBombStacks => Remote ? _remoteLivingBomb : _livingBombStacks;
+    public float LivingBombThreshold => Mathf.Clamp(3f + MaxHp / 45f, 3f, 60f);   // HP-scaled, like the freeze threshold
+    public void AddBurn(float amt, float perStack, float bombFlat, float durBonus = 0f, int owner = 0)
+    {
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 6, amt, perStack, bombFlat); return; }   // client → host (status kind 6; host uses sender as owner)
+        if (Dead) return;
+        _burnStacks += amt;
+        _burnPerStack = Mathf.Max(_burnPerStack, perStack);   // best-of the caster's burn power
+        _bombFlat = Mathf.Max(_bombFlat, bombFlat);
+        _burnT = Mathf.Max(_burnT, 3.5f + durBonus);
+        _burnOwner = owner != 0 ? owner : (Game.I != null ? Game.I.LocalPeer : 1);
+        while (_burnStacks >= LivingBombThreshold) { _burnStacks -= LivingBombThreshold; _livingBombStacks++; TriggerLivingBomb(); }   // each threshold crossing = a Living Bomb stack + a blast on THIS foe
+    }
+    private void TriggerLivingBomb()   // reaching Living Bomb status → an immediate blast on THIS foe ONLY (flat, base-scaled). Repeats as stacks pile.
+    {
+        Hurt(_bombFlat, DamageType.Ember, false);
+        Game.I.SpawnEmberBurst(GlobalPosition + Vector3.Up * Radius * 0.5f, Radius * 1.5f);   // broadcasts kind 21 → allies see it
+        Game.I.Sfx?.ModEmber(GlobalPosition);
+        if (Game.I.Player != null && Game.I.Player.EmberWitch) Game.I.MyStats.Highlight++;   // Ember highlight = bombs detonated
+    }
     private bool _bleedRot = false;
     private float _rotBubT = 0f;
     private bool _rotShow = false;     // client mirror of the rot state (status bit 32)
@@ -147,6 +174,7 @@ public partial class Enemy : Node3D
     public void Fling(Vector3 velocity)
     {
         if (Remote || Dead) return;
+        if (IsTaker && _grabPeer != 0) ReleaseGrab();   // (NEW) a flung Taker drops whoever it's carrying
         if (_behav == EBehav.Boss) { Knockback(GlobalPosition - velocity, 1.5f); return; }
         float mass = 0.85f + Radius * 0.4f;   // weight: heavies launch lower than light foes, but everyone gets real air now (was 0.6 + Radius, which barely budged big enemies) (NEW)
         _throwVel = velocity / mass;
@@ -405,7 +433,7 @@ public partial class Enemy : Node3D
         // (NEW) named wave mutators: Blood Moon / Surge foes move faster (bosses excepted, they have their own pacing)
         if (!IsBoss && Game.I != null)
         {
-            if (Game.I.ActiveMutator == WaveMutator.BloodMoon) Speed *= 1.3f;
+            if (Game.I.ActiveMutator == WaveMutator.BloodMoon) Speed *= 1.2f;   // (NERF 1.3→1.2) still "fast", but fewer hits land — Blood Moon foes were hitting too hard (director already ups their damage at that Heat)
             else if (Game.I.ActiveMutator == WaveMutator.Surge) Speed *= 1.18f;
         }
         float dmul = Game.I?.DirectorStatMul ?? 1f;   // enemy director: extra HP/damage when the party is dominating
@@ -873,6 +901,12 @@ public partial class Enemy : Node3D
             SlowT = Mathf.Max(SlowT, 0.2f);   // poison ivy slows as long as it's ticking on them
             if (_poiTick <= 0f) { _poiTick = 0.4f; if (!Dead) { Hurt(_poiDps * 0.4f, DamageType.Nature, false); Game.I.AwardDotCombo(_poiOwner); } }   // (NEW) DoT trickles combo to its caster
             if (_poiT <= 0f) _poiDps = 0f;
+        }
+        if (_burnT > 0f)   // (NEW) Ember burn DoT — ticks stacks × per-stack dps; stacks reset when it burns out
+        {
+            _burnT -= dt; _burnTick -= dt;
+            if (_burnTick <= 0f) { _burnTick = 0.4f; if (!Dead) { float bd = _burnStacks * _burnPerStack * 0.4f; Hurt(bd, DamageType.Ember, false); Game.I?.AwardBurnLifesteal(_burnOwner, bd); } }   // (NEW) burn ticks lifesteal to the owner (Wildfire Rush)
+            if (_burnT <= 0f) _burnStacks = 0f;
         }
         if (_knock.LengthSquared() > 0.0001f)
         {
@@ -2035,6 +2069,7 @@ public partial class Enemy : Node3D
             return;
         }
         if (IsGoblin && Game.I.GoblinTime < 0f) Game.I.GoblinTime = 12f;   // chase clock starts on first strike
+        _lastAttackerPeer = Game.I.AttackerPeer;   // (NEW) credit this damage's dealer (host's own = LocalPeer; a client's routed hit = the reporter)
         var pl = Game.I.Player;
         if (pl != null) dmg *= pl.LunarNightMul(type);   // Lunar Witch: ALL lunar damage waxes stronger at night
         _lastType = type; _lastCombo = fromCombo;
@@ -2092,7 +2127,7 @@ public partial class Enemy : Node3D
         else if (_type == "taker" && _takerState == 2) m |= (1 & 3) << 7;  // (NEW) wall-stun → lie pose on clients
         if (_screamT > 0f) m |= 512;               // (NEW) scream pulse
         if (FrozenT > 0f) m |= 1024;               // (NEW) frozen in ice
-        m |= (Mathf.RoundToInt(FrozenBlueFrac * 15f) & 0xF) << 11;   // (NEW) blue ice-bar (coarse)
+        m |= (Mathf.Min(_livingBombStacks, 15) & 0xF) << 11;   // (REPURPOSED bits 11-14, was the dead blue ice-bar) Ember Living Bomb stacks (0-15) — for the HUD indicator on every client
         m |= (Mathf.Min((int)FreezeStacks, 63) & 0x3F) << 15;        // (NEW) freeze stacks (for the indicator)
         if (CurseT > 0f) m |= 1 << 21;                               // (NEW) cursed
         m |= (Mathf.Min((int)CurseStacks, 63) & 0x3F) << 22;         // (NEW) curse stacks (overhead counter)
@@ -2161,6 +2196,7 @@ public partial class Enemy : Node3D
     {
         FrozenT = 5f + _freezeDurBonus; FreezeStacks = 0f; _freezeExpT = 0f;
         _frozenBlueMax = 0f; _frozenBlue = 0f; _frozenBlueDmg = 0f;   // no blue bank anymore (FrozenBlueFrac stays 0 → the bar isn't drawn)
+        if (IsTaker && _grabPeer != 0) ReleaseGrab();   // (NEW) freezing a Taker (a hard stun, not slow/root) makes it drop its captive
         RootT = Mathf.Max(RootT, FrozenT);   // held in place
         EnsureIceBlock(true);
         Game.I.Sfx?.Freeze(GlobalPosition);
@@ -2232,7 +2268,7 @@ public partial class Enemy : Node3D
         bool frozen = (mask & 1024) != 0;   // (NEW) mirror the ice block + blue bar + stacks
         FrozenT = frozen ? 1f : 0f;
         EnsureIceBlock(frozen);
-        _remoteBlueFrac = ((mask >> 11) & 0xF) / 15f;
+        _remoteLivingBomb = (mask >> 11) & 0xF;   // (REPURPOSED bits 11-14) Ember Living Bomb stacks on the client
         FreezeStacks = (mask >> 15) & 0x3F;
         _remoteCursed = (mask & (1 << 21)) != 0;   // (NEW) mirror cursed glow + overhead counter + tether group
         CurseStacks = (mask >> 22) & 0x3F;
@@ -2246,9 +2282,16 @@ public partial class Enemy : Node3D
         }
     }
 
+    private long _lastAttackerPeer = 1;   // (NEW) who dealt the most recent damage — for host-authoritative kill credit
     private void Die()
     {
         Dead = true;
+        Game.I?.CreditKill(_lastAttackerPeer, Game.I != null && Game.I.IsNight);   // (NEW) exact MP kill attribution (host/solo only reaches Die)
+        if (_livingBombStacks > 0 && Game.I != null)   // (NEW) Ember Living Bomb: on death, erupt Z times ~0.2s apart at the death spot — each blast % of MAX hp, chaining through the crowd
+        {
+            var burst = new EmberDeathBurst(); Game.I.AddChild(burst);
+            burst.Init(GlobalPosition + Vector3.Up * Radius * 0.5f, _livingBombStacks, 5.5f + Radius, MaxHp * 0.16f);
+        }
         if (_type == "swarmer") Game.I.Sfx?.ZombieDeath(GlobalPosition);   // (NEW)
         if (_type == "taker") { ReleaseGrab(); Game.I.Sfx?.TakerDeath(GlobalPosition); }   // (NEW) free the captive
         if (Affix == 4 || (Game.I != null && Game.I.ActiveMutator == WaveMutator.Volatile && !IsBoss && !IsGoblin)) Explode();   // volatile affix OR the Volatile mutator: blast on death (players only, never other enemies)

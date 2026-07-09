@@ -44,6 +44,11 @@ public partial class EnemyBolt : Node3D
             return;
         }
 
+        // (NEW) Ring of Fire eats incoming enemy projectiles — puff + crackle, damage negated
+        foreach (var fr in Game.I.FireRings)
+            if (new Vector2(GlobalPosition.X - fr.Pos.X, GlobalPosition.Z - fr.Pos.Z).Length() < fr.Radius)
+            { Game.I.SpawnEmberBurst(GlobalPosition, 1.3f); Game.I.Sfx?.Impact(DamageType.Ember); QueueFree(); return; }
+
         // Faith Shield: enemy fire is absorbed by the dome and chips its HP
         var sh = Game.I.Shield;
         if (sh != null && GodotObject.IsInstanceValid(sh) && p != null)

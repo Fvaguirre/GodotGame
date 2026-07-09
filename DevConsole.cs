@@ -22,6 +22,9 @@ public partial class DevConsole : CanvasLayer
         ("crimson", "The Crimson Blood Witch"),
         ("verdant", "The Verdant Witch"),
         ("gale",    "The Gale Witch"),
+        ("frost",   "The Frost Witch"),
+        ("forsaken","The Forsaken Witch"),
+        ("ember",   "The Ember Witch"),
     };
 
     public override void _Ready()

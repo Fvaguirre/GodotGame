@@ -24,6 +24,9 @@ public partial class GroundField : Node3D
     public float SlowMul = 0f;         // >0 = slow enemies inside
     public float RotDps = 0f;          // >0 = apply spreading rot-bleed to enemies inside (Blood Rot)
     public float PoisonAdd = 0f;       // >0 = stack additive Nature poison on foes standing inside (Creeping Blight)
+    public float BurnAdd = 0f, BurnPer = 0f, BurnBomb = 0f;   // (NEW) >0 = stack Ember burn on foes inside (Meteor Descent inferno)
+    public int BurnOwner = 0;          // (NEW) caster peer for the burn's lifesteal attribution
+    private float _burnTick = 0f;
     public bool Remote = false;        // client visual copy
     public bool HealAllies = false;    // also heal nearby ally avatars over the network (rez beam)
     private bool _announced = false;
@@ -146,6 +149,17 @@ public partial class GroundField : Node3D
                 _poiTick = 0f;
                 foreach (var e in Game.I.Enemies.ToArray())
                     if (e != null && !e.Dead && Flat(e.GlobalPosition) < Radius) { e.Poison(PoisonAdd, 2.5f); if (SlowMul > 0f) e.Slow(0.5f, SlowMul); }
+            }
+        }
+
+        if (BurnAdd > 0f)   // (NEW) Ember inferno: keep stacking burn on anything standing in it
+        {
+            _burnTick += dt;
+            if (_burnTick >= 0.6f)
+            {
+                _burnTick = 0f;
+                foreach (var e in Game.I.Enemies.ToArray())
+                    if (e != null && !e.Dead && Flat(e.GlobalPosition) < Radius) e.AddBurn(BurnAdd, BurnPer, BurnBomb, 0f, BurnOwner);
             }
         }
 

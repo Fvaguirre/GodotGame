@@ -152,6 +152,41 @@ public partial class Hud : Control
         DrawString(f, p, s, a, w, fs, col);
     }
 
+    // a little flame glyph (drawn, so it always renders) centered at c, height ~2s.
+    // Built ONLY from circles — DrawColoredPolygon triangulation is unreliable in this Godot build (even for triangles),
+    // so a stack of shrinking circles gives a flame silhouette with zero triangulation risk.
+    private void DrawFlameIcon(Vector2 c, float s, Color col)
+    {
+        if (s < 1f) s = 1f;
+        DrawCircle(c + new Vector2(0, 0.45f * s), 0.5f * s, col);    // base
+        DrawCircle(c + new Vector2(0, 0.0f * s), 0.36f * s, col);    // body
+        DrawCircle(c + new Vector2(0, -0.42f * s), 0.22f * s, col);  // upper
+        DrawCircle(c + new Vector2(0, -0.78f * s), 0.11f * s, col);  // tip
+        var y = new Color(1f, 0.92f, 0.45f, col.A);
+        DrawCircle(c + new Vector2(0, 0.42f * s), 0.26f * s, y);     // inner glow
+        DrawCircle(c + new Vector2(0, -0.05f * s), 0.15f * s, y);
+    }
+
+    // a little bomb glyph with a sparking fuse, centered at c
+    private void DrawBombIcon(Vector2 c, float s, float spark)
+    {
+        DrawCircle(c + new Vector2(0, 0.2f * s), 0.54f * s, new Color(0.1f, 0.1f, 0.12f));
+        DrawCircle(c + new Vector2(-0.18f * s, 0.02f * s), 0.15f * s, new Color(0.4f, 0.4f, 0.46f));   // highlight
+        DrawLine(c + new Vector2(0.08f * s, -0.32f * s), c + new Vector2(0.42f * s, -0.74f * s), new Color(0.5f, 0.42f, 0.28f), Mathf.Max(1f, 0.14f * s));
+        DrawCircle(c + new Vector2(0.42f * s, -0.74f * s), 0.18f * s * (0.7f + 0.5f * spark), new Color(1f, 0.72f, 0.22f));
+    }
+
+    // draw an icon + short label as ONE group centered horizontally on cx (fits regardless of count width)
+    private void IconLabel(Font f, float cx, float baselineY, bool bomb, string txt, float fs, Color txtCol, float spark = 0f)
+    {
+        float iconS = fs, gap = 3f;
+        var tw = f.GetStringSize(txt, HorizontalAlignment.Left, -1, Mathf.RoundToInt(fs));
+        float total = iconS + gap + tw.X, sx = cx - total / 2f;
+        var ic = new Vector2(sx + iconS * 0.5f, baselineY - fs * 0.34f);
+        if (bomb) DrawBombIcon(ic, iconS, spark); else DrawFlameIcon(ic, iconS * 0.9f, new Color(1f, 0.55f, 0.2f));
+        T(f, new Vector2(sx + iconS + gap, baselineY), txt, fs, txtCol, HorizontalAlignment.Left, -1, Mathf.RoundToInt(1f * (fs / 10f)));
+    }
+
     // a top-right radar: player-relative (up = facing), dots for nearby threats & points of interest
     private void DrawMinimap(Game g, Player p, Vector2 vp, float u)
     {
@@ -422,36 +457,68 @@ public partial class Hud : Control
 
         if (g.State == GameState.Over)
         {
-            DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.62f));
-            T(_head, new Vector2(0f, c.Y - 6 * u), "YOU FELL", 52 * u, new Color(0.95f, 0.4f, 0.45f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
-            T(_body, new Vector2(0f, c.Y + 36 * u), $"Wave {g.Wave}  ·  {g.Score} banished  ·  best combo x{p?.BestCombo}", 18 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.72f));
+            float top = vp.Y * 0.08f;
+            T(_head, new Vector2(0f, top), "YOU FELL", 46 * u, new Color(0.95f, 0.4f, 0.45f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
+            T(_body, new Vector2(0f, top + 52 * u), $"Wave {g.Wave}  ·  {g.Score} banished  ·  best combo x{p?.BestCombo}", 17 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+
+            // ---- scoreboard: one row per warden (solo = one). Kills come from the host's authoritative tally, not the personal block ----
+            var pr = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<long, RunStats>>(g.AllStats);
+            if (pr.Count == 0) pr.Add(new System.Collections.Generic.KeyValuePair<long, RunStats>(g.LocalPeer, g.MyStats));
+            pr.Sort((a, b) => a.Value.Slot.CompareTo(b.Value.Slot));
+            float tw = Mathf.Min(vp.X * 0.96f, 1300 * u), tx = (vp.X - tw) / 2f, ty = top + 92 * u;
+            string[] heads = { "WARDEN", "KILLS", "DMG", "BOSS", "HEAL", "TAKEN", "FLUNG", "DOWNS", "REVIVES", "COMBO", "BIG HIT", "SIGNATURE" };
+            float[] fr = { 0.11f, 0.06f, 0.09f, 0.08f, 0.08f, 0.07f, 0.06f, 0.06f, 0.07f, 0.06f, 0.07f, 0.19f };
+            float[] cx = new float[heads.Length]; float acc = 0f;
+            for (int i = 0; i < heads.Length; i++) { cx[i] = tx + acc * tw; acc += fr[i]; }
+            for (int i = 0; i < heads.Length; i++) T(_body, new Vector2(cx[i], ty), heads[i], 12 * u, GoldDim, HorizontalAlignment.Left, tw * fr[i], 1);
+            ty += 22 * u;
+            foreach (var kv in pr)
+            {
+                var s = kv.Value; var wc = WitchModel.WitchColor(s.WitchIdx);
+                int kills = g.KillTally.GetValueOrDefault(kv.Key);
+                string sig = s.WitchIdx == 0 ? $"Night Kills: {g.NightKillTally.GetValueOrDefault(kv.Key)}" : $"{RunStats.HighlightLabel(s.WitchIdx)}: {s.HighlightValue()}";
+                DrawRect(new Rect2(tx - 6 * u, ty - 2 * u, tw + 12 * u, 22 * u), new Color(wc.R, wc.G, wc.B, 0.12f));
+                void Cell(int i, string txt, Color col) => T(_body, new Vector2(cx[i], ty), txt, 14 * u, col, HorizontalAlignment.Left, tw * fr[i], 1);
+                T(_head, new Vector2(cx[0], ty), RunStats.WitchName(s.WitchIdx), 15 * u, wc, HorizontalAlignment.Left, tw * fr[0], 1);
+                Cell(1, $"{kills}", Gold);
+                Cell(2, $"{s.DamageDealt:0}", Gold);
+                Cell(3, $"{s.BossDamage:0}", Gold);
+                Cell(4, $"{s.Healing:0}", new Color(0.6f, 0.95f, 0.7f));
+                Cell(5, $"{s.DamageTaken:0}", new Color(0.95f, 0.55f, 0.5f));
+                Cell(6, $"{s.Flings}", Gold);
+                Cell(7, $"{s.TimesDowned}", GoldDim);
+                Cell(8, $"{s.Revives}", new Color(0.6f, 0.95f, 0.7f));
+                Cell(9, $"x{s.BestCombo}", Gold);
+                Cell(10, $"{s.BiggestHit:0}", Gold);
+                T(_body, new Vector2(cx[11], ty), sig, 12 * u, wc.Lerp(Colors.White, 0.25f), HorizontalAlignment.Left, tw * fr[11], 1);
+                ty += 24 * u;
+            }
+
+            // ---- retry / continue options, below the scoreboard ----
             ROver = RChangeWitch = ROverRetry = ROverCharSelect = ROverEnd = new Rect2();
             bool mp = g.NetMgr != null && g.NetMgr.Active;
             var viol = DamageTypes.Col(DamageType.Lunar);
-            if (!mp)   // solo — scene reload is fine
+            float oy = ty + 22 * u, bw = 300 * u, bx = vp.X / 2f - bw / 2f;
+            void Opt(ref Rect2 r, string label, Color col, float h)
             {
-                ROver = new Rect2(vp.X / 2f - 130 * u, c.Y + 64 * u, 260 * u, 32 * u);
-                Frame(ROver, new Color(0.95f, 0.4f, 0.45f, 0.6f), 1.5f * u);
-                T(_body, new Vector2(0f, c.Y + 70 * u), "Rise again   [Enter]", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-                RChangeWitch = new Rect2(vp.X / 2f - 130 * u, c.Y + 104 * u, 260 * u, 30 * u);
-                Frame(RChangeWitch, new Color(viol.R, viol.G, viol.B, 0.6f), 1.5f * u);
-                T(_body, new Vector2(0f, c.Y + 109 * u), "Change witch   [C]", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+                r = new Rect2(bx, oy, bw, h); Frame(r, new Color(col.R, col.G, col.B, 0.7f), 1.5f * u);
+                T(_body, new Vector2(0f, oy + (h - 16 * u) * 0.5f), label, 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+                oy += h + 10 * u;
             }
-            else if (g.NetMgr.IsHost)   // host decides for the whole group (keeps everyone connected)
+            if (!mp)
             {
-                float bw = 300 * u, bh = 34 * u, bx = vp.X / 2f - bw / 2f, by = c.Y + 60 * u;
-                void Opt(ref Rect2 r, string label, Color col)
-                {
-                    r = new Rect2(bx, by, bw, bh); Frame(r, new Color(col.R, col.G, col.B, 0.7f), 1.5f * u);
-                    T(_body, new Vector2(0f, by + 8 * u), label, 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
-                    by += 44 * u;
-                }
-                Opt(ref ROverRetry, "Retry — same witches", new Color(0.5f, 0.9f, 0.55f));
-                Opt(ref ROverCharSelect, "Character Select", viol);
-                Opt(ref ROverEnd, "End Game", new Color(0.95f, 0.4f, 0.45f));
+                Opt(ref ROver, "Rise again   [Enter]", new Color(0.95f, 0.4f, 0.45f), 32 * u);
+                Opt(ref RChangeWitch, "Change witch   [C]", viol, 30 * u);
             }
-            else   // client waits for the host's call
-                T(_body, new Vector2(0f, c.Y + 74 * u), "waiting for the host to decide…", 17 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+            else if (g.NetMgr.IsHost)
+            {
+                Opt(ref ROverRetry, "Retry — same witches", new Color(0.5f, 0.9f, 0.55f), 34 * u);
+                Opt(ref ROverCharSelect, "Character Select", viol, 34 * u);
+                Opt(ref ROverEnd, "End Game", new Color(0.95f, 0.4f, 0.45f), 34 * u);
+            }
+            else
+                T(_body, new Vector2(0f, oy + 4 * u), "waiting for the host to decide…", 17 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
         }
 
         DrawToast(g, vp, u);
@@ -490,6 +557,9 @@ public partial class Hud : Control
         Player.UltKind.HexCircle => "Hex Circle",          // (NEW)
         Player.UltKind.LifeDrain => "Life Drain",          // (NEW)
         Player.UltKind.LifeCurse => "Life Curse",          // (NEW)
+        Player.UltKind.MeteorDescent => "Meteor Descent",  // (NEW)
+        Player.UltKind.WildfireRush => "Wildfire Rush",    // (NEW)
+        Player.UltKind.PhoenixAscend => "Phoenix Ascendant",// (NEW)
         _ => "—"
     };
 
@@ -516,6 +586,9 @@ public partial class Hud : Control
         Player.UltKind.HexCircle => "Curse the ground around you for ~10s: every foe inside is dragged into one huge shared tether-group and piles on curse stacks, so damage to any of them cascades across the whole crowd. (Plaguebearer: bigger, and the ground festers with a curse DoT.)",   // (NEW)
         Player.UltKind.LifeDrain => "Rise into the air and fly freely (Space up / Ctrl down) while draining every foe in a wide radius — damaging them, healing you, and banking the stolen life. When it ends, detonate for the full banked amount. Fewer foes = you focus more on each. (Rapture: also drags them all toward you.)",   // (NEW)
         Player.UltKind.LifeCurse => "Erupt a curse rune beneath you. Each foe takes a share of its MAX health — the LOWER your current HP, the bigger the share (up to half; bosses capped). A desperation nuke. (Blood Rite: siphons some of the damage back as health.)",   // (NEW)
+        Player.UltKind.MeteorDescent => "Rise into the sky invulnerable and aim a landing zone with your reticle (5s, or auto-drop). SLAM down for massive damage — devastating at the core, fading to the rim — brand every foe there with a Living Bomb, and leave a 6s inferno that keeps stacking burn. Radius scales with AoE cards.",   // (NEW)
+        Player.UltKind.WildfireRush => "Gain 3 flame dashes (press [Q]) for ~10s. Each dash blazes a long burning trail that stacks burn on foes for 10s — and every point of BURN damage heals you. Allies who run the trail gain move speed + a light heal (not you). Trails sized by AoE cards.",   // (NEW)
+        Player.UltKind.PhoenixAscend => "Become a phoenix for ~10s: fly freely (Space up / Ctrl down), an immolation aura torches nearby foes, and your flamethrower turns free & huge. If you'd die during it, you're reborn in a fiery burst instead — once.",   // (NEW)
         _ => ""
     };
 
@@ -592,6 +665,7 @@ public partial class Hud : Control
     {
         var chips = new System.Collections.Generic.List<(string label, float t, Color col)>();
         if (p.BlessedT > 0f) chips.Add(("\u271d BLESSED", p.BlessedT, DamageTypes.Col(DamageType.Holy)));
+        if (p.EmberFervorActive) chips.Add(("EMBER FERVOR", p.EmberFervorT, DamageTypes.Col(DamageType.Ember)));   // (NEW) active fervor buff
         if (chips.Count == 0) return;
         float cw = 132 * u, chh = 26 * u, gap = 8 * u;
         float total = chips.Count * cw + (chips.Count - 1) * gap;
@@ -1179,6 +1253,13 @@ public partial class Hud : Control
             if (!e.Frozen && e.FreezeStacks > 0.5f)   // (NEW) freeze-stack indicator ❄ N/threshold
             {
                 T(_body, new Vector2(x, y - 14f * u), $"\u2744 {Mathf.CeilToInt(e.FreezeStacks)}/{Mathf.CeilToInt(e.FreezeThreshold)}", 10f * u, new Color(0.62f, 0.86f, 1f), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+            }
+            if (e.BurnStacks > 0.5f && !e.Frozen)   // (NEW) Ember burn: 🔥 current/needed toward Living Bomb
+                IconLabel(_body, sp.X, y - 14f * u, false, $"{Mathf.CeilToInt(e.BurnStacks)}/{Mathf.CeilToInt(e.LivingBombThreshold)}", 10f * u, new Color(1f, 0.68f, 0.32f));
+            if (e.LivingBombStacks > 0)   // (NEW) Ember Living Bomb: 💣 xN running count (synced → all players), pulses
+            {
+                float pulse = 0.5f + 0.5f * Mathf.Sin((Time.GetTicksMsec() % 900) / 900f * Mathf.Tau);
+                IconLabel(_head, sp.X, y - 26f * u, true, $"x{e.LivingBombStacks}", 11f * u, new Color(1f, 0.5f + 0.4f * pulse, 0.15f), pulse);
             }
             if (e.IsBoss)   // (NEW) aggression / heat meter — thin bar under the health bar
             {

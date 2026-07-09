@@ -250,6 +250,121 @@ vitals so a retry works. **Solo game-over unchanged** (scene reload). ⚠ Soft-r
 (compiles clean); lingering transient VFX/projectiles aren't force-cleared (they self-expire). Ready-gate caveat: a host who
 confirms while alone (client mid-connect) starts immediately — "all others" = currently-connected peers.
 
+## Witch legendaries — now ≥3 each (NEW)
+Older witches were topped up to 3 legendary affinity cards (in `Upgrade.cs`, `LegP` + `!pl.XWitch → Hidden` pattern, gated by a
+new bool flag on `Player`): **Lunar** = Lunar Eclipse + *Lunar Resonance* (combo cap+15/pow) + *Gravity Well* (`GravityWell`:
+on-kill StormForce mode-0 pull, throttled by `_killProcCd`). **Divine** = Martyr's Grace + *Radiant Ascension* (`RadiantMote`)
++ *Guardian's Aegis* (Interventions+2, DR). **Crimson** = Hemoclast + *Crimson Frenzy* (stat) + *Bloodbath* (`Bloodbath`:
+on-kill heal + StormForce mode-2 burst). **Verdant** = Wildfire Bloom + *Ancient Grove* (ents) + *Verdant Vitality* (HP/DR).
+On-kill procs (`GravityWell`/`Bloodbath`) fire in `Player.OnHitCore`, throttled 0.25s.
+
+**Radiant Ascension (Divine):** while `Airborne`, the Holy primary can lock onto allies (`AimAllyPos`) and the mote is flagged
+`Bolt.RadiantHeal`/`HealAmt` (=`0.4 + 0.2·Combo`). In `Bolt._Process` it calls `NetMgr.HealAlliesNear` (now returns bool)
+once per pass, then flies through the ally (allies aren't in `Enemies`, so pierce isn't spent) to strike the foe behind. Airborne-only.
+
+**Taker** now drops its captive (`ReleaseGrab`) when flung (`Enemy.Fling`) or frozen (`Enemy.Freeze` — the game's hard stun);
+slow/root don't. **Chest healing font** now sets `HealAllies=true` (clients only got a visual-only field copy). **Updraft**
+launch `_vy 15→23`.
+
+## Ally/minion x-ray + end-of-run scoreboard (NEW)
+**Silhouette rework:** the fat capsule x-ray was replaced by a model-SHAPED ghost. `Game.SilhouetteMat(col)` + `Game.
+AddModelSilhouette(model, mat)` clone each of a model's `MeshInstance3D`s as a translucent, `NoDepthTest`, RenderPriority-8
+overlay parented to the real mesh (so it rides the animation). `AddFriendlySilhouette` now calls those (ents/Guardian keep
+working). `RemoteAvatar` builds its ghost via `AddModelSilhouette(_model, _silMat)` and re-adds it in `BuildModel` on witch
+swap; `_silMat` recolor still works. ⚠ per-mesh → more draw calls than the capsule (bounded: allies + ents).
+
+**Scoreboard:** `RunStats.cs` (per-warden tally). `Game.MyStats` tracked locally: DamageDealt/BossDamage/Kills (+Lunar
+night-kill & Crimson leech highlights) in `Player.OnHitCore`; Healing in `Player.Heal` + `Net.HealAlliesNear` (+Divine
+highlight); DamageTaken in `Player.Hurt`; Flings via `Game.CountFlungNear` in the fling finishers; Gale-aloft in the player
+update; Verdant ents in `Thornling.Detonate`; Frost shatters in `Bolt`; Forsaken curses in `UpdateCurseBeam`. At `GameOver`
+each peer `Net.BroadcastRunStats` → `Game.AllStats[peer]` (personal stats). Over screen (`Hud`) draws one row per warden.
+
+**KILLS are host-authoritative & exact** (damage was already per-player-exact — each tracks only its own OnHitCore). `Enemy.
+Hurt` stamps `_lastAttackerPeer = Game.AttackerPeer`; `Enemy.Die` → `Game.CreditKill(peer, IsNight)` → `Game.KillTally` /
+`NightKillTally`. `AttackerPeer` defaults to `LocalPeer` (host's own hits) and `Net.ReceiveHit` sets it to the reporting
+client around the routed `Hurt` (so ALL client damage — direct hits, beams, curse-share — credits the client). Host
+`BroadcastKillTally` → all; the Over screen reads `KillTally[peer]` for kills and `NightKillTally[peer]` for the Lunar
+highlight. **Edge:** persistent DoTs (poison/bleed) applied by a client but *ticked* host-side credit the host — direct
+hits, beams, shatters, crushes, curse-share are exact. Added stats: `TimesDowned` (`GoDown`), `Revives` (ally-revive act),
+`BestCombo` (`Player.BestCombo`), `BiggestHit` (`OnHitCore` max). All reset in `StartGame`.
+
+## Curse spell-combo finishers (NEW) — universal, curse-flavored
+3 new `FinType`s (Curse `DType`), witch-agnostic like all finishers. Wired: `Finisher.cs` enum+Name/Desc/DType, `Player.
+Execute` cases, `Fin*` methods (Player.cs), pool `Def(...FinCard...)` in `Upgrade.cs`, VFX kinds 63/64/65 in `Net.ReceiveVfx`.
+- **Soul Reap** (`ComUncRare`): reaping curse-nova, `dmg × (1 + 1.6·missingHP)` execute + 5% soul-harvest heal (cap 18% MaxHp).
+  VFX: `Game.SpawnScytheVfx` (crescent arc) + soul wisps + ring; SFX `CurseCrush`. Kind 63.
+- **Hex Chains** (`UncRareEpic`): binds nearest `4+t` foes into a temp shared-pain group (`AddCurse` w/ new `_curseGroupSeq`,
+  shareFrac 0.4) + hex burst. VFX: cursed chain cylinders + sigil + ring; SFX `WitchCackle` (self-networks). Kind 64.
+- **Doom Sigil** (`EpicP`): brands foes (curse), spawns `DoomSigil.cs` node — a pentacle that fuses ~1.35s then detonates for
+  `Base·2.4·pow × (1 + 0.12·(branded-1))` Curse damage + rising doom pillars. Remote ghost via kind 65 (visual). SFX `WitchCackle`
+  cast / `CurseCrush` detonation (ghost self-plays). **MP:** damage via `e.Hurt`/`AddCurse` (route to host); VFX broadcast; the
+  DoomSigil node is caster-owned (real) vs `InitRemote` (ghost, `_dmg=0`). All damage host-authoritative → attribution stays exact.
+
+## Coven Perks — persistent meta-progression (NEW)
+`PerkTree.cs` (`Perks` static): each witch has a **9-node tree** — 3 lanes (Left playstyle / Middle shared / Right playstyle)
+× 3 tiers (2 minors → 1 major). Fixed support graph (`SUP`): sides are single chains, middle nodes bridge both sides with
+2 supports (`M1←{L1,R1}`, `M2←{L2,R2}`, `M3←{M1,M2}`). **Buy** with gold (cost 150/400/850 by tier, permanent), **Equip** up
+to `Cap=6` with `MaxMajors=2`. Equip needs ≥1 support EQUIPPED; `Unequip` cascades (drops any node that loses all supports).
+Effects are `Action<Player>` (stat/scalar deltas leaning into each witch's 2 playstyles) applied in `StartGame` via
+`Perks.ApplyEquipped(Player, witch)` AFTER `ConfigureWitch`, before vitals. State (owned+equipped per witch) persists in
+`[perks]` of `grove_save.cfg` (`Perks.Save/Load`, hooked into `Game.SaveGold/LoadGold`; `Game.SavePerks()` = SaveGold).
+UI: `PerkScreen.cs` (custom `_Draw` tree + connecting lines, witch tabs, left-click buy→equip / right-click unequip-cascade),
+opened from the home menu's "Coven Perks" button (`Game.OpenPerks/ClosePerks`). Runtime-untested (Control `_Draw`/`_GuiInput`).
+
+## Ember Witch (index 7, NEW) — flamethrower + meteor + Living Bomb
+Registered everywhere: `Player.EmberWitch`/`WitchIndex`/`WitchDamage`, `Game.ConfigureWitch` case 7 (+ both flag-reset
+chains), `WitchModel.WitchColor`/hat case 7, `CharSelect` roster, `RunStats` labels, `Perks.WitchCount=8` + `_trees[7]` +
+`LaneNames` + `PerkScreen` (uses `Perks.WitchCount`), `DevConsole`. **Ult is still the Lunar default** (`UltChoiceSet` — TODO).
+- **Burn + Living Bomb (Enemy.cs):** `AddBurn(amt, perStack, bombFlat, dur)` (routes for clients via `ReportStatus` kind 6 /
+  `ReceiveStatus` case 6). Burn is a stacking Ember DoT (ticks `stacks·perStack`). `LivingBombThreshold` is HP-scaled like
+  freeze; each crossing → `_livingBombStacks++`, burn drops by the threshold, `TriggerLivingBomb()` (flat base-scaled blast on
+  THAT foe). On `Die()`: erupts an area for `MaxHp·0.16·stacks` to nearby foes (chains). Synced to clients via StatusMask
+  **bits 11-14** (repurposed the dead blue-bar bits) → `LivingBombStacks`; HUD shows "LIVING BOMB xN" to all players (`Hud` enemy bars).
+- **Primary flamethrower:** `Combat` EmberWitch branch → `UpdateFlameCone` → `FlameConeTick` (cone dmg + `AddBurn`, combo/finisher
+  once per tick). Tick rate = `S.FireCd·0.6` (cast-speed cards speed it up); reach = `9·SpellArea`. VFX `Game.SpawnFlameCone` (kind 66).
+- **Secondary meteor:** `Combat` EmberWitch charge branch → `UpdateEmberCharge` (ground aim ring, mirrors Gale) → `FireMeteor`
+  → `EmberMeteor.cs` node (falling rock, AoE dmg + `burnStacks` to foes, Remote ghost via kind 67). All damage host-authoritative.
+
+## Ember Ultimates (NEW) — all MP-synced, host-authoritative damage
+`UltKind.MeteorDescent / WildfireRush / PhoenixAscend`; choice branch in `Game.UltChoiceSet`; names/descs in `Hud`.
+Activation cases in `Player.ActivateUlt`; flight/aim hijacks dispatched at `Player.cs` movement tick (before `Combat(dt)` — so
+flight ults fire their own weapons); countdowns in `UpdateUlt`. VFX tells = BroadcastVfx kinds **68/69/70** (`ReceiveVfx`).
+- **Meteor Descent:** `_meteorAscend` → `UpdateMeteorAscend` (rise to baseY+18, `_iframe=999` invuln, `ShowEmberAimRing` reticle
+  scaled to `MeteorUltRadius`=`(10+tier·1.5)·SpellArea`, 5s or [Q]/[LMB] confirm) → `MeteorLand`: tapering AoE
+  (`Lerp(centerDmg, edgeDmg, (d/r)²)`), `AddBurn(threshold)` brands 1 Living Bomb on all, drops a 6s Ember `GroundField`
+  (new `BurnAdd/BurnPer/BurnBomb/BurnOwner` fields stack burn every 0.6s).
+- **Wildfire Rush:** `_flameDashCharges`(3-5) + 10s window; [Q] during the window → `TryUlt`→`FlameDash` (motion via `_flameDashT`
+  in the movement block) laying an `EmberTrail.cs` (rectangular ~8×13·SpellArea, 10s, stacks burn, buffs allies). Burn-tick
+  **lifesteal**: `Enemy._burnOwner` (set in `AddBurn`, or sender on the status relay) → burn tick calls `Game.AwardBurnLifesteal`
+  → owner's `Player.TryBurnLifesteal` (heals 100% while `BurnLifestealT>0`). Ally speed+heal (never caster) via
+  `Net.BuffAlliesInStrip` (strip geometry over `_remotes`) → `GrantWindBoon` + `Heal`. Trail ghost = `Net.BroadcastEmberTrail`.
+- **Phoenix Ascendant:** `_phoenix`/`PhoenixActive` → `UpdatePhoenix` (free flight: WASD + Space/Ctrl, immolation aura ticks
+  burn, fires the flamethrower itself since Combat is skipped; flame reach/dmg get a Phoenix bonus in `UpdateFlameCone`/
+  `FlameConeTick`). One-shot cheat-death `PhoenixRebirth` hooked in the lethal check (`if PhoenixActive && _phoenixRebirth`).
+  `BuildPhoenixAura` = wings+core VFX parented to her. `GoDown` cancels any Ember flight ult.
+
+## Ember spell combos (finishers, NEW) — universal, all rarities
+`FinType.FireWall / Fireball / EmberFervor` (Ember), pooled via `Def(AllR, …FinCard…)` in Upgrade.cs so any witch can equip
+them at any rarity. Executed in `Player.ExecuteFinisher` → `FinFireWall/FinFireball/FinEmberFervor`.
+- **Ring of Fire** (`FireWall.cs`): planted flame ring; burns foes in the band (owner-authoritative). Eats incoming enemy
+  projectiles host-side — `Game.FireRings` list (registered by `RegisterFireRing`, a client routes via `Net.ReqFireRing`);
+  `EnemyBolt` pops + puffs + crackles on entering a ring. Ghost via VFX kind 72.
+- **Fireball** (`Fireball.cs`): med-speed projectile; direct enemy hit (heavy) + medium blast; ghost via kind 73 (visual-only
+  explode). Both stack burn.
+- **Ember Fervor** (self-buff): `Player.EmberFervorT/_emberFervorCrit/_emberFervorSpeed` fold into `RollCrit` + `MoveSpeedFactor`;
+  can't recharge while active (guard in the finisher-charge loop in OnHitCore); HUD chip in `DrawBuffs`; fists/feet flames via
+  `ShowFervorFlames` (view-model hands + body model, tracked in `_fervorFlames`); periodic kind-70 pulse so allies see it.
+
+NOTE: `Hud.DrawFlameIcon` is now built from stacked `DrawCircle`s ONLY — `DrawColoredPolygon` triangulation is unreliable in
+this Godot build (crashed even on 3-vertex triangles), so avoid it for HUD glyphs.
+
+## Ember charged-cast modifiers (NEW) — universal, Uncommon→Legendary
+`ModType.Meteor / Eruption` (Ember) in Modifier.cs; cases in `Player.ApplyChargedMods`; pooled via `Def(UncP, …ModCard…)`.
+- **Meteor Strike:** full charge → `SpawnEmberMeteor` at the impact point (Ember witch → her meteor + this = two meteors).
+- **Eruption:** molten `SpawnGroundSpikes` + `SpawnEmberBurst` flame ring + `NetMgr.StormForce(pos, r, 1, power)` (host-authoritative
+  outward/up fling, mass-scaled → higher rarity flings small foes skyward). Damage/burn route to host; both are MP-visible.
+- FIX: the Ember witch's `UpdateEmberCharge` full-charge release now calls `ApplyChargedMods` (it never did — she couldn't use ANY charged-mod before).
+
 ## File map (the ones you'll touch most)
 
 - `Player.cs` — the witch: movement, cast pipeline, every witch's primary/secondary/ults/finishers/mods/minors,

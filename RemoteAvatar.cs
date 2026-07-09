@@ -19,7 +19,7 @@ public partial class RemoteAvatar : Node3D
     public float Bark = 0f;
 
     private WitchModel _model;
-    private MeshInstance3D _sil, _bubble, _thorns, _bloodMoon;
+    private MeshInstance3D _bubble, _thorns, _bloodMoon;
     private Node3D _gust;   // Stormform tell: wind rings swirling around this ally, shown to all (NEW)
     private StandardMaterial3D _bubbleMat;
     private StandardMaterial3D _silMat;
@@ -56,18 +56,10 @@ public partial class RemoteAvatar : Node3D
     {
         BuildModel();
 
-        // x-ray silhouette: always drawn on top so allies are visible through walls/enemies
-        _sil = new MeshInstance3D { Mesh = new CapsuleMesh { Radius = 0.5f, Height = 1.9f } };
-        _sil.Position = new Vector3(0, 1.0f, 0);
-        _silMat = new StandardMaterial3D {
-            AlbedoColor = new Color(_col.R, _col.G, _col.B, 0.42f),
-            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
-            EmissionEnabled = true, Emission = _col, EmissionEnergyMultiplier = 1.4f,
-            Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
-            NoDepthTest = true, RenderPriority = 8
-        };
-        _sil.MaterialOverride = _silMat;
-        AddChild(_sil);
+        // x-ray silhouette: a model-SHAPED ghost (per-mesh overlay on the actual witch model), drawn on top so allies read
+        // through walls/enemies — traces her real outline instead of a fat capsule. Recolored via the shared _silMat.
+        _silMat = Game.SilhouetteMat(_col);
+        Game.AddModelSilhouette(_model, _silMat);
 
         // blood shield bubble
         _bubble = new MeshInstance3D { Mesh = new SphereMesh { Radius = 1.2f, Height = 2.4f } };
@@ -170,6 +162,7 @@ public partial class RemoteAvatar : Node3D
         _model = new WitchModel();
         _model.Build(Mathf.Max(0, _witch), false);
         AddChild(_model);
+        if (_silMat != null) Game.AddModelSilhouette(_model, _silMat);   // re-trace the x-ray ghost on the new model
         if (Downed) _model.Collapse(true);
     }
 

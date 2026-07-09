@@ -270,6 +270,7 @@ public partial class Thornling : Node3D
         if (_detonated) return 0;          // guard: chain reactions can call this more than once
         if (Caster != null && GodotObject.IsInstanceValid(Caster) && Caster.BarkActive) return 0;   // can't detonate ents during Barkskin
         _detonated = true;
+        if (Game.I != null && Game.I.Player != null && Game.I.Player.VerdantWitch) Game.I.MyStats.Highlight++;   // (NEW) Verdant highlight = ents detonated
         Caster?.Ents.Remove(this);         // leave the grove now so a recount/refund this frame is accurate
         if (!Ghost && Game.I != null && GD.Randf() < 0.4f) Say(GD.Randf() < 0.5f ? "Booomm!" : "Oooowww!", 2, new Color(0.5f, 0.9f, 0.5f));
         float dmg = Caster != null ? Caster.MinionBurst() : 60f;

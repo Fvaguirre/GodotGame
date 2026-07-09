@@ -5,7 +5,7 @@ using Godot;
 // Granted by a FinCard (Upgrade.cs), equipped via Player.EquipFinisher, and EXECUTED in the big
 // switch in Player.ExecuteFinisher (each case calls a Fin* method + an arm pose). To add one:
 // extend this enum + FinMeta, add the execution case in Player, add a FinCard Def in UpgradePool.
-public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls }   // IceSpike/FrostVault/FrostWalls = Frost (NEW)
+public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls, SoulReap, HexChains, DoomSigil, FireWall, Fireball, EmberFervor }   // FireWall/Fireball/EmberFervor = Ember (NEW)
 
 public static class FinMeta
 {
@@ -33,6 +33,12 @@ public static class FinMeta
         FinType.IceSpike => "Ice Spikes",
         FinType.FrostVault => "Frost Vault",
         FinType.FrostWalls => "Glacial Vise",
+        FinType.SoulReap => "Soul Reap",
+        FinType.HexChains => "Hex Chains",
+        FinType.DoomSigil => "Doom Sigil",
+        FinType.FireWall => "Ring of Fire",
+        FinType.Fireball => "Fireball",
+        FinType.EmberFervor => "Ember Fervor",
         _ => "?" };
 
     public static bool Passive(FinType t) => t == FinType.Crescendo;   // no key-press, but still occupies a slot
@@ -62,6 +68,12 @@ public static class FinMeta
         FinType.IceSpike => "Erupt a cone of ice spikes ahead of you — damages foes and flings the small/medium ones skyward.",
         FinType.FrostVault => "Kick off an icicle to vault up and back to safety; the icicle bursts, slowing the foes it leaves behind.",
         FinType.FrostWalls => "Clap two ice walls together in front of you, crushing the foes between them for a chunk of their max health.",
+        FinType.SoulReap => "A reaping curse-nova that bites harder the more wounded each foe is — and siphons their souls to mend you.",
+        FinType.HexChains => "Binds nearby foes in cursed chains: for a few seconds a share of ALL damage any of them takes bleeds to the rest.",
+        FinType.DoomSigil => "Brands nearby foes with a doom sigil that detonates a moment later for heavy Curse damage — the more branded, the bigger the blast.",
+        FinType.FireWall => "Raise a ring of fire around you for a few seconds — it eats incoming enemy projectiles (puff + crackle) and burns anything standing in it.",
+        FinType.Fireball => "Hurl a fireball at your cursor — a heavy direct hit, plus a medium blast where it lands.",
+        FinType.EmberFervor => "Ignite yourself: a burst of crit chance and move speed for a few seconds (both scale with rarity). Fists and feet blaze while it lasts; can't recharge until it fades.",
         _ => "" };
 
     public static DamageType DType(FinType t) => t switch {
@@ -88,6 +100,12 @@ public static class FinMeta
         FinType.IceSpike => DamageType.Frost,
         FinType.FrostVault => DamageType.Frost,
         FinType.FrostWalls => DamageType.Frost,
+        FinType.SoulReap => DamageType.Curse,
+        FinType.HexChains => DamageType.Curse,
+        FinType.DoomSigil => DamageType.Curse,
+        FinType.FireWall => DamageType.Ember,
+        FinType.Fireball => DamageType.Ember,
+        FinType.EmberFervor => DamageType.Ember,
         _ => DamageType.Arcane };
 
     public static Color Col(FinType t) => DamageTypes.Col(DType(t));

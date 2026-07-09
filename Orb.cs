@@ -38,13 +38,13 @@ public partial class Orb : Node3D
         here.Y = gy + 0.7f + Mathf.Sin(_bob) * 0.15f;            // a low, small persistent speck
         bool magnet = Game.I.MagnetActive;
         float range = Game.I.PickupRange;
-        if (magnet || d < range)
+        if (magnet)   // lodestone: fly in from anywhere, collect when it reaches the player
         {
-            var target = new Vector3(pp.X, gy + 1.2f, pp.Z);
-            float speed = magnet ? 15f : (6f + (range - d) * 4f);
-            here = here.Lerp(target, Mathf.Clamp(dt * speed, 0f, 1f));
-            if (new Vector2(here.X - pp.X, here.Z - pp.Z).Length() < 1.0f) { Game.I.GrantSharedXp(Xp); QueueFree(); return; }
+            here = here.Lerp(new Vector3(pp.X, gy + 1.2f, pp.Z), Mathf.Clamp(dt * 15f, 0f, 1f));
+            if (new Vector2(here.X - pp.X, here.Z - pp.Z).Length() < 1.4f) { Game.I.GrantSharedXp(Xp); QueueFree(); return; }
+            GlobalPosition = here; return;
         }
-        GlobalPosition = here;
+        if (d < range) { Game.I.GrantSharedXp(Xp); QueueFree(); return; }   // within the pickup radius → collect reliably (no homing-gate to graze past)
+        GlobalPosition = here;   // otherwise idle-bob in place until a warden comes near
     }
 }

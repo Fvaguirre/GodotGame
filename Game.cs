@@ -28,6 +28,7 @@ public static class Palette
 }
 
 public struct Blocker { public Vector3 Pos; public float Radius; }
+public struct FireRing { public Vector3 Pos; public float Radius; public float T; }   // (NEW) Ring of Fire zone: eats enemy projectiles that enter it (host-authoritative)
 // Walkable flat surface (raised platform top, or ground patch).
 public struct Deck { public Vector3 Center; public Vector2 Half; public float TopY; }
 // Sloped walkway connecting two heights along one axis.
@@ -42,6 +43,7 @@ public partial class Game : Node3D
     public int Score = 0;
     public int Wave = 0;
     public WaveMutator ActiveMutator = WaveMutator.None;   // (NEW) the current wave's named mutator (None most waves)
+    private WaveMutator _endedMutator = WaveMutator.None;  // (NEW) the just-cleared wave's mutator — kept for the reward/gold after ActiveMutator is reset at intermission
 
     public Player Player;   // the local player (canonical reference used throughout)
     public bool ConsoleOpen = false;   // (NEW) dev console open → suspends local control so typing can't drive the game
@@ -82,6 +84,16 @@ public partial class Game : Node3D
     public FaithShield Shield;   // active Faith Shield dome (Divine ult), if any
     public readonly List<Enemy> Enemies = new();
     public readonly List<Blocker> Blockers = new();
+    public readonly List<FireRing> FireRings = new();   // (NEW) active Ring-of-Fire projectile-eating zones (host/solo)
+    public void RegisterFireRing(Vector3 pos, float radius, float dur)
+    {
+        if (NetMgr != null && NetMgr.Active && !IsAuthority) { NetMgr.ReqFireRing(pos, radius, dur); return; }   // a client routes it to the host, where the bolts live
+        FireRings.Add(new FireRing { Pos = pos, Radius = radius, T = dur });
+    }
+    private void AgeFireRings(float dt)
+    {
+        for (int i = FireRings.Count - 1; i >= 0; i--) { var fr = FireRings[i]; fr.T -= dt; if (fr.T <= 0f) FireRings.RemoveAt(i); else FireRings[i] = fr; }
+    }
     public readonly List<Pumpkin> Smashables = new();   // breakable props (pumpkins) the player can smash (NEW)
     public readonly List<Flower> Flowers = new();        // reactive blooms that glow when activity is near (NEW)
     public readonly List<Deck> Decks = new();
@@ -502,6 +514,9 @@ public partial class Game : Node3D
         CharSelectUi = new CharSelect();
         lobbyLayer.AddChild(CharSelectUi);
         CharSelectUi.Hide();
+        PerkScreenUi = new PerkScreen();
+        lobbyLayer.AddChild(PerkScreenUi);
+        PerkScreenUi.Hide();
 
         if (s_witch >= 0) { LobbyUi.Hide(); StartGame(); }   // restart kept the chosen witch — skip lobby
         else { State = GameState.Lobby; LobbyUi.Show(); Input.MouseMode = Input.MouseModeEnum.Visible; }
@@ -511,7 +526,21 @@ public partial class Game : Node3D
     public Net NetMgr;
     public Lobby LobbyUi;
     public CharSelect CharSelectUi;
+    public PerkScreen PerkScreenUi;
+    public void OpenPerks() { if (LobbyUi != null) LobbyUi.Hide(); if (PerkScreenUi != null) PerkScreenUi.Show(s_witch < 0 ? 0 : s_witch); }
+    public void ClosePerks() { if (PerkScreenUi != null) PerkScreenUi.Hide(); if (LobbyUi != null) LobbyUi.Show(); }
     public int ReadyCount = 0;   // (NEW) MP char-select: how many wardens have locked in (synced from host)
+    public RunStats MyStats = new RunStats();                                                        // (NEW) this player's end-of-run tally
+    public readonly System.Collections.Generic.Dictionary<long, RunStats> AllStats = new();          // (NEW) every warden's PERSONAL tally (kills come from the host-authoritative tally below)
+    // (NEW) host/solo-authoritative kill attribution — the ONLY exact way in HOST-OWNS-WORLD (clients can't tell who landed the killing blow)
+    public long AttackerPeer = 1;   // the peer currently dealing damage (set per-hit; host's own = LocalPeer, a client's routed hit = the reporter)
+    public readonly System.Collections.Generic.Dictionary<long, int> KillTally = new();
+    public readonly System.Collections.Generic.Dictionary<long, int> NightKillTally = new();
+    public void CreditKill(long peer, bool night)
+    {
+        KillTally[peer] = KillTally.GetValueOrDefault(peer) + 1;
+        if (night) NightKillTally[peer] = NightKillTally.GetValueOrDefault(peer) + 1;
+    }
     // solo or host = we own/drive the world; a connected client does not
     public void GrantSharedXp(float amt)
     {
@@ -604,6 +633,7 @@ public partial class Game : Node3D
                 {
                     if (Player.DivineWitch && Player.Interventions > 0) { Player.Interventions--; NetMgr.RevivePeer(peer, 1f, true); }
                     else NetMgr.RevivePeer(peer, 0.4f, false);
+                    MyStats.Revives++;   // (NEW) end-of-run tally
                 };
                 prompt = divine ? "Hold E — Divine Revival" : "Hold E — revive ally";
             }
@@ -636,6 +666,14 @@ public partial class Game : Node3D
         _dotCreditCd[owner] = 0.5f;
         if (NetMgr == null || !NetMgr.Active || owner == LocalPeer) Player?.ComboFromDot();
         else NetMgr.SendDotCombo(owner);
+    }
+    // (NEW) route an Ember burn tick's lifesteal to its caster (Wildfire Rush). The owner heals only if their lifesteal window is live.
+    public void AwardBurnLifesteal(int owner, float dmg)
+    {
+        if (dmg <= 0f) return;
+        if (owner == 0) owner = LocalPeer;
+        if (NetMgr == null || !NetMgr.Active || owner == LocalPeer) Player?.TryBurnLifesteal(dmg);
+        else NetMgr.SendBurnHeal(owner, dmg);
     }
     private int _netEnemySeq = 1;
 
@@ -727,6 +765,9 @@ public partial class Game : Node3D
         _started = true;
         if (CharSelectUi != null) CharSelectUi.Hide();
         ConfigureWitch(s_witch < 0 ? 0 : s_witch);
+        Perks.ApplyEquipped(Player, s_witch < 0 ? 0 : s_witch);   // (NEW) apply this witch's equipped meta-progression perks
+        MyStats = new RunStats { WitchIdx = s_witch < 0 ? 0 : s_witch, Slot = (NetMgr != null && NetMgr.Active && !NetMgr.IsHost) ? 1 : 0 };   // (NEW) fresh end-of-run tally
+        AllStats.Clear(); KillTally.Clear(); NightKillTally.Clear();
         Player.Hp = Player.S.MaxHp; Player.Mana = Player.S.ManaMax; Player.DashStock = Player.S.DashCharges; Player.Downed = false;   // full vitals (also covers an MP retry after a soft-reset)
         // in co-op, host and joiner spawn a few steps apart at the same area so they can see each other
         if (NetMgr != null && NetMgr.Active)
@@ -1025,12 +1066,20 @@ public partial class Game : Node3D
                 Player.DamageMul = 0.85f;       // low direct damage — her power is the curse groups + shared damage
                 Player.S.DmgResist = 0.15f;     // a controller, fragile but not paper
                 break;
+            case 7:    // The Ember Witch (Ember) (NEW) — flamethrower cone + aimed meteor; stacks burn → Living Bomb detonations
+                Player.PrimaryType = DamageType.Ember;
+                Player.SecondaryType = DamageType.Ember;
+                Player.NightAffinity = false;
+                Player.EmberWitch = true;
+                Player.DamageMul = 0.9f;        // her direct is modest — her damage is the burn DoT + Living Bomb explosions
+                Player.S.DmgResist = 0.12f;     // fragile pyro — she wants distance/kiting
+                break;
             case 4:    // The Gale Witch (Wind) (NEW)
                 Player.PrimaryType = DamageType.Wind;
                 Player.SecondaryType = DamageType.Wind;
                 Player.NightAffinity = false;
                 Player.GaleWitch = true;
-                Player.DamageMul = 0.92f;       // modest personal DPS — her edge is mobility + control (knockback/cyclones)
+                Player.DamageMul = 0.98f;       // (BUFF 0.92→0.98) she felt weak — lift her whole kit, plus a harder punch + airborne-kill bonus below
                 Player.S.DmgResist = 0.12f;     // lightly armored — she survives by evasion (Tailwind), not toughness
                 Player.S.Speed = Mathf.Min(16.5f, Player.S.Speed * 1.12f);   // Tailwind: quicker on foot
                 if (Player.S.DashCharges < 3) Player.S.DashCharges++;        // Tailwind: an extra dash charge
@@ -1073,7 +1122,7 @@ public partial class Game : Node3D
         Player.Fin.Clear(); Player.Mods.Clear(); Player.Minors.Clear();
         Player.S = new Stats();
         Player.DamageMul = 1f; Player.NightAffinity = false; Player.Interventions = 0;
-        Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = false;
+        Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = Player.EmberWitch = false;
         ConfigureWitch(i);   // sets the new flag + primary/secondary + witch stats, and RetintHands rebuilds the body model
         Player.Hp = Player.S.MaxHp; Player.Mana = Player.S.ManaMax; Player.DashStock = Player.S.DashCharges;
     }
@@ -2170,6 +2219,39 @@ void fragment(){
         var m = new Moonshard { Remote = remote }; AddChild(m); m.Init(pos, size);
         if (net) NetMgr?.BroadcastVfx(62, pos, Vector3.Zero, size, 0f, Colors.White);
     }
+
+    // (NEW) Ember flamethrower flame — a short-lived scatter of glowing flame motes in the cone. Local; UpdateFlameCone broadcasts (kind 66).
+    public void SpawnFlameCone(Vector3 o, Vector3 dir, float reach, Color col)
+    {
+        dir = dir.LengthSquared() > 0.001f ? dir.Normalized() : Vector3.Forward;   // (FIX) full 3D aim — flame follows the cursor up/down, no longer flattened
+        var right = dir.Cross(Vector3.Up);
+        right = right.LengthSquared() < 0.001f ? Vector3.Right : right.Normalized();   // dir nearly vertical → any perpendicular
+        var up = right.Cross(dir).Normalized();
+        int n = Mathf.Max(3, (int)(6 * ParticleScale));
+        for (int i = 0; i < n; i++)
+        {
+            float d = reach * (0.12f + 0.85f * GD.Randf()), spread = d * 0.16f;   // (NEW) tighter jet — motes hug the axis (was 0.32) & reach further
+            var p = o + dir * d + right * ((GD.Randf() - 0.5f) * spread) + up * ((GD.Randf() - 0.5f) * spread);
+            float rr = 0.18f + d * 0.04f;   // (NEW) slimmer motes so it doesn't blanket the view (was 0.26 + 0.05d)
+            var fl = new MeshInstance3D { Mesh = new SphereMesh { Radius = rr, Height = rr * 2f, RadialSegments = 6, Rings = 4 } };
+            var mm = Emissive(col.Lerp(new Color(1f, 0.28f, 0.05f), GD.Randf() * 0.55f), 3.4f);
+            mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; fl.MaterialOverride = mm;
+            AddChild(fl); fl.GlobalPosition = p;
+            var tw = fl.CreateTween(); tw.SetParallel(true);
+            tw.TweenProperty(fl, "scale", Vector3.One * 1.7f, 0.22f);
+            tw.TweenProperty(fl, "global_position", p + dir * 0.5f + Vector3.Up * 0.25f, 0.22f);   // drift along the flame + a little rise
+            tw.TweenProperty(mm, "albedo_color", new Color(mm.AlbedoColor.R, mm.AlbedoColor.G, mm.AlbedoColor.B, 0f), 0.22f);
+            tw.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(fl)) fl.QueueFree(); }));
+        }
+    }
+
+    // (NEW) Ember meteor: host/caster owns the damage; allies spawn a visual ghost via VFX kind 67.
+    public void SpawnEmberMeteor(Vector3 at, float radius, float dmg, int burnStacks, float burnPer, float bombFlat, Player src)
+    {
+        var m = new EmberMeteor(); AddChild(m); m.Init(at, radius, dmg, burnStacks, burnPer, bombFlat, src);
+        NetMgr?.BroadcastVfx(67, at, Vector3.Zero, radius, 0f, DamageTypes.Col(DamageType.Ember));
+    }
+    public void SpawnEmberMeteorGhost(Vector3 at, float radius) { var m = new EmberMeteor(); AddChild(m); m.InitRemote(at, radius); }
     // non-zombie goblin mines: scatter armed mines around a spot (host); each is broadcast as a ghost to clients
     public void SpawnBossMines(Vector3 center, int count, float dmg)
     {
@@ -2646,6 +2728,23 @@ void sky(){
         v.Init(new TorusMesh { InnerRadius = 0.9f, OuterRadius = 1.15f }, col, life, grow);
         WaterTouchArea(at, grow, Mathf.Clamp(grow * 0.12f, 0.25f, 1.3f));   // any AoE ring splashes water within its radius (NEW)
     }
+
+    // (NEW) Soul Reap's cursed scythe: a glowing crescent arc that sweeps in front of the caster and fades. Position-based so
+    // both the local cast and the networked ally copy (VFX kind 63) can spawn it.
+    public void SpawnScytheVfx(Vector3 pos, Vector3 dir, float radius, Color col)
+    {
+        dir.Y = 0f; dir = dir.LengthSquared() > 0.001f ? dir.Normalized() : Vector3.Forward;
+        var arc = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = radius * 0.6f, OuterRadius = radius * 0.82f } };
+        var mm = Emissive(col, 3.2f); mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; arc.MaterialOverride = mm;
+        AddChild(arc);
+        arc.GlobalPosition = new Vector3(pos.X, SurfaceHeight(pos, 1e9f) + 1.1f, pos.Z);
+        arc.RotationDegrees = new Vector3(78f, Mathf.RadToDeg(Mathf.Atan2(dir.X, dir.Z)), 0f);
+        var tw = arc.CreateTween(); tw.SetParallel(true);
+        tw.TweenProperty(arc, "rotation:y", arc.Rotation.Y + Mathf.Pi * 1.1f, 0.4f);
+        tw.TweenProperty(arc, "scale", Vector3.One * 1.35f, 0.4f);
+        tw.TweenProperty(mm, "albedo_color", new Color(col.R, col.G, col.B, 0f), 0.42f);
+        tw.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(arc)) arc.QueueFree(); }));
+    }
     public void VfxBeam(Vector3 o, Vector3 fwd, float len, float half, Color col)
     {
         if (fwd.LengthSquared() < 0.001f) fwd = Vector3.Forward;
@@ -2857,22 +2956,47 @@ void sky(){
         return m;
     }
 
-    // Attach an x-ray silhouette to any friendly entity (minions now, future friendlies later) so it
-    // reads through walls and crowds — same treatment ally avatars get. Returns the overlay mesh.
-    public static MeshInstance3D AddFriendlySilhouette(Node3D parent, Color col, float radius = 0.45f, float height = 1.6f, float yOff = 0.9f)
+    // (REWORK) Model-SHAPED x-ray ghost so allies & friendly minions read through walls/crowds — NOT a fat capsule.
+    // Clones each of the entity's meshes as a translucent, always-on-top emissive overlay parented to the real mesh, so it
+    // rides the animation and traces the actual character/ent silhouette. Returns the shared material (recolor via it).
+    public static StandardMaterial3D SilhouetteMat(Color col) => new StandardMaterial3D
     {
-        var sil = new MeshInstance3D { Mesh = new CapsuleMesh { Radius = radius, Height = height } };
-        sil.Position = new Vector3(0, yOff, 0);
-        sil.MaterialOverride = new StandardMaterial3D
+        AlbedoColor = new Color(col.R, col.G, col.B, 0.3f),
+        ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+        EmissionEnabled = true, Emission = col, EmissionEnergyMultiplier = 1.4f,
+        Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+        CullMode = BaseMaterial3D.CullModeEnum.Disabled,
+        NoDepthTest = true, RenderPriority = 8   // always drawn on top
+    };
+    public static void AddModelSilhouette(Node3D model, Material mat)
+    {
+        if (model == null) return;
+        var meshes = new System.Collections.Generic.List<MeshInstance3D>();
+        CollectMeshInstances(model, meshes);
+        foreach (var mi in meshes)
+            mi.AddChild(new MeshInstance3D { Mesh = mi.Mesh, MaterialOverride = mat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off });
+    }
+    private static void CollectMeshInstances(Node node, System.Collections.Generic.List<MeshInstance3D> outList)
+    {
+        foreach (var c in node.GetChildren())
         {
-            AlbedoColor = new Color(col.R, col.G, col.B, 0.4f),
-            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
-            EmissionEnabled = true, Emission = col, EmissionEnergyMultiplier = 1.3f,
-            Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
-            NoDepthTest = true, RenderPriority = 8   // always drawn on top
-        };
-        parent.AddChild(sil);
-        return sil;
+            if (c is MeshInstance3D mi && mi.Mesh != null) outList.Add(mi);
+            CollectMeshInstances(c, outList);
+        }
+    }
+    // (NEW) count non-boss enemies in a radius — used to tally "enemies flung" for the end-of-run stats
+    public int CountFlungNear(Vector3 center, float radius)
+    {
+        int n = 0;
+        foreach (var e in Enemies)
+            if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && !e.IsBoss && new Vector2(e.GlobalPosition.X - center.X, e.GlobalPosition.Z - center.Z).Length() < radius + e.Radius) n++;
+        return n;
+    }
+    public static StandardMaterial3D AddFriendlySilhouette(Node3D parent, Color col, float radius = 0.45f, float height = 1.6f, float yOff = 0.9f)
+    {
+        var mat = SilhouetteMat(col);
+        AddModelSilhouette(parent, mat);
+        return mat;
     }
 
     // ---- waves ----
@@ -2881,15 +3005,27 @@ void sky(){
     // composition in NextWave/SpawnEnemy. Bounded [0.85, 1.6] so it never trivializes or hard-walls the run.
     private void AssessDirector()
     {
-        float clear = _waveTimer;
-        bool healthy = _waveMinHpFrac > 0.55f && !_downThisWave;
-        bool struggled = _downThisWave || _waveMinHpFrac < 0.25f;
+        // (REWORK) PRIMARY signal = SURVIVAL MARGIN, not clear time. How low the party's HP dipped + downs directly measures
+        // "did they have this under control", and it's naturally player-count / wave-size AGNOSTIC — a party that never dropped
+        // below 78% crushed the wave whether it took 15s solo or 50s as a 4-stack. Absolute time (old metric) unfairly read
+        // MP's bigger, slower waves as "struggling". Clear time is kept only as a MINOR nudge, normalized by party size.
+        float minHp = _waveMinHpFrac;   // lowest party HP frac this wave (host + allies)
+        bool downs = _downThisWave;
         float step;
-        if (struggled) step = -0.12f;                         // back off — they're hurting
-        else if (clear < 16f && healthy) step = 0.10f;        // stomped it untouched — ramp up
-        else if (clear > 42f) step = -0.06f;                  // dragging — ease a touch
-        else if (clear < 26f && healthy) step = 0.04f;        // comfortable — drift up
+        if (downs || minHp < 0.30f) step = -0.12f;            // someone fell / HP cratered — back off hard
+        else if (minHp > 0.78f) step = 0.09f;                 // barely scratched — they're cruising, ramp up
+        else if (minHp > 0.58f) step = 0.05f;                 // comfortable margin — drift up
+        else if (minHp < 0.45f) step = -0.05f;                // took a real beating (no down) — ease a touch
         else step = 0f;                                       // about right — hold
+
+        // secondary (minor): clear pace vs a par that scales with wave depth AND party size, so MP isn't penalized for its bigger waves
+        float par = (13f + Wave * 2.2f) * (1f + 0.5f * (WardenCount - 1));   // solo par; ×1.5 (2p) … ×2.5 (4p), mirroring the body scaling
+        float pace = par / Mathf.Max(_waveTimer, 1f);         // >1 = faster than expected for this wave's size/party
+        if (!downs)
+        {
+            if (pace > 1.5f) step += 0.03f;                   // blew through it even for its size
+            else if (pace < 0.55f) step -= 0.03f;             // genuinely dragging (slow relative to size)
+        }
         if (Player != null && Player.Level > Wave + 4) step += 0.03f;   // over-leveled relative to depth
 
         float old = Heat;
@@ -2903,7 +3039,8 @@ void sky(){
     {
         Wave++;
         // named wave mutator: a hot streak (high Heat) can turn a normal, non-boss wave into a Blood Moon / Eclipse / Surge
-        var clearedMutator = ActiveMutator;   // the mutator on the wave that just ended
+        var clearedMutator = _endedMutator;   // the mutator on the wave that just ended (ActiveMutator was already cleared at intermission)
+        _endedMutator = WaveMutator.None;
         ActiveMutator = WaveMutator.None;
         if (IsAuthority && clearedMutator != WaveMutator.None)   // survived a mutator wave → every warden gets a pick-3 with a guaranteed legendary
         {
@@ -3565,6 +3702,7 @@ void sky(){
         : (Player != null && Player.GaleWitch) ? new[] { Player.UltKind.Cyclone, Player.UltKind.Hurricane, Player.UltKind.Stormform }   // (NEW)
         : (Player != null && Player.FrostWitch) ? new[] { Player.UltKind.Blizzard, Player.UltKind.FrostElemental, Player.UltKind.DeepFreeze }   // (NEW)
         : (Player != null && Player.ForsakenWitch) ? new[] { Player.UltKind.HexCircle, Player.UltKind.LifeDrain, Player.UltKind.LifeCurse }   // (NEW)
+        : (Player != null && Player.EmberWitch) ? new[] { Player.UltKind.MeteorDescent, Player.UltKind.WildfireRush, Player.UltKind.PhoenixAscend }   // (NEW)
         : new[] { Player.UltKind.Eclipse, Player.UltKind.LunarLight, Player.UltKind.Crescent };
     public void OpenUltMenu() { State = GameState.UltMenu; Input.MouseMode = Input.MouseModeEnum.Visible; SelectLock = 0.3f; }
     private void CloseUltMenu() { State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
@@ -3626,7 +3764,7 @@ void sky(){
         else if (r < 0.55f) { GiveUltCharge(openerPeer, _rng.RandfRange(0.1f, 0.5f)); }
         else if (r < 0.72f)
         {
-            var f = new GroundField { Type = FieldType.Heal, Radius = 5f, Dur = 6f, Power = Player.S.MaxHp * 0.04f, EnemyDmg = 0f, DType = DamageType.Holy };
+            var f = new GroundField { Type = FieldType.Heal, Radius = 5f, Dur = 6f, Power = Player.S.MaxHp * 0.04f, EnemyDmg = 0f, DType = DamageType.Holy, HealAllies = true };   // (FIX) also heal co-op allies (their Remote field copy is visual-only)
             AddChild(f); f.GlobalPosition = new Vector3(at.X, 0.04f, at.Z);
             Hud?.Banner("a healing font");
         }
@@ -3926,13 +4064,22 @@ void sky(){
         else if (_dragSlider == 1) { var r = Hud.RPauseSens; SetSensitivity((pos.X - r.Position.X) / Mathf.Max(1f, r.Size.X)); }
     }
 
+    // (FIX) the level-10 ult offer, checked from BOTH the level-up entry AND the pending-level drain — otherwise gaining
+    // several levels at once (common now that orbs pile up + collect in bursts) crosses level 10 mid-drain and skips it forever.
+    private bool TryOfferUlt()
+    {
+        if (Player != null && Player.Level >= 10 && Player.Ult == Player.UltKind.None && !_ultOffered)
+        { _ultOffered = true; OpenUltChoice(); return true; }
+        return false;
+    }
+
     public void OpenLevelUp()
     {
         _pendingLevels++;
         VendorSpawnChecks();
         if (State == GameState.Playing)
         {
-            if (Player.Level >= 10 && Player.Ult == Player.UltKind.None && !_ultOffered) { _ultOffered = true; OpenUltChoice(); return; }
+            if (TryOfferUlt()) return;
             Choices = RollChoices();
             ChoiceGen++; RarityCue(Choices);
             State = GameState.LevelUp;
@@ -4060,6 +4207,7 @@ void sky(){
         else if (_lootLeft > 0) _lootLeft--;
         if (_pendingLevels > 0)
         {
+            if (TryOfferUlt()) return;   // crossed level 10 while draining a burst of levels → offer the ult here
             Choices = RollChoices();
             ChoiceGen++; RarityCue(Choices);
             State = GameState.LevelUp;
@@ -4079,6 +4227,7 @@ void sky(){
     {
         float dt = (float)delta;
         if (SelectLock > 0f) SelectLock -= dt;
+        if (State == GameState.Playing && _pendingLevels == 0) TryOfferUlt();   // (SAFETY NET) never leave a level-10+ warden without their ult offer, no matter how the levels were gained
         if (_dotCreditCd.Count > 0)   // (NEW) age the per-caster DoT-combo throttles
         {
             var __dk = new System.Collections.Generic.List<int>(_dotCreditCd.Keys);
@@ -4388,6 +4537,8 @@ void sky(){
         if (IsAuthority && Player != null && State == GameState.Playing)   // feed the director
         {
             float hp = Player.S.MaxHp > 0 ? Player.Hp / Player.S.MaxHp : 1f;
+            if (Player.Downed) hp = 0f;
+            if (NetMgr != null && NetMgr.Active) hp = Mathf.Min(hp, NetMgr.MinAllyHpFrac());   // (NEW) party-wide lowest HP, not just the host's
             _waveMinHpFrac = Mathf.Min(_waveMinHpFrac, hp);
             if (Player.Downed) _downThisWave = true;
             if (NetMgr != null && NetMgr.Active && NetMgr.AnyDowned()) _downThisWave = true;
@@ -4453,6 +4604,7 @@ void sky(){
             }
         }
 
+        if (FireRings.Count > 0) AgeFireRings(dt);   // (NEW) expire Ring-of-Fire zones
         if (ActiveMutator == WaveMutator.Moonfall) MoonfallTick(dt);   // rain moon-fragment asteroids across the field this wave
 
         if (_toSpawn.Count > 0)
@@ -4462,6 +4614,11 @@ void sky(){
         }
         else if (Enemies.Count == 0)
         {
+            if (ActiveMutator != WaveMutator.None)   // (NEW) combat's over → clear the wave's mutator NOW (stops meteors/visuals during the rest) — stash it for the reward/gold
+            {
+                _endedMutator = ActiveMutator; ActiveMutator = WaveMutator.None;
+                foreach (var ms in GetChildren()) if (ms is Moonshard m && GodotObject.IsInstanceValid(m)) m.QueueFree();   // no in-flight asteroids landing mid-rest
+            }
             // all players must vote (hold Backspace) to skip the between-wave rest — detection is global in _Process (NEW)
             if (Wave >= 1 && _skipVotes.Count >= SkipNeeded) _waveGap = 0f;
 
@@ -4485,12 +4642,14 @@ void sky(){
 
     private void AwardWaveGold()
     {
-        float comboF = Mathf.Max(1f, _waveMaxComboMul);            // your peak combo multiplier this wave
-        float par = 16f + Wave * 2.5f;                            // expected clear time
-        float timeF = Mathf.Clamp(par / Mathf.Max(_waveTimer, 1f), 0.4f, 2.5f);   // faster clear → more
-        float diffF = 1f + (Wave - 1) * 0.12f;                    // later waves are worth more
-        int g = Mathf.Max(1, Mathf.RoundToInt(8f * comboF * timeF * diffF));
-        int flat = Mathf.RoundToInt(_waveComboAccrued * 0.05f);   // small bonus for total combo activity
+        // (REWORK) tied to the wave's HEAT (its actual difficulty) instead of clear time — the metric we just retired as a bad
+        // signal (esp. in MP). Harder waves pay more; combo rewards style; depth + a mutator-gauntlet bonus round it out.
+        float heatF = 0.6f + Heat;                                // ~1.45 (Heat 0.85) → 2.2 (Heat 1.6): the wave's difficulty
+        float comboF = Mathf.Clamp(_waveMaxComboMul, 1f, 2f);     // your peak combo this wave — a style reward
+        float depthF = 1f + (Wave - 1) * 0.1f;                    // later waves are worth more
+        float mutF = _endedMutator != WaveMutator.None ? 1.4f : 1f;   // named-mutator waves are a gauntlet → +40%
+        int g = Mathf.Max(1, Mathf.RoundToInt(7f * heatF * comboF * depthF * mutF));
+        int flat = Mathf.RoundToInt(_waveComboAccrued * 0.04f);   // small bonus for total combo activity
         g += flat;
         Gold += g;
         LastWaveGold = g;
@@ -4560,8 +4719,11 @@ void sky(){
         cfg.SetValue("options", "windowmode", WindowMode);
         cfg.SetValue("options", "resindex", ResIndex);
         cfg.SetValue("options", "vsync", VSync);
+        Perks.Save(cfg);   // (NEW) persist the coven perk trees (owned + equipped per witch)
         cfg.Save("user://grove_save.cfg");
     }
+
+    public void SavePerks() => SaveGold();   // (NEW) perk buy/equip changes persist (gold + perk sets are both written by SaveGold)
 
     private void LoadGold()
     {
@@ -4581,6 +4743,11 @@ void sky(){
             VSync = cfg.GetValue("options", "vsync", true).AsBool();
             ApplyGraphics();   // no-op if the environment isn't built yet; BuildWorld re-applies
             ApplyWindow();
+            Perks.Load(cfg);   // (NEW) restore the coven perk trees
+        }
+        else
+        {
+            Perks.Load(cfg);   // still load perks even on a fresh save (empty → no-op)
         }
     }
 
@@ -4593,6 +4760,10 @@ void sky(){
         if (State == GameState.Over) return;
         State = GameState.Over;
         Input.MouseMode = Input.MouseModeEnum.Visible;
+        if (Player != null) MyStats.BestCombo = Player.BestCombo;   // (NEW) final combo record
+        AllStats[LocalPeer] = MyStats;      // (NEW) publish this warden's PERSONAL tally to the scoreboard
+        NetMgr?.BroadcastRunStats(MyStats);
+        if (NetMgr != null && NetMgr.Active && NetMgr.IsHost) NetMgr.BroadcastKillTally();   // host is the ONE source of truth for kills
     }
 
     // (NEW) MP game-over: the host's choice, applied on every peer. 0 = char-select, 1 = retry same witches, 2 = end session.
@@ -4620,13 +4791,13 @@ void sky(){
         foreach (var r in Rituals.ToArray()) if (GodotObject.IsInstanceValid(r)) r.QueueFree(); Rituals.Clear();
         foreach (var c in Chests.ToArray()) if (GodotObject.IsInstanceValid(c)) c.QueueFree(); Chests.Clear();
         Wave = 0; Heat = 1f; Score = 0; _waveTimer = 0f; _magnetT = 0f; ActiveMutator = WaveMutator.None;
-        _started = false; ReadyCount = 0; NetMgr?.ResetReady();
+        _started = false; _ultOffered = false; ReadyCount = 0; NetMgr?.ResetReady();
         if (Player != null)
         {
             Player.Fin.Clear(); Player.Mods.Clear(); Player.Minors.Clear();
             Player.S = new Stats();
             Player.DamageMul = 1f; Player.NightAffinity = false; Player.Interventions = 0;
-            Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = false;
+            Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = Player.EmberWitch = false;
             Player.Level = 1; Player.Xp = 0f; Player.XpNext = 28f; Player.Combo = 0; Player.BestCombo = 0;
             Player.Ult = Player.UltKind.None; Player.UltCharge = 0f; Player.UltActive = false;
             Player.Downed = false; Player.ReviveProg = 0f;

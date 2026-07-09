@@ -635,9 +635,9 @@ public partial class Net : Node
     }
 
     // any player's support AoE -> heal/bless/blood the OTHER players standing in it (their own avatar heals locally)
-    public void HealAlliesNear(Vector3 at, float r, float amt)
+    public bool HealAlliesNear(Vector3 at, float r, float amt)   // returns true if it healed at least one ally (Radiant mote uses this to heal once per pass)
     {
-        if (!Active) return;
+        if (!Active) return false;
         bool healedAlly = false;
         foreach (var kv in _remotes)
         {
@@ -648,9 +648,11 @@ public partial class Net : Node
                 RpcId(kv.Key, nameof(ReceiveHealAlly), amt);
                 healedAlly = true;
                 _allyHealAccum[kv.Key] = (_allyHealAccum.TryGetValue(kv.Key, out var acc) ? acc : 0f) + amt;
+                if (Game.I != null) { Game.I.MyStats.Healing += amt; if (Game.I.Player != null && Game.I.Player.DivineWitch) Game.I.MyStats.Highlight += amt; }   // (NEW) tally ally-healing (+ Divine highlight)
             }
         }
         if (healedAlly) Game.I?.Player?.ComboFromDot();   // healing allies drips combo (reduced DoT rate)
+        return healedAlly;
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveHealAlly(float amt) { var p = Game.I?.Player; if (p != null) { p.Heal(amt); p.HealOwnMinions(amt); p.MarkHealed(); } }
@@ -670,6 +672,50 @@ public partial class Net : Node
             done.Add(kv.Key);
             RpcId(kv.Key, nameof(ReceiveBlessAlly), dur);
         }
+    }
+
+    // (NEW) Wildfire Rush: buff remote allies standing in the rectangular flame trail — light heal + move speed. NEVER the caster (only _remotes).
+    public void BuffAlliesInStrip(Vector3 origin, Vector3 dir, float halfW, float len, float healAmt, float speedDur)
+    {
+        if (!Active) return;
+        foreach (var kv in _remotes)
+        {
+            if (kv.Value == null || !GodotObject.IsInstanceValid(kv.Value)) continue;
+            var rel = kv.Value.GlobalPosition - origin; rel.Y = 0;
+            float along = rel.Dot(dir);
+            if (along < -1f || along > len + 1f) continue;
+            if ((rel - dir * along).Length() > halfW + 1f) continue;
+            RpcId(kv.Key, nameof(ReceiveEmberTrailBuff), healAmt, speedDur);
+            if (Game.I != null && healAmt > 0f) Game.I.MyStats.Healing += healAmt;
+        }
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveEmberTrailBuff(float healAmt, float speedDur)
+    {
+        var p = Game.I?.Player; if (p == null) return;
+        if (healAmt > 0f) { p.Heal(healAmt); p.MarkHealed(); }
+        if (speedDur > 0f) p.GrantWindBoon(speedDur);   // reuse the +30% move boon
+    }
+
+    // (NEW) Ring of Fire: a client asks the host to register a projectile-eating zone (the host owns enemy bolts).
+    public void ReqFireRing(Vector3 pos, float radius, float dur) { if (Active && !IsHost) RpcId(1, nameof(ReceiveFireRing), pos.X, pos.Y, pos.Z, radius, dur); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveFireRing(float x, float y, float z, float radius, float dur) { if (IsHost) Game.I.RegisterFireRing(new Vector3(x, y, z), radius, dur); }
+
+    // (NEW) Wildfire Rush: a burn tick lifesteals back to its remote caster.
+    public void SendBurnHeal(int peer, float amt) { if (Active) RpcId(peer, nameof(ReceiveBurnHeal), amt); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveBurnHeal(float amt) { Game.I?.Player?.TryBurnLifesteal(amt); }
+
+    // (NEW) Wildfire Rush: allies render a visual-only ghost of the flame trail.
+    public void BroadcastEmberTrail(Vector3 origin, Vector3 dir, float len, float halfW, float dur)
+    { if (Active) Rpc(nameof(ReceiveEmberTrail), origin.X, origin.Y, origin.Z, dir.X, dir.Z, len, halfW, dur); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveEmberTrail(float ox, float oy, float oz, float dx, float dz, float len, float halfW, float dur)
+    {
+        var d = new Vector3(dx, 0, dz); d = d.LengthSquared() > 0.001f ? d.Normalized() : Vector3.Forward;
+        var t = new EmberTrail { Remote = true, Origin = new Vector3(ox, oy, oz), Dir = d, Length = len, HalfW = halfW, Dur = dur };
+        Game.I.AddChild(t);
     }
 
     public void BlessAlliesNear(Vector3 at, float r, float dur)
@@ -914,6 +960,16 @@ public partial class Net : Node
             case 60: Game.I.VfxRing(o, c, a, 0.35f); break;                                               // Life Drain aura pulse (a=radius)
             case 61: Game.I.SpawnGroundSigil(o, a, c); Game.I.VfxRing(o, c, a, 0.7f); Game.I.Sfx?.CurseCrush(o); break;   // Life Curse / Life Drain release burst
             case 62: Game.I.SpawnMoonshard(o, a, remote: true, net: false); break;                                       // Moonfall asteroid ghost (a = size; visual only, host owns the damage)
+            case 63: Game.I.SpawnScytheVfx(o, dir, a, c); Game.I.VfxRing(o, c, a, 0.5f); Game.I.Sfx?.CurseCrush(o); break; // Soul Reap scythe + ring + reap crunch
+            case 64: Game.I.SpawnGroundSigil(o, a, c); Game.I.VfxRing(o, c, a, 0.5f); break;                              // Hex Chains burst (the cackle networks itself via WitchCackle)
+            case 65: { var ds = new DoomSigil(); Game.I.AddChild(ds); ds.InitRemote(o, a, c); break; }                    // Doom Sigil ghost (telegraph + detonation are self-driven)
+            case 66: Game.I.SpawnFlameCone(o, dir, a, c); break;                                                          // Ember flamethrower flame (a=reach)
+            case 67: Game.I.SpawnEmberMeteorGhost(o, a); break;                                                          // Ember meteor ghost (a=radius; host owns damage)
+            case 68: Game.I.SpawnEmberBurst(o, Mathf.Max(3f, a), false); Game.I.VfxRing(o, c, Mathf.Max(4f, a * 1.3f), 0.5f); break;   // Meteor Descent launch/impact (a=radius)
+            case 69: Game.I.SpawnEmberBurst(o, Mathf.Max(4f, a), false); Game.I.VfxRing(o, c, a * 1.2f, 0.5f); break;    // Wildfire Rush activation tell
+            case 70: Game.I.SpawnEmberBurst(o, Mathf.Max(3f, a), false); break;                                         // Phoenix aura pulse / activation / rebirth (a=radius)
+            case 72: { var fw = new FireWall { Remote = true, Center = o, Radius = a, Dur = b }; Game.I.AddChild(fw); fw.GlobalPosition = o; break; }   // Ring of Fire ghost (a=radius, b=dur)
+            case 73: { var fb = new Fireball { Remote = true, Dir = dir, Speed = a, BlastRadius = b }; Game.I.AddChild(fb); fb.GlobalPosition = o; break; }   // Fireball ghost (a=speed, b=blastR)
         }
     }
 
@@ -1005,6 +1061,13 @@ public partial class Net : Node
     // ---- downed / revive ----
     private readonly HashSet<long> _downed = new();
     public bool AnyDowned() => _downed.Count > 0;
+    public float MinAllyHpFrac()   // (NEW) lowest ally HP frac — lets the director judge party-wide survival, not just the host's
+    {
+        float m = 1f;
+        foreach (var kv in _remotes)
+            if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value)) m = Mathf.Min(m, kv.Value.Downed ? 0f : kv.Value.HpFrac);
+        return m;
+    }
     public System.Collections.Generic.List<Vector3> AllyPositions()
     {
         var list = new System.Collections.Generic.List<Vector3>();
@@ -1050,6 +1113,36 @@ public partial class Net : Node
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveGameOver() { Game.I?.GameOver(); }
+
+    // ---- end-of-run scoreboard sync (NEW): each warden broadcasts its RunStats block at game over ----
+    public void BroadcastRunStats(RunStats s)
+    {
+        if (!Active || s == null) return;
+        Rpc(nameof(ReceiveRunStats), s.DamageDealt, s.BossDamage, s.Healing, s.Flings, s.DamageTaken, s.Highlight, s.WitchIdx, s.Slot, s.TimesDowned, s.Revives, s.BestCombo, s.BiggestHit);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveRunStats(float dd, float bd, float heal, int flings, float taken, float hl, int witch, int slot, int downed, int revives, int bestCombo, float biggestHit)
+    {
+        if (Game.I == null) return;
+        Game.I.AllStats[Multiplayer.GetRemoteSenderId()] = new RunStats
+        { DamageDealt = dd, BossDamage = bd, Healing = heal, Flings = flings, DamageTaken = taken, Highlight = hl, WitchIdx = witch, Slot = slot, TimesDowned = downed, Revives = revives, BestCombo = bestCombo, BiggestHit = biggestHit };
+    }
+
+    // host → all: the authoritative kill tallies (the only exact way to attribute kills in HOST-OWNS-WORLD)
+    public void BroadcastKillTally()
+    {
+        if (!Active || !IsHost) return;
+        var peers = new System.Collections.Generic.List<long>(Game.I.KillTally.Keys);
+        var ids = new long[peers.Count]; var kills = new int[peers.Count]; var night = new int[peers.Count];
+        for (int i = 0; i < peers.Count; i++) { ids[i] = peers[i]; kills[i] = Game.I.KillTally[peers[i]]; night[i] = Game.I.NightKillTally.GetValueOrDefault(peers[i]); }
+        Rpc(nameof(ReceiveKillTally), ids, kills, night);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveKillTally(long[] ids, int[] kills, int[] night)
+    {
+        if (Game.I == null) return;
+        for (int i = 0; i < ids.Length; i++) { Game.I.KillTally[ids[i]] = kills[i]; Game.I.NightKillTally[ids[i]] = night[i]; }
+    }
 
     // ---- char-select ready gate (NEW): every warden locks in, host waits for all, then broadcasts BeginRun ----
     private readonly System.Collections.Generic.HashSet<long> _ready = new();
@@ -1450,6 +1543,7 @@ public partial class Net : Node
                 var xs = new System.Collections.Generic.List<float>();
                 var ys = new System.Collections.Generic.List<float>();   // (NEW) Y so clients see fling arcs / flyer height
                 var zs = new System.Collections.Generic.List<float>();
+                var brn = new System.Collections.Generic.List<int>();    // (NEW) Ember burn stacks for the client HUD
                 foreach (var e in live)
                 {
                     if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead) continue;
@@ -1458,8 +1552,9 @@ public partial class Net : Node
                     st.Add(e.StatusMask());
                     af.Add(e.Affix);
                     xs.Add(e.GlobalPosition.X); ys.Add(e.GlobalPosition.Y); zs.Add(e.GlobalPosition.Z);
+                    brn.Add(Mathf.CeilToInt(e.BurnStacks));
                 }
-                Rpc(nameof(EnemySnapshot), ids.ToArray(), tys.ToArray(), eli.ToArray(), hpf.ToArray(), st.ToArray(), xs.ToArray(), ys.ToArray(), zs.ToArray(), af.ToArray());
+                Rpc(nameof(EnemySnapshot), ids.ToArray(), tys.ToArray(), eli.ToArray(), hpf.ToArray(), st.ToArray(), xs.ToArray(), ys.ToArray(), zs.ToArray(), af.ToArray(), brn.ToArray());
 
                 // pickups: live orbs (kind 0) + unopened chests (kind 1)
                 var pid = new System.Collections.Generic.List<int>();
@@ -1528,9 +1623,15 @@ public partial class Net : Node
     private void ReceiveHit(int netId, float dmg, int type, bool crit)
     {
         if (!IsHost || Game.I == null) return;
+        long sender = Multiplayer.GetRemoteSenderId();
         foreach (var e in Game.I.Enemies)
             if (e != null && GodotObject.IsInstanceValid(e) && !e.Dead && e.NetId == netId)
-            { e.Hurt(dmg, (DamageType)type, true, crit); break; }   // (NEW) carry crit → armor-bypass (Sentinel core) + crit plink resolve on the host
+            {
+                Game.I.AttackerPeer = sender;                       // (NEW) so a kill here credits the reporting client, exactly
+                e.Hurt(dmg, (DamageType)type, true, crit);         // (NEW) carry crit → armor-bypass (Sentinel core) + crit plink resolve on the host
+                Game.I.AttackerPeer = Game.I.LocalPeer;             // reset: the host's own subsequent hits credit the host
+                break;
+            }
     }
 
     // ---- Gale storm authority (Cyclone pull / Hurricane fling / area grind) ----
@@ -1621,6 +1722,7 @@ public partial class Net : Node
                 case 3: e.Mark(a, b, (int)c); break;
                 case 4: e.Poison(a, b, (int)Multiplayer.GetRemoteSenderId()); break;   // (NEW) poison now routes to the host, attributed to its caster
                 case 5: e.AddFreeze(a, b, c); break;   // (NEW) frost witch freeze stacks + caster's frost profile (threshMul=b, durBonus=c) — best-of on the host
+                case 6: e.AddBurn(a, b, c, 0f, (int)Multiplayer.GetRemoteSenderId()); break;  // (NEW) Ember burn stacks (amt=a, perStackDps=b, bombFlat=c); owner = the client who cast it
                 case 7: e.ConsumeCurse(a, b, c); break;   // (NEW) Forsaken voodoo crush: a=frac of stacks, b=damage per stack, c=effective-stack cap
             }
             return;
@@ -1675,7 +1777,7 @@ public partial class Net : Node
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
-    private void EnemySnapshot(int[] ids, int[] types, int[] elite, float[] hpf, int[] status, float[] xs, float[] ys, float[] zs, int[] aff)
+    private void EnemySnapshot(int[] ids, int[] types, int[] elite, float[] hpf, int[] status, float[] xs, float[] ys, float[] zs, int[] aff, int[] burn)
     {
         if (IsHost || Game.I == null) return;   // only clients render proxies
         var seen = new HashSet<int>();
@@ -1700,6 +1802,7 @@ public partial class Net : Node
             e.Hp = hpf[i] * e.MaxHp;                            // reflect damage on the client health bar
             e.SetAffix(aff[i]);                                 // affix aura/visual
             e.SetRemoteStatus(status[i]);                       // reflect bleed/slow/root/mark tints & rings
+            e.SetRemoteBurn(i < burn.Length ? burn[i] : 0);     // (NEW) Ember burn stacks for the HUD progress
         }
         // anything not in this snapshot died/despawned on the host
         var gone = new List<int>();

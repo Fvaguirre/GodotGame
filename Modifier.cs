@@ -5,7 +5,7 @@ using Godot;
 // Player.EquipModifier, and applied in Player.ApplyChargedMods (switch on m.Type, reading magnitude
 // from the equipped Modifier). To add one: extend this enum + ModMeta, handle it in ApplyChargedMods,
 // add a ModCard Def in UpgradePool. Witch-agnostic, like finishers. See DEV_GUIDE.md §6.3.
-public enum ModType { Frost, Bramble, Sunder, HexMark, Moonbeam, Consecrate, Smite, Hemorrhage, CrimsonPool, SanguineSpikes, Implosion, Whirlwind }   // Implosion/Whirlwind = Wind (NEW)
+public enum ModType { Frost, Bramble, Sunder, HexMark, Moonbeam, Consecrate, Smite, Hemorrhage, CrimsonPool, SanguineSpikes, Implosion, Whirlwind, Meteor, Eruption }   // Implosion/Whirlwind = Wind; Meteor/Eruption = Ember (NEW)
 
 public static class ModMeta
 {
@@ -22,6 +22,8 @@ public static class ModMeta
         ModType.SanguineSpikes => "Sanguine Spikes",
         ModType.Implosion => "Implosion",
         ModType.Whirlwind => "Whirlwind",
+        ModType.Meteor => "Meteor Strike",
+        ModType.Eruption => "Eruption",
         _ => "?" };
 
     // hover-tooltip description for the swap / grimoire screens
@@ -38,13 +40,16 @@ public static class ModMeta
         ModType.SanguineSpikes => "Charged casts loose blood spikes; kills bank a stack (Crimson) or mend others.",
         ModType.Implosion => "A full charge damages the area, then yanks the survivors inward.",
         ModType.Whirlwind => "A full charge spawns a stationary tornado: it grinds foes, and any player can launch off it like a jump pad.",
+        ModType.Meteor => "A full charge calls down a meteor where it lands — a heavy Ember blast that stacks burn.",
+        ModType.Eruption => "A full charge erupts the ground: molten rock heaves up and a flame ring blasts outward, knocking foes back (higher rarities fling the small ones skyward).",
         _ => "" };
 
     public static string Tag(ModType t) => t switch {
         ModType.Frost => "FV", ModType.Bramble => "BR", ModType.Sunder => "SB",
         ModType.HexMark => "HX", ModType.Moonbeam => "MW",
         ModType.Consecrate => "CG", ModType.Smite => "SM",
-        ModType.Hemorrhage => "HM", ModType.CrimsonPool => "CP", ModType.SanguineSpikes => "SS", _ => "?" };
+        ModType.Hemorrhage => "HM", ModType.CrimsonPool => "CP", ModType.SanguineSpikes => "SS",
+        ModType.Meteor => "MT", ModType.Eruption => "ER", _ => "?" };
 
     public static DamageType DType(ModType t) => t switch {
         ModType.Frost => DamageType.Frost,
@@ -59,6 +64,8 @@ public static class ModMeta
         ModType.SanguineSpikes => DamageType.Blood,
         ModType.Implosion => DamageType.Wind,
         ModType.Whirlwind => DamageType.Wind,
+        ModType.Meteor => DamageType.Ember,
+        ModType.Eruption => DamageType.Ember,
         _ => DamageType.Arcane };
 
     public static Color Col(ModType t) => DamageTypes.Col(DType(t));

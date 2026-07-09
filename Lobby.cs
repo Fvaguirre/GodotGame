@@ -86,6 +86,7 @@ public partial class Lobby : Control
         _main.AddChild(Spacer(14));
         _main.AddChild(MenuButton("Play Solo", Accent, () => { Hide(); Game.I.LobbySolo(); }));
         _main.AddChild(MenuButton("Play Multiplayer", new Color(0.55f, 0.85f, 1f), () => ShowPanel(1)));
+        _main.AddChild(MenuButton("Coven Perks", new Color(0.8f, 0.6f, 1f), () => { Hide(); Game.I.OpenPerks(); }));
         _main.AddChild(MenuButton("Options", new Color(0.6f, 0.9f, 0.6f), () => ShowPanel(2)));
         _main.AddChild(MenuButton("Quit", new Color(0.9f, 0.5f, 0.55f), () => GetTree().Quit(), 18));
     }

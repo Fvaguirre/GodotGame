@@ -55,7 +55,7 @@ public partial class Player : Node3D
     public float DashT = 0f;          // recent-dodge spike for musical tension
 
     // ---- ultimate ----
-    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze, HexCircle, LifeDrain, LifeCurse }   // …Forsaken = HexCircle/LifeDrain/LifeCurse (NEW)
+    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze, HexCircle, LifeDrain, LifeCurse, MeteorDescent, WildfireRush, PhoenixAscend }   // …Forsaken = HexCircle/LifeDrain/LifeCurse (NEW)
     public UltKind Ult = UltKind.None;
     public float UltCharge = 0f;       // 0..1
     public float DmgWindow = 0f;        // damage dealt since last team-damage broadcast (ult-share)
@@ -65,7 +65,7 @@ public partial class Player : Node3D
     public float UltDmgMul = 1f;
     public bool ModEclipse = false, ModLight = false, ModCrescent = false;   // legendary ult-mods
     public float EclipseCrit => (Ult == UltKind.Eclipse && UltActive) ? 0.25f : 0f;   // +crit while the eclipse is up
-    private bool RollCrit() => GD.Randf() < Mathf.Min(0.95f, S.CritChance + EclipseCrit);
+    private bool RollCrit() => GD.Randf() < Mathf.Min(0.95f, S.CritChance + EclipseCrit + (EmberFervorT > 0f ? _emberFervorCrit : 0f));
     private float _eclipseMax = 1f;
     public float EclipseFrac => _eclipseMax > 0f ? Mathf.Clamp(UltActiveT / _eclipseMax, 0f, 1f) : 0f;
     public float EclipseTime => UltActiveT;
@@ -76,6 +76,17 @@ public partial class Player : Node3D
     public bool ModCyclone = false, ModHurricane = false, ModStorm = false;   // gale legendary ult-mods (NEW)
     public bool ModBlizzard = false, ModFrostElem = false, ModDeepFreeze = false;   // frost legendary ult-mods (NEW)
     public bool ModPlague = false, ModRapture = false, ModRite = false;   // forsaken legendary ult-mods (NEW)
+    // ---- Ember ult runtime state (NEW) ----
+    private bool _meteorAscend = false; private float _meteorAscendT = 0f, _meteorBaseY = 0f;   // Meteor Descent: rise + top-down aim window
+    private int _flameDashCharges = 0; private float _flameDashWindowT = 0f, _flameDashT = 0f, _flameDashDur = 0f, _flameDashDist = 0f; private Vector3 _flameDashDir;   // Wildfire Rush: dash stock + window + motion
+    public float BurnLifestealT = 0f;   // Wildfire Rush: while >0, this player's burn ticks heal her 100%
+    private bool _phoenix = false, _phoenixRebirth = false; private float _phoenixAuraT = 0f;   // Phoenix Ascendant: transform + one-shot cheat-death
+    public bool PhoenixActive => Ult == UltKind.PhoenixAscend && UltActive;
+    private Node3D _phoenixVfx;
+    // ---- Ember Fervor finisher buff (crit + move speed; witch-agnostic) ----
+    public float EmberFervorT = 0f; private float _emberFervorCrit = 0f, _emberFervorSpeed = 0f, _fervorNetT = 0f;
+    private readonly System.Collections.Generic.List<Node3D> _fervorFlames = new();
+    public bool EmberFervorActive => EmberFervorT > 0f;
     // ---- Forsaken ult runtime state (NEW) ----
     private int _hexGroup = 0; private Node3D _hexVfx; private float _hexTickT = 0f, _hexNetT = 0f;   // Hex Circle: the mega-group id + ground field + tick throttles
     private float _drainBank = 0f, _drainBaseY = 0f, _drainTickT = 0f, _drainNetT = 0f; private Node3D _drainVfx;   // Life Drain: banked lifesteal + hover base + aura
@@ -99,7 +110,7 @@ public partial class Player : Node3D
     public float StormFrac => _stormMax > 0f ? Mathf.Clamp(UltActiveT / _stormMax, 0f, 1f) : 0f;   // Stormform meter 0..1 (NEW)
     public float StormTime => UltActiveT;                                      // Stormform seconds left (NEW)
     private float StormSpeedMul => StormActive ? 1.5f : 1f;                    // Stormform: +50% move speed (NEW)
-    public float MoveSpeedFactor => Mathf.Max(1f, StormSpeedMul * WindBoonSpeedMul);   // (NEW) swarmers scale up to keep pace with a fast player
+    public float MoveSpeedFactor => Mathf.Max(1f, StormSpeedMul * WindBoonSpeedMul * (EmberFervorT > 0f ? 1f + _emberFervorSpeed : 1f));   // (NEW) swarmers scale up to keep pace with a fast player; Ember Fervor also speeds her
     private float StormFireMul => StormActive ? 0.6f : 1f;                     // Stormform: 40% faster casts (NEW)
     private float _galeGuard = 0f;                                             // Tailwind: brief damage-reduction window after a dash (Gale) (NEW)
     public float GustPower = 1f;                                               // Gale card "Crosswind": scales charged-gust knockback + reach (NEW)
@@ -125,7 +136,8 @@ public partial class Player : Node3D
     public bool GaleWitch = false;      // Wind mobility/control witch — knockback gusts + cyclones (NEW)
     public bool FrostWitch = false;     // (NEW) Frost sniper — freezing beam + charged icicle spear + shatter
     public bool ForsakenWitch = false;  // (NEW) Curse controller — a lock-on curse-suck beam that tethers foes into hexed groups
-    public int WitchIndex => ForsakenWitch ? 6 : FrostWitch ? 5 : GaleWitch ? 4 : (VerdantWitch ? 3 : (CrimsonWitch ? 2 : (DivineWitch ? 1 : 0)));   // 0 Lunar,1 Divine,2 Crimson,3 Verdant,4 Gale,5 Frost,6 Forsaken
+    public bool EmberWitch = false;     // (NEW) Ember pyro — flamethrower cone + aimed meteor; stacks burn → Living Bomb
+    public int WitchIndex => EmberWitch ? 7 : ForsakenWitch ? 6 : FrostWitch ? 5 : GaleWitch ? 4 : (VerdantWitch ? 3 : (CrimsonWitch ? 2 : (DivineWitch ? 1 : 0)));   // 0 Lunar,1 Divine,2 Crimson,3 Verdant,4 Gale,5 Frost,6 Forsaken,7 Ember
     // ---- Forsaken (Curse) witch tuning ----
     public int MaxLinks = 6;              // (NEW) how many foes she can tether across all curse groups at once
     public float CurseRate = 2.5f;        // (NEW) curse stacks/sec the suck-beam builds — faster so groups form quickly
@@ -154,6 +166,15 @@ public partial class Player : Node3D
     public float AuraBonusR = 0f;            // Crimson: Crimson Communion (+aura radius)
     public float AuraHealMul = 1f;           // Crimson: Crimson Communion (+aura-kill heal)
     public bool Hemoclast = false;           // Crimson: Hemoclast (blood nova when spending stacks)
+    // ---- new witch legendaries (NEW) ----
+    public bool RadiantMote = false;         // Divine legendary "Radiant Ascension": while AIRBORNE, motes mend allies they pass (+combo) and pierce on to a foe; primary can lock allies
+    public bool GravityWell = false;         // Lunar legendary "Gravity Well": a slain foe collapses, dragging nearby enemies inward
+    public bool Bloodbath = false;           // Crimson legendary "Bloodbath": each kill bursts blood — heals you + damages nearby foes
+    public bool GuardianAegis = false;       // Divine legendary "Guardian's Aegis" (gate)
+    public bool CrimsonFrenzy = false;       // Crimson legendary "Crimson Frenzy" (gate)
+    public bool AncientGrove = false;        // Verdant legendary "Ancient Grove" (gate)
+    public bool VerdantVitality = false;     // Verdant legendary "Verdant Vitality" (gate)
+    private float _killProcCd = 0f;          // throttle for the on-kill legendary procs (Gravity Well / Bloodbath)
     // ---- Verdant finisher state + legendary mods (equippable by ANY witch) ----
     public bool ModPoisonField = false;      // Creeping Blight legendary: also slows + thicker poison
     public bool ModSeedMine = false;         // Seed Mines legendary: chain-detonate
@@ -163,7 +184,7 @@ public partial class Player : Node3D
     public int MaxEnts => 3 + GroveBonusEnts;                    // base 3; grows ONLY via Deepening Grove cards (cap +4 → 7)
     public float MinionDamage() => Base() * 0.6f;
     public float MinionBurst() => Base() * 3.0f;                   // full-charge detonation — her big burst
-    public float PoisonDps() => Base() * 0.22f;                   // per application — additive, stacks while you keep hitting
+    public float PoisonDps() => Base() * 0.15f;                   // (NERF 0.22→0.15) per application — additive, stacks while you keep hitting; her primary poison was ~2.6× overtuned
     // her tree-ents are part of her kit: their direct hits inherit her crit + lifesteal (but NOT her full
     // HP or flat damage, which stay fractional). Rolls a crit, heals her for the leech, returns final damage.
     public float MinionStrike(float baseDmg, out bool crit)
@@ -305,6 +326,7 @@ public partial class Player : Node3D
         float before = Hp;
         Hp = Mathf.Min(S.MaxHp, Hp + amt * HealMul());
         _healAccum += Hp - before;   // count only effective healing (not overheal)
+        if (Game.I != null) Game.I.MyStats.Healing += Hp - before;   // (NEW) end-of-run tally: total healing done
     }
     // friendly healing also mends the witch's tree-ents (positive support effect)
     public bool HealOwnMinions(float amt)    {
@@ -688,6 +710,8 @@ public partial class Player : Node3D
         if (HurricaneActive) { UpdateHurricane(dt); return; }   // aloft, steering the storm (NEW)
         if (LifeDrainActive) { UpdateLifeDrain(dt); return; }   // aloft, draining — free flight, then the release burst (NEW)
         if (_galeDiving) { UpdateGaleDive(dt); return; }   // Gale air-slam: rocket to the aimed spot, then slam (NEW)
+        if (_meteorAscend) { UpdateMeteorAscend(dt); return; }   // (NEW) Ember ult: suspended, aiming the landing zone
+        if (PhoenixActive) { UpdatePhoenix(dt); return; }        // (NEW) Ember ult: free phoenix flight + immolation aura
 
         if (_rushT > 0f)
         {
@@ -696,6 +720,13 @@ public partial class Player : Node3D
             GlobalPosition = ClampPos(GlobalPosition + _rushDir * step);
             if (_rushWind) { _windPuffCd -= dt; if (_windPuffCd <= 0f) { SpawnWindPuff(GlobalPosition, _rushDir); _windPuffCd = 0.05f; } }   // wind trail (NEW)
             if (_rushT <= 0f) _rushWind = false;
+        }
+        else if (_flameDashT > 0f)   // (NEW) Wildfire Rush: a long flame dash, laying its trail as it goes
+        {
+            _flameDashT -= dt;
+            float step = _flameDashDist * (Mathf.Min(dt, _flameDashDur) / _flameDashDur);
+            GlobalPosition = ClampPos(GlobalPosition + _flameDashDir * step);
+            Game.I.SpawnFlameCone(GlobalPosition, _flameDashDir, 3f, DamageTypes.Col(DamageType.Ember));
         }
         else if (_dashT > 0f)
         {
@@ -722,6 +753,8 @@ public partial class Player : Node3D
         }
 
         if (_flareCd > 0f) _flareCd -= dt;
+        if (_killProcCd > 0f) _killProcCd -= dt;   // (NEW) age the on-kill legendary throttle
+        if (GaleWitch && Airborne && Game.I.State == GameState.Playing) Game.I.MyStats.Highlight += dt;   // (NEW) Gale highlight = seconds aloft
         if (!Downed && Game.I.CanControlLocal() && Input.IsPhysicalKeyPressed(Key.T) && _flareCd <= 0f) { FireFlare(); _flareCd = 2f; }   // (NEW) hold T → firework flare
 
         Combat(dt);
@@ -741,7 +774,7 @@ public partial class Player : Node3D
         Game.I.AddMinimapBlip(GlobalPosition, DamageTypes.Col(WitchDamage)); // (NEW) minimap ping so allies triangulate you
     }
 
-    public DamageType WitchDamage => WitchIndex switch { 1 => DamageType.Holy, 2 => DamageType.Blood, 3 => DamageType.Nature, 4 => DamageType.Wind, 5 => DamageType.Frost, 6 => DamageType.Curse, _ => DamageType.Lunar };
+    public DamageType WitchDamage => WitchIndex switch { 1 => DamageType.Holy, 2 => DamageType.Blood, 3 => DamageType.Nature, 4 => DamageType.Wind, 5 => DamageType.Frost, 6 => DamageType.Curse, 7 => DamageType.Ember, _ => DamageType.Lunar };
 
     private Vector3 InputDir()
     {
@@ -845,6 +878,7 @@ public partial class Player : Node3D
         float dmg = Base() * (0.8f * scale);
         Game.I.NetMgr?.StormForce(pos, radius, 2, dmg);                 // shockwave damage
         Game.I.NetMgr?.StormForce(pos, radius, 3, 6f + scale * 4f);     // fling foes back (mass-scaled)
+        Game.I.MyStats.Flings += Game.I.CountFlungNear(pos, radius);   // (NEW) tally enemies flung
         Game.I.NetMgr?.BroadcastVfx(6, pos, Vector3.Up, radius, 0f, DamageTypes.Col(DamageType.Wind));
         Ring(pos, DamageTypes.Col(DamageType.Wind), radius, 0.4f);
         Ring(pos, DamageTypes.Col(DamageType.Wind).Lerp(Colors.White, 0.4f), radius * 0.6f, 0.3f);
@@ -905,6 +939,7 @@ public partial class Player : Node3D
         if (HurricaneActive) { Charging = false; ChargeAmt = 0; return; }   // piloting the storm — no casting (NEW)
 
         if (GaleWitch) { UpdateGaleCharge(dt); }   // Gale: chargeable ground/air slam punch (NEW)
+        else if (EmberWitch) { UpdateEmberCharge(dt); }   // (NEW) Ember: chargeable aimed meteor (ground aim ring under the reticle)
         else if (Input.IsActionPressed("charge") && !(UltActive && Ult == UltKind.Crescent))
         {
             if (!_charging) { _charging = true; _charge = 0f; Game.I.Sfx?.ChargeUp(SecondaryType); }
@@ -960,6 +995,11 @@ public partial class Player : Node3D
             if (!_charging && Input.IsActionPressed("cast") && !(UltActive && Ult == UltKind.Crescent)) UpdateCurseBeam(dt);
             else EndCurseBeam();
         }
+        else if (EmberWitch)   // (NEW) primary = a channeled flame cone (hold left-click) — ticks faster with cast speed
+        {
+            if (!_charging && Input.IsActionPressed("cast") && !(UltActive && Ult == UltKind.Crescent)) UpdateFlameCone(dt);
+            else EndFlameCone();
+        }
         else if (!_charging && Input.IsActionPressed("cast") && _fireCd <= 0f && !(UltActive && Ult == UltKind.Crescent))
         {
             FireBolt(0f);
@@ -1011,7 +1051,7 @@ public partial class Player : Node3D
             var right = new Vector3(fwd.Z, 0, -fwd.X).Normalized();
             var up = right.Cross(fwd).Normalized();
             const int needles = 3;
-            float per = dmg * 0.42f;                     // scaled down — several needles per cast
+            float per = dmg * 0.30f;                     // (NERF 0.42→0.30) scaled down — the Grove/ents should carry her DPS, not the primary
             for (int i = 0; i < needles; i++)
             {
                 float sx = (GD.Randf() - 0.5f) * 0.085f, sy = (GD.Randf() - 0.5f) * 0.07f;
@@ -1032,18 +1072,23 @@ public partial class Player : Node3D
         // Holy primary = a light mote. Locks onto whatever the cursor was over; otherwise flies straight.
         if (dtype == DamageType.Holy && isNormal)
         {
+            bool radiant = RadiantMote && Airborne;   // the airborne heal-through only comes online while she's aloft
             var tgt = AimTarget();
+            Vector3 origin = _cam.GlobalPosition + camFwd * 1.2f;
+            Vector3 dir = camFwd.Normalized();
+            if (tgt == null && radiant && AimAllyPos(out var allyPos))   // no foe aimed → lock onto an ally to mend them (and hit whatever's behind)
+                dir = (allyPos - origin).Normalized();
+            Bolt mote;
             if (tgt != null)
             {
-                var mote = SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd.Normalized() * 44f, dmg,
-                    pierce, 0.45f, tint, dtype, normal: true, charged: false, combo: true, full: false, homing: true);
+                mote = SpawnBolt(origin, dir * 44f, dmg, pierce, 0.45f, tint, dtype, normal: true, charged: false, combo: true, full: false, homing: true);
                 mote.Target = tgt; mote.SeekLockedOnly = true; mote.HomeSpeed = 44f; mote.Turn = 7f; mote.HomeDelay = 0.05f;
             }
             else
             {
-                SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd.Normalized() * 48f, dmg,
-                    pierce, 0.45f, tint, dtype, normal: true, charged: false, combo: true, full: false, homing: false);
+                mote = SpawnBolt(origin, dir * 48f, dmg, pierce, 0.45f, tint, dtype, normal: true, charged: false, combo: true, full: false, homing: false);
             }
+            if (radiant) { mote.RadiantHeal = true; mote.HealAmt = 0.4f + 0.2f * Mathf.Clamp(Combo, 0, 30); }   // mends allies it passes; base 0.4 HP, more with combo
             return;
         }
 
@@ -1107,6 +1152,25 @@ public partial class Player : Node3D
             if (dot > bestDot) { bestDot = dot; best = e; }   // most-centered enemy within the cone
         }
         return best;
+    }
+
+    // (NEW) Radiant Ascension: find the ally most centered in the aim cone, so an airborne Divine can lock her healing mote onto them.
+    private bool AimAllyPos(out Vector3 pos)
+    {
+        pos = Vector3.Zero;
+        var net = Game.I.NetMgr;
+        if (net == null || !net.Active) return false;
+        Vector3 o = _cam.GlobalPosition, f = (-_cam.GlobalTransform.Basis.Z).Normalized();
+        float bestDot = 0.985f; bool found = false;
+        foreach (var ap in net.AllyPositions())
+        {
+            var aim = ap + Vector3.Up * 0.9f;
+            var to = aim - o; float d = to.Length();
+            if (d < 0.5f || d > 70f) continue;
+            float dot = f.Dot(to / d);
+            if (dot > bestDot) { bestDot = dot; pos = aim; found = true; }
+        }
+        return found;
     }
 
     // Blood Lash: a fast short-range arc swipe in front of the witch.
@@ -1209,7 +1273,7 @@ public partial class Player : Node3D
         Vector3 fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();
         float reach = 7.5f * S.SpellArea, cosArc = 0.55f;   // ~57-degree half-arc; SpellArea (area cards) scales reach
         bool crit = RollCrit();
-        float dmg = dmgBase * (crit ? CritMult() : 1f);
+        float dmg = dmgBase * 1.3f * (crit ? CritMult() : 1f);   // (BUFF) Gale punches hit ~30% harder — she felt weak
         var col = DamageTypes.Col(DamageType.Wind);
         foreach (var e in Game.I.Enemies.ToArray())
         {
@@ -1217,9 +1281,10 @@ public partial class Player : Node3D
             var to = e.GlobalPosition - o; float d = to.Length();
             if (d > reach + e.Radius) continue;
             if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc) continue;
-            e.Hurt(dmg, DamageType.Wind, true, crit);
+            float fdmg = e.Thrown ? dmg * 1.45f : dmg;   // (BUFF) extra lethal to airborne foes — rewards her fling→punch combo
+            e.Hurt(fdmg, DamageType.Wind, true, crit);
             e.Knockback(GlobalPosition, 1.0f);                              // light shove on the basic punch
-            OnHitDirectNormal(e, e.Dead, dmg, DamageType.Wind);
+            OnHitDirectNormal(e, e.Dead, fdmg, DamageType.Wind);
             AimHitOnEnemy(o, fwd, e, out var hp, out var hn);   // (NEW) blow-mark lands where the cursor hit him, at that height
             Game.I.SpawnImpactMark(hp, hn, e, DamageType.Wind, 0.55f);
         }
@@ -1293,9 +1358,8 @@ public partial class Player : Node3D
             if (Flat(e, center) > radius + e.Radius) continue;
             e.Hurt(dmg, DamageType.Wind, true, crit);
             e.Knockback(center, knock);
-            ComboFromSource();
+            OnHitDirect(e, e.Dead, dmg, DamageType.Wind);   // (FIX) build combo + charge finishers PER enemy hit (was ComboFromSource — 0.15s-throttled & never charged finishers; also handles kill/Stormform)
             hits++;
-            if (e.Dead) StormformOnKill();   // slam kills extend Stormform too (NEW)
         }
         if (hits > 0) AddMana(1f);   // right-click pays back a mana when it connects — matches every other witch's charged release (NEW)
         Game.I.SmashNear(center, radius);   // the slam shatters pumpkins caught in it (NEW)
@@ -1414,6 +1478,253 @@ public partial class Player : Node3D
         _galeAimRing.GlobalPosition = new Vector3(p.X, p.Y + 0.06f, p.Z);
     }
     private void HideGaleAimRing() { if (_galeAimRing != null) _galeAimRing.Visible = false; }
+
+    // ===================== EMBER WITCH — flamethrower primary + aimed meteor secondary (NEW) =====================
+    private MeshInstance3D _emberAimRing;
+    private float _flameTickT = 0f, _flameSndT = 0f;
+
+    // held primary: a flame cone that TICKS at the cast-speed rate (so FireCd cards speed it up) and coats foes in burn.
+    private void UpdateFlameCone(float dt)
+    {
+        var basis = _cam.GlobalTransform.Basis;
+        Vector3 o = (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))   // (NEW) flame pours from the LEFT HAND, not the eye
+            ? _handMeshL.GlobalPosition
+            : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;
+        Vector3 dir = AimDir().Normalized();
+        float reach = 12f * S.SpellArea * (PhoenixActive ? 1.7f : 1f);   // (NEW) reaches further; Phoenix Ascendant makes it huge
+        Game.I.SpawnFlameCone(o, dir, reach, DamageTypes.Col(DamageType.Ember));   // continuous flame VFX (local)
+        _flameSndT -= dt; if (_flameSndT <= 0f) { _flameSndT = 0.25f; Game.I.Sfx?.Cast(DamageType.Ember); }
+        _emberNetT -= dt; if (_emberNetT <= 0f) { _emberNetT = 0.12f; Game.I.NetMgr?.BroadcastVfx(66, o, dir, reach, 0f, DamageTypes.Col(DamageType.Ember)); }   // allies see the flame
+        _flameTickT -= dt;
+        if (_flameTickT <= 0f) { _flameTickT = Mathf.Max(0.08f, S.FireCd * 0.6f); FlameConeTick(o, dir, reach); }   // faster cast speed → faster ticks
+        FireHeat = Mathf.Min(1f, FireHeat + 0.03f);
+    }
+    private float _emberNetT = 0f;
+    private void EndFlameCone() { }   // nothing to tear down — the flame VFX is fire-and-forget puffs
+
+    private void FlameConeTick(Vector3 o, Vector3 dir, float reach)
+    {
+        float pmul = PhoenixActive ? 1.6f : 1f;                // Phoenix Ascendant: harder-hitting flame
+        float cosArc = PhoenixActive ? 0.78f : 0.85f;         // ...and a wider cone while ascended
+        float dmg = Base() * 0.26f * pmul * ComboMul();        // small per-tick direct
+        float burnPer = Base() * 0.085f * pmul;                // burn dps PER stack (scales with base damage)
+        float bombFlat = Base() * 3.2f;                        // Living Bomb blast on reaching the threshold
+        bool credited = false;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            var to = e.GlobalPosition - o; float d = to.Length();
+            if (d > reach + e.Radius) continue;
+            if (dir.Dot(to / Mathf.Max(d, 0.001f)) < cosArc) continue;
+            e.Hurt(dmg, DamageType.Ember, true);
+            e.AddBurn(1f, burnPer, bombFlat);                  // +1 burn stack toward Living Bomb
+            if (!credited) { OnHitDirectNormal(e, e.Dead, dmg, DamageType.Ember); credited = true; }   // build combo/finisher/mana ONCE per tick (like the beams)
+        }
+        Game.I.DamageWorld(o + dir * (reach * 0.5f), reach * 0.5f, dmg);
+    }
+
+    // charged secondary: hold to aim a big ground ring under the reticle, release to call a meteor there.
+    private void UpdateEmberCharge(float dt)
+    {
+        bool holding = Input.IsActionPressed("charge") && !(UltActive && Ult == UltKind.Crescent);
+        if (holding)
+        {
+            if (!_charging) { _charging = true; _charge = 0f; Game.I.Sfx?.ChargeUp(DamageType.Ember); }
+            _charge = Mathf.Min(1f, _charge + Mathf.Min(S.ChargeSpeed, 2.5f) * dt);
+            UpdateEmberAimRing();
+        }
+        else if (_charging)
+        {
+            _charging = false; HideEmberAimRing();
+            if (_charge > 0.08f)
+            {
+                if (Mana < 0.5f) ResFail();
+                else { Mana -= 0.5f; var aim = EmberAimPoint(_charge); FireMeteor(_charge, aim); if (_charge >= 0.95f) ApplyChargedMods(aim); Game.I.Sfx?.Release(DamageType.Ember); CamKick(0.4f); }   // (FIX) her full-charge now fires charged-mods too (Meteor mod → two meteors)
+            }
+            _charge = 0f;
+        }
+        Charging = _charging; ChargeAmt = _charge;
+    }
+    private float EmberMeteorRadius(float charge) => (4f + charge * 4.5f) * S.SpellArea;   // grows with hold (4→8.5) AND with area-spell cards (× SpellArea)
+    private Vector3 EmberAimPoint(float charge)
+    {
+        Vector3 aim = GroundAim();
+        float maxReach = 26f * Mathf.Clamp(S.SpellRange, 1f, 2.5f);
+        Vector3 flat = aim - GlobalPosition; flat.Y = 0;
+        if (flat.Length() > maxReach) aim = GlobalPosition + flat.Normalized() * maxReach;
+        return new Vector3(aim.X, Game.I.SurfaceHeight(aim, aim.Y), aim.Z);
+    }
+    private void UpdateEmberAimRing() => ShowEmberAimRing(EmberAimPoint(_charge), EmberMeteorRadius(_charge));
+    private void ShowEmberAimRing(Vector3 p, float rr)   // the ground landing reticle (torus scaled to the blast radius) — shared by the meteor secondary AND the Meteor Descent ult
+    {
+        if (_emberAimRing == null)
+        {
+            _emberAimRing = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = 0.9f, OuterRadius = 1.0f } };
+            var m = Game.ToonEmissive(DamageTypes.Col(DamageType.Ember), 1.8f, 0.02f);
+            if (m is StandardMaterial3D sm) { sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; sm.AlbedoColor = new Color(1f, 0.5f, 0.18f, 0.6f); }
+            _emberAimRing.MaterialOverride = m; Game.I.AddChild(_emberAimRing);
+        }
+        _emberAimRing.Visible = true;
+        _emberAimRing.Scale = Vector3.One * rr;   // torus base radius ~1 → scale to the blast radius
+        _emberAimRing.GlobalPosition = new Vector3(p.X, p.Y + 0.07f, p.Z);
+    }
+    private void HideEmberAimRing() { if (_emberAimRing != null) _emberAimRing.Visible = false; }
+
+    // ===================== EMBER ULTIMATES (NEW) =====================
+    private float MeteorUltRadius() => (10f + UltTier * 1.5f) * S.SpellArea;
+    private Vector3 MeteorAimPoint() { var a = GroundAim(); return new Vector3(a.X, Game.I.SurfaceHeight(a, a.Y), a.Z); }
+
+    // ULT 1 — Meteor Descent: rise invulnerable, aim a landing zone (5s or confirm), then SLAM.
+    private void UpdateMeteorAscend(float dt)
+    {
+        if (Downed || Game.I.State != GameState.Playing) { _meteorAscend = false; UltActive = false; HideEmberAimRing(); _iframe = 0.3f; _noFall = 2f; return; }
+        _iframe = Mathf.Max(_iframe, 0.3f); Floating = false;
+        float targetY = _meteorBaseY + 18f;
+        GlobalPosition = new Vector3(GlobalPosition.X, Mathf.MoveToward(GlobalPosition.Y, targetY, 26f * dt), GlobalPosition.Z);
+        _grounded = false; _vy = 0f;
+        ShowEmberAimRing(MeteorAimPoint(), MeteorUltRadius());
+        _meteorAscendT -= dt;
+        bool canConfirm = _meteorAscendT < 4.7f;   // ignore the activation-frame [Q] press so she doesn't drop instantly
+        if (_meteorAscendT <= 0f || (canConfirm && (Input.IsActionJustPressed("cast") || Input.IsActionJustPressed("ult")))) MeteorLand(MeteorAimPoint());
+    }
+    private void MeteorLand(Vector3 target)
+    {
+        _meteorAscend = false; HideEmberAimRing();
+        float gy = Game.I.SurfaceHeight(target, target.Y);
+        var land = new Vector3(target.X, gy, target.Z);
+        GlobalPosition = ClampPos(land);
+        _grounded = true; _vy = 0f; _jumps = JumpsMax; _iframe = 0.4f; _noFall = 0.5f;
+        UltActive = false;
+
+        int t = UltTier; float radius = MeteorUltRadius();
+        float centerDmg = Base() * (10f + t * 3f) * ComboMul();   // huge at the core
+        float edgeDmg = Base() * (2f + t * 0.6f) * ComboMul();    // still okay at the rim
+        float burnPer = Base() * 0.1f, bombFlat = Base() * 3.5f;
+        var col = DamageTypes.Col(DamageType.Ember);
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            float d = Flat(e, land); if (d > radius + e.Radius) continue;
+            float tt = Mathf.Clamp(d / radius, 0f, 1f);
+            float dmg = Mathf.Lerp(centerDmg, edgeDmg, tt * tt);   // taper: sharp huge core → okay edge
+            e.Hurt(dmg, DamageType.Ember, true, RollCrit());
+            e.AddBurn(e.LivingBombThreshold, burnPer, bombFlat, 0f, Game.I.LocalPeer);   // brand EVERYTHING with 1 Living Bomb
+            OnHitDirect(e, e.Dead, dmg, DamageType.Ember);
+        }
+        Game.I.DamageWorld(land, radius, centerDmg);
+        var field = new GroundField { Type = FieldType.Hex, DType = DamageType.Ember, Radius = radius, Dur = 6f, Power = Base() * 0.6f,
+            TintColor = col, BurnAdd = 1f, BurnPer = burnPer, BurnBomb = bombFlat, BurnOwner = Game.I.LocalPeer, Src = this };
+        Game.I.AddChild(field); field.GlobalPosition = new Vector3(land.X, 0.05f, land.Z);   // the 6s inferno keeps stacking burn
+
+        Game.I.SpawnEmberBurst(land + Vector3.Up * 0.5f, radius * 1.2f);
+        for (int i = 0; i < 3; i++) Game.I.SpawnEmberBurst(land + new Vector3((GD.Randf() - 0.5f) * radius, 0.5f, (GD.Randf() - 0.5f) * radius), radius * 0.5f);
+        Ring(land, col, radius * 1.3f, 0.6f); CamKick(1f);
+        Game.I.Sfx?.ModEmber(land); Game.I.Sfx?.Thunder();
+        Game.I.NetMgr?.BroadcastVfx(68, land, Vector3.Down, radius, 1f, col);
+    }
+
+    // ULT 2 — Wildfire Rush: a flame dash that lays a burning trail.
+    private void FlameDash()
+    {
+        if (_flameDashCharges <= 0) return;
+        _flameDashCharges--;
+        Vector3 dir = InputDir();
+        if (dir == Vector3.Zero) { dir = -GlobalTransform.Basis.Z; dir.Y = 0; dir = dir.Normalized(); }
+        float area = Mathf.Clamp(S.SpellArea, 1f, 2.5f);
+        float len = (13f + UltTier) * area, halfW = 4f * area;   // ~8u wide × 12-15u long, area cards enlarge it
+        _flameDashDir = dir; _flameDashDist = len; _flameDashDur = 0.24f; _flameDashT = _flameDashDur;
+        _iframe = Mathf.Max(_iframe, 0.3f);
+        Vector3 origin = new Vector3(GlobalPosition.X, Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y), GlobalPosition.Z);
+        var trail = new EmberTrail { Origin = origin, Dir = dir, Length = len, HalfW = halfW, Dur = 10f,
+            BurnAdd = 1.2f, BurnPer = Base() * 0.11f, BurnBomb = Base() * 3.5f, HealPerSec = S.MaxHp * 0.02f, Caster = this, OwnerPeer = Game.I.LocalPeer };
+        Game.I.AddChild(trail);
+        Game.I.NetMgr?.BroadcastEmberTrail(origin, dir, len, halfW, 10f);
+        CamKick(0.3f); Game.I.Sfx?.Cast(DamageType.Ember);
+    }
+
+    // ULT 3 — Phoenix Ascendant: free flight + immolation aura; flamethrower fires here (Combat is skipped while flying).
+    private void UpdatePhoenix(float dt)
+    {
+        if (Downed || Game.I.State != GameState.Playing) { EndPhoenix(); return; }
+        Floating = false;
+        Vector3 dir = InputDir();
+        Vector3 np = (dir != Vector3.Zero) ? GlobalPosition + dir * (S.Speed * 1.15f) * dt : GlobalPosition;
+        float vy = 0f;
+        if (Input.IsActionPressed("jump")) vy += 11f;
+        if (Input.IsActionPressed("descend")) vy -= 11f;
+        float ny = GlobalPosition.Y + vy * dt;
+        float floor = Game.I.SurfaceHeight(np, GlobalPosition.Y) + 1.2f;
+        if (ny < floor) ny = floor;
+        GlobalPosition = ClampPos(new Vector3(np.X, ny, np.Z));
+        _grounded = false; _vy = 0f; _noFall = 1f;
+
+        if (Input.IsActionPressed("cast")) UpdateFlameCone(dt);   // free & huge flamethrower (bonus applied in UpdateFlameCone)
+        else EndFlameCone();
+
+        _phoenixAuraT -= dt;
+        if (_phoenixAuraT <= 0f)
+        {
+            _phoenixAuraT = 0.4f;
+            float ar = (7f + UltTier) * S.SpellArea, ad = Base() * (0.8f + UltTier * 0.2f);
+            foreach (var e in Game.I.Enemies.ToArray())
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || Flat(e, GlobalPosition) >= ar + e.Radius) continue;
+                e.Hurt(ad, DamageType.Ember, false);
+                e.AddBurn(1f, Base() * 0.09f, Base() * 3.2f, 0f, Game.I.LocalPeer);
+            }
+            Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition, Vector3.Zero, ar, 0.4f, DamageTypes.Col(DamageType.Ember));
+        }
+        UltActiveT -= dt;
+        if (UltActiveT <= 0f) EndPhoenix();
+    }
+    private void EndPhoenix()
+    {
+        _phoenix = false; UltActive = false; _noFall = 3f; _iframe = Mathf.Max(_iframe, 0.3f);
+        if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) { _phoenixVfx.QueueFree(); _phoenixVfx = null; }
+    }
+    private void PhoenixRebirth()   // cheat-death, once per Phoenix
+    {
+        _phoenixRebirth = false;
+        Hp = S.MaxHp * 0.6f; Shield = 0; _iframe = Mathf.Max(_iframe, 1.2f);
+        float r = 12f * S.SpellArea;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || Flat(e, GlobalPosition) >= r + e.Radius) continue;
+            e.Hurt(Base() * 6f, DamageType.Ember, true); e.Knockback(GlobalPosition, 8f);
+            e.AddBurn(3f, Base() * 0.1f, Base() * 3.5f, 0f, Game.I.LocalPeer);
+        }
+        Game.I.DamageWorld(GlobalPosition, r, Base() * 6f);
+        Game.I.SpawnEmberBurst(GlobalPosition + Vector3.Up * 0.5f, r * 1.2f);
+        Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), r * 1.3f, 0.7f); CamKick(1f);
+        Game.I.Sfx?.ModEmber(GlobalPosition); Game.I.Sfx?.Thunder();
+        Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition, Vector3.Up, r, 1f, DamageTypes.Col(DamageType.Ember));
+        Game.I.Hud?.Banner("REBORN IN FLAME");
+    }
+    private Node3D BuildPhoenixAura()
+    {
+        var root = new Node3D(); var col = DamageTypes.Col(DamageType.Ember);
+        var core = new MeshInstance3D { Mesh = new SphereMesh { Radius = 1.3f, Height = 2.6f }, MaterialOverride = Game.Emissive(col, 2.5f) };
+        if (core.MaterialOverride is StandardMaterial3D cm) { cm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; cm.AlbedoColor = new Color(1f, 0.5f, 0.15f, 0.26f); }
+        core.Position = new Vector3(0, 1f, 0); root.AddChild(core);
+        for (int s = -1; s <= 1; s += 2)
+        {
+            var wing = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(2.6f, 1.7f, 0.1f) } };
+            var wm = Game.Emissive(col, 2.2f); wm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; wm.AlbedoColor = new Color(1f, 0.45f, 0.12f, 0.5f); wm.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+            wing.MaterialOverride = wm; wing.Position = new Vector3(s * 1.7f, 1.5f, -0.2f); wing.RotationDegrees = new Vector3(0, 0, s * 35f);
+            root.AddChild(wing);
+        }
+        root.AddChild(new OmniLight3D { OmniRange = 9f, LightColor = col, LightEnergy = 2.5f, Position = new Vector3(0, 1.5f, 0) });
+        return root;
+    }
+
+    private void FireMeteor(float charge, Vector3 at)
+    {
+        float radius = EmberMeteorRadius(charge);
+        float dmg = Base() * (1.8f + charge * 1.6f) * ComboMul();   // scales with hold
+        float burnPer = Base() * 0.085f, bombFlat = Base() * 3.2f;
+        int burnStacks = 3 + Mathf.RoundToInt(charge * 3f);          // instant burn toward Living Bomb
+        Game.I.SpawnEmberMeteor(at, radius, dmg, burnStacks, burnPer, bombFlat, this);
+    }
 
     // rocket toward the aimed ground point; slam on arrival (NEW)
     private void UpdateGaleDive(float dt)
@@ -1744,7 +2055,9 @@ public partial class Player : Node3D
         if (tgt != null)
         {
             beamEnd = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f;
+            bool _wasCursed = tgt.CurseStacks > 0.01f;
             tgt.AddCurse(dt * CurseRate, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // build stacks on the beamed foe
+            if (!_wasCursed && tgt.CurseStacks > 0.01f) Game.I.MyStats.Highlight++;   // (NEW) Forsaken highlight = foes newly cursed
             float beamDmg = Base() * CurseBeamDmg * dt * ComboMul();
             tgt.Hurt(beamDmg, DamageType.Curse, true);   // primary DoT — the beam isn't her damage, the group is
             if (CurseBeamLifesteal > 0f && Hp < S.MaxHp) Heal(beamDmg * CurseBeamLifesteal);   // (NEW) small sustain: siphon while beaming a live foe
@@ -2237,10 +2550,11 @@ public partial class Player : Node3D
     // barely rise) — a setup for air follow-ups (primary/charged/other combos mid-air).
     private void FinUpdraft(float pow, int t, Color col)
     {
-        _vy = 15f + t * 1.5f; _grounded = false; _jumps = JumpsMax; _noFall = Mathf.Max(_noFall, 2.5f);
+        _vy = 23f + t * 1.5f; _grounded = false; _jumps = JumpsMax; _noFall = Mathf.Max(_noFall, 3.5f);   // (BUFF) launches the caster notably higher — more air time for follow-ups
         float rad = (6f + t) * S.SpellArea;
         float up = 16f + t * 2f + pow * 2f;
         Game.I.NetMgr?.StormForce(GlobalPosition, rad, 4, up);                 // lift small/medium foes straight up
+        Game.I.MyStats.Flings += Game.I.CountFlungNear(GlobalPosition, rad);   // (NEW) tally enemies flung
         Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Up, rad, 0.5f, col);
         Ring(GlobalPosition, col, rad, 0.45f);
         Ring(GlobalPosition, col.Lerp(Colors.White, 0.4f), rad * 0.6f, 0.35f);
@@ -2284,6 +2598,7 @@ public partial class Player : Node3D
         _iframe = Mathf.Max(_iframe, _rushDur + 0.15f);
         Game.I.NetMgr?.StormForce(GlobalPosition, rad, 2, dmg);               // light damage in the lane
         Game.I.NetMgr?.StormForce(GlobalPosition, rad, 3, flingPow);          // fling foes aside/back (mass-scaled)
+        Game.I.MyStats.Flings += Game.I.CountFlungNear(GlobalPosition, rad);   // (NEW) tally enemies flung
         // ~50% dash refund if an enemy is in the path (local check — works regardless of authority)
         bool hit = false;
         foreach (var e in Game.I.Enemies.ToArray())
@@ -2338,6 +2653,7 @@ public partial class Player : Node3D
             ComboFromSource();
         }
         Game.I.NetMgr?.StormForce(o + fwd * (reach * 0.5f), reach * 0.6f, 4, 13f + t * 2f);   // fling small/medium foes up (host-authoritative / client-safe)
+        Game.I.MyStats.Flings += Game.I.CountFlungNear(o + fwd * (reach * 0.5f), reach * 0.6f);   // (NEW) tally enemies flung
         Game.I.DamageWorld(o + fwd * (reach * 0.5f), reach * 0.6f, dmg);
         SpawnIceSpikeCone(o, fwd, reach, col);
         Game.I.NetMgr?.BroadcastVfx(54, o, fwd, reach, 0f, col);   // allies see the cone
@@ -2617,6 +2933,10 @@ public partial class Player : Node3D
     private void OnHitCore(Enemy e, bool killed, float dmg, DamageType dt, bool normal, bool charged, bool combo)
     {
         DmgWindow += dmg;   // shared with allies as ult charge
+        var _st = Game.I.MyStats;   // (NEW) end-of-run tally (kills are host-authoritative — tracked in Enemy.Die, not here)
+        _st.DamageDealt += dmg;
+        if (dmg > _st.BiggestHit) _st.BiggestHit = dmg;
+        if (e != null && e.IsBoss) _st.BossDamage += dmg;
         if (Ult != UltKind.None && !UltActive)
         {
             float k = Mathf.Min(0.022f, dmg * 0.0004f);   // capped per hit — no longer runs away with damage scaling
@@ -2635,10 +2955,30 @@ public partial class Player : Node3D
             _eclipseMax = Mathf.Max(_eclipseMax, UltActiveT);
         }
         if (killed) StormformOnKill();   // a kill while Stormform is up extends it (NEW)
+        // (NEW) on-kill legendary bursts — throttled so an AoE-clear frame can't spam StormForce
+        if (killed && _killProcCd <= 0f && e != null && GodotObject.IsInstanceValid(e) && (GravityWell || Bloodbath))
+        {
+            _killProcCd = 0.25f;
+            if (GravityWell && WitchIndex == 0)   // Lunar: the slain foe collapses, dragging nearby enemies inward
+            {
+                float rr = 6.5f * S.SpellArea;
+                Game.I.NetMgr?.StormForce(e.GlobalPosition, rr, 0, 10f);   // mode 0 = pull-in
+                Ring(e.GlobalPosition, DamageTypes.Col(DamageType.Lunar), rr, 0.35f);
+                Game.I.Sfx?.Release(DamageType.Lunar);
+            }
+            if (Bloodbath && CrimsonWitch)        // Crimson: a kill bursts blood — heal yourself + damage nearby foes
+            {
+                float rr = 4.5f * S.SpellArea;
+                Heal(S.MaxHp * 0.06f);
+                Game.I.NetMgr?.StormForce(e.GlobalPosition, rr, 2, Base() * 0.7f * ComboMul());   // mode 2 = area damage
+                Ring(e.GlobalPosition, DamageTypes.Col(DamageType.Blood), rr, 0.35f);
+                Game.I.Sfx?.Release(DamageType.Blood);
+            }
+        }
         if (normal) AddMana(S.ManaGain);
         if (killed && charged) AddMana(0.5f);
         if (_chargedRefund && charged) { AddMana(1f); _chargedRefund = false; }   // right-click pays back a mana when it connects
-        if (S.Lifesteal > 0) Heal(dmg * S.Lifesteal);
+        if (S.Lifesteal > 0) { Heal(dmg * S.Lifesteal); if (CrimsonWitch) _st.Highlight += dmg * S.Lifesteal; }   // Crimson highlight = health leeched
         if (CrimsonWitch && Game.I != null && dmg > 0f)   // (NEW) lone-target sustain: if only ONE enemy is in her aura, damaging it heals 10%→(scales w/ level) of the damage
         {
             int inAura = 0;
@@ -2656,6 +2996,7 @@ public partial class Player : Node3D
             foreach (var f in Fin)
             {
                 if (FinMeta.Passive(f.Type) || f.Armed) continue;
+                if (f.Type == FinType.EmberFervor && EmberFervorActive) { f.Charge = 0; continue; }   // (NEW) can't rebuild Ember Fervor while its buff is up
                 f.Charge++;
                 if (f.Charge >= f.Every) { f.Armed = true; f.Window = 3.2f; ProcFlash = 0.3f; }
             }
@@ -2773,6 +3114,27 @@ public partial class Player : Node3D
                     Game.I.NetMgr?.BroadcastVfx(12, new Vector3(pos.X, 0f, pos.Z), Vector3.Up, wrad, wdur, DamageTypes.Col(DamageType.Wind));   // allies get a visual + jump-pad copy
                     Ring(pos, DamageTypes.Col(DamageType.Wind), wrad, 0.5f);
                     Game.I.Sfx?.ModWind(pos);
+                    break;
+                }
+                case ModType.Meteor:   // (NEW Ember) call down a meteor where the charge lands (Ember witch → two meteors)
+                {
+                    float mrad = 6f + mag, mdmg = Base() * (2.2f + 0.3f * mag) * ComboMul();
+                    var at = new Vector3(pos.X, Game.I.SurfaceHeight(pos, pos.Y), pos.Z);
+                    Game.I.SpawnEmberMeteor(at, mrad, mdmg, 3 + (int)mag, Base() * 0.09f, Base() * 3.2f, this);   // host-authoritative + broadcasts a ghost (kind 67)
+                    break;
+                }
+                case ModType.Eruption:   // (NEW Ember) molten upheaval + flame ring; knocks back, higher rarity flings the small ones skyward
+                {
+                    float erad = 7f + mag, edmg = Base() * (1.2f + 0.15f * mag), power = 8f + mag * 3f;
+                    foreach (var e in Game.I.Enemies.ToArray())
+                        if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, pos) < erad && !Game.I.SightBlocked(pos, e.GlobalPosition))
+                        { e.Hurt(edmg, DamageType.Ember, false); e.AddBurn(1f, Base() * 0.08f, Base() * 3.2f, 0f, Game.I.LocalPeer); }
+                    Game.I.NetMgr?.StormForce(pos, erad, 1, power);   // host-authoritative outward+up fling (mass-scaled: small foes fly, big resist)
+                    Game.I.DamageWorld(pos, erad, edmg);
+                    Game.I.SpawnGroundSpikes(pos, erad, 16, new Color(0.32f, 0.13f, 0.06f), 1.6f);   // molten rock heaving up
+                    Game.I.SpawnEmberBurst(pos, erad);   // flame ring bursting outward
+                    Ring(pos, DamageTypes.Col(DamageType.Ember), erad * 1.2f, 0.4f);
+                    Game.I.Sfx?.ModEmber(pos);
                     break;
                 }
             }
@@ -2975,6 +3337,165 @@ public partial class Player : Node3D
             case FinType.IceSpike: FinIceSpike(pow, t, col); SetArm("thrust", 0.4f); break;        // (NEW)
             case FinType.FrostVault: FinFrostVault(pow, t, col); SetArm("slam", 0.4f); break;      // (NEW)
             case FinType.FrostWalls: FinFrostWalls(pow, t, col); SetArm("together", 0.4f); break;  // (NEW)
+            case FinType.SoulReap: FinSoulReap(pow, t, col); SetArm("draw", 0.5f); break;           // (NEW Curse)
+            case FinType.HexChains: FinHexChains(pow, t, col); SetArm("together", 0.45f); break;    // (NEW Curse)
+            case FinType.DoomSigil: FinDoomSigil(pow, t, col); SetArm("palmsup", 0.5f); break;      // (NEW Curse)
+            case FinType.FireWall: FinFireWall(pow, t, col); SetArm("raise", 0.45f); break;          // (NEW Ember)
+            case FinType.Fireball: FinFireball(pow, t, col); SetArm("thrust", 0.4f); break;          // (NEW Ember)
+            case FinType.EmberFervor: FinEmberFervor(pow, t); SetArm("together", 0.45f); break;      // (NEW Ember)
+        }
+    }
+
+    // ===== Curse finishers (NEW) — witch-agnostic, but they lean into the curse fantasy =====
+    // Soul Reap: a cursed reaping nova that bites harder the more wounded each foe is, and siphons souls to mend you.
+    private void FinSoulReap(float pow, int t, Color col)
+    {
+        float radius = 8f + t * 0.8f, baseDmg = Base() * 1.2f * pow, healTotal = 0f;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) >= radius || Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) continue;
+            float missing = e.MaxHp > 0f ? Mathf.Clamp(1f - e.Hp / e.MaxHp, 0f, 1f) : 0f;
+            float dmg = baseDmg * (1f + 1.6f * missing);   // reaps the wounded — up to 2.6× on the nearly-dead
+            e.Hurt(dmg, DamageType.Curse, true);
+            healTotal += dmg * 0.05f;
+            SpawnSoulWisp(e.GlobalPosition + Vector3.Up * 0.9f, col);
+        }
+        Game.I.DamageWorld(GlobalPosition, radius, baseDmg);
+        if (healTotal > 0f) Heal(Mathf.Min(healTotal, S.MaxHp * 0.18f));   // soul harvest, capped
+        Game.I.SpawnScytheVfx(GlobalPosition, AimDir(), radius, col);
+        Ring(GlobalPosition, col, radius, 0.5f);
+        Game.I.NetMgr?.BroadcastVfx(63, GlobalPosition, new Vector3(AimDir().X, 0f, AimDir().Z), radius, 0f, col);
+        Game.I.Sfx?.CurseCrush(GlobalPosition);
+    }
+
+    // Hex Chains: bind the nearest foes into a temporary shared-pain web — a share of ALL damage any of them takes bleeds to the rest.
+    private void FinHexChains(float pow, int t, Color col)
+    {
+        float radius = 10f + t * 1f; int maxLinks = 4 + t;
+        var links = new System.Collections.Generic.List<Enemy>();
+        foreach (var e in Game.I.Enemies.ToArray())
+            if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < radius && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) links.Add(e);
+        links.Sort((a, b) => Flat(a, GlobalPosition).CompareTo(Flat(b, GlobalPosition)));
+        if (links.Count > maxLinks) links.RemoveRange(maxLinks, links.Count - maxLinks);
+        int group = ++_curseGroupSeq;
+        float burst = Base() * 1.4f * pow;
+        foreach (var e in links)
+        {
+            e.AddCurse(2f, group, DamageType.Curse, 1.35f, 0.4f);   // tether into a shared-pain group (40% of damage bleeds across)
+            e.Hurt(burst, DamageType.Curse, true);
+            SpawnCurseChain(GlobalPosition + Vector3.Up * 1.1f, e.GlobalPosition + Vector3.Up * 0.9f, col);
+        }
+        Game.I.SpawnGroundSigil(GlobalPosition, radius * 0.8f, col);
+        Ring(GlobalPosition, col, radius, 0.5f);
+        Game.I.NetMgr?.BroadcastVfx(64, GlobalPosition, Vector3.Zero, radius, 0f, col);
+        Game.I.Sfx?.WitchCackle(GlobalPosition);
+    }
+
+    // Doom Sigil: brand nearby foes, then a delayed cursed detonation (bigger the more branded). Deferred blast = DoomSigil node.
+    private void FinDoomSigil(float pow, int t, Color col)
+    {
+        var flat = new Vector3(AimDir().X, 0f, AimDir().Z);
+        flat = flat.LengthSquared() > 0.001f ? flat.Normalized() : Vector3.Forward;
+        var at = GlobalPosition + flat * 6f;
+        at = new Vector3(at.X, Game.I.SurfaceHeight(at, 1e9f) + 0.05f, at.Z);
+        float radius = 6f + t * 0.7f, dmg = Base() * 2.4f * pow;
+        int branded = 0;
+        foreach (var e in Game.I.Enemies.ToArray())
+            if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && new Vector2(e.GlobalPosition.X - at.X, e.GlobalPosition.Z - at.Z).Length() < radius + e.Radius)
+            { e.AddCurse(1.5f, 0, DamageType.Curse, 1.35f, 0f); branded++; }
+        float mul = 1f + 0.12f * Mathf.Max(0, branded - 1);
+        var sig = new DoomSigil(); Game.I.AddChild(sig); sig.Init(at, radius, dmg * mul, col, this);
+        Game.I.NetMgr?.BroadcastVfx(65, at, Vector3.Zero, radius, 0f, col);   // allies spawn a Remote ghost sigil (visual only)
+        Game.I.Sfx?.WitchCackle(GlobalPosition);
+    }
+
+    private void SpawnSoulWisp(Vector3 at, Color col)   // a soul mote drawn back to the caster (Soul Reap heal visual)
+    {
+        var w = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.12f, Height = 0.24f }, MaterialOverride = Game.ToonEmissive(col.Lerp(new Color(0.45f, 1f, 0.6f), 0.4f), 3f, 0f) };
+        Game.I.AddChild(w); w.GlobalPosition = at;
+        var tw = w.CreateTween(); tw.SetParallel(true);
+        tw.TweenProperty(w, "global_position", EyePos, 0.45f).SetTrans(Tween.TransitionType.Sine).SetEase(Tween.EaseType.In);
+        tw.TweenProperty(w, "scale", Vector3.One * 0.1f, 0.45f);
+        tw.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(w)) w.QueueFree(); }));
+    }
+
+    private void SpawnCurseChain(Vector3 a, Vector3 b, Color col)   // a fading cursed chain between the caster and a bound foe
+    {
+        float len = (b - a).Length(); if (len < 0.2f) return;
+        var chain = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.05f, Height = len, RadialSegments = 6 } };
+        var mm = Game.Emissive(col, 2.6f); mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; chain.MaterialOverride = mm;
+        Game.I.AddChild(chain);
+        chain.LookAtFromPosition((a + b) * 0.5f, b, Vector3.Up);
+        chain.RotateObjectLocal(Vector3.Right, Mathf.Pi / 2f);   // cylinder length runs along local Y → aim it down the link
+        var tw = chain.CreateTween();
+        tw.TweenInterval(0.4f);
+        tw.TweenProperty(mm, "albedo_color", new Color(col.R, col.G, col.B, 0f), 0.5f);
+        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(chain)) chain.QueueFree(); }));
+    }
+
+    // ===== Ember finishers (NEW) — witch-agnostic, the fire fantasy =====
+    // Ring of Fire: a planted ring of flame that EATS incoming enemy projectiles and burns foes standing in it.
+    private void FinFireWall(float pow, int t, Color col)
+    {
+        float radius = 5f + t * 0.5f, dur = 4f + t * 0.6f, dps = Base() * 0.5f * pow;
+        var center = new Vector3(GlobalPosition.X, Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y) + 0.05f, GlobalPosition.Z);
+        var w = new FireWall { Center = center, Radius = radius, Dur = dur, Dps = dps, BurnPer = Base() * 0.08f, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer };
+        Game.I.AddChild(w); w.GlobalPosition = center;
+        Game.I.RegisterFireRing(center, radius, dur);   // host-side zone that eats enemy projectiles (a client routes it to the host)
+        Game.I.NetMgr?.BroadcastVfx(72, center, Vector3.Zero, radius, dur, col);   // allies render the ring
+        Ring(center, col, radius, 0.5f);
+        Game.I.Sfx?.Release(DamageType.Ember);
+    }
+
+    // Fireball: hurl a med-speed fireball at the cursor — heavy direct hit + a medium blast on impact.
+    private void FinFireball(float pow, int t, Color col)
+    {
+        Vector3 dir = AimDir().Normalized();
+        Vector3 origin = EyePos + dir * 0.6f;
+        float directDmg = Base() * 3.2f * pow * ComboMul(), blastDmg = Base() * 1.6f * pow * ComboMul(), blastR = 4.5f + t * 0.5f;
+        var fb = new Fireball { Dir = dir, Speed = 22f, DirectDmg = directDmg, BlastDmg = blastDmg, BlastRadius = blastR, BurnPer = Base() * 0.09f, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer, Src = this };
+        Game.I.AddChild(fb); fb.GlobalPosition = origin;
+        Game.I.NetMgr?.BroadcastVfx(73, origin, dir, 22f, blastR, col);   // allies render a visual ghost fireball
+        Game.I.Sfx?.Cast(DamageType.Ember);
+    }
+
+    // Ember Fervor: self-buff — crit + move speed for a few seconds; fists/feet blaze; can't recharge until it fades.
+    private void FinEmberFervor(float pow, int t)
+    {
+        float dur = 5f + t * 0.8f;
+        _emberFervorCrit = (0.1f + t * 0.03f) * pow;    // ~+10% → +22% crit
+        _emberFervorSpeed = (0.15f + t * 0.03f) * pow;  // ~+15% → +27% move
+        EmberFervorT = dur; _fervorNetT = 0f;
+        ShowFervorFlames(true);
+        Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 3f, 0.5f);
+        Game.I.SpawnEmberBurst(GlobalPosition + Vector3.Up * 1f, 3f);
+        Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition, Vector3.Zero, 3f, 0f, DamageTypes.Col(DamageType.Ember));
+        Game.I.Sfx?.Release(DamageType.Ember); Game.I.Hud?.Banner("EMBER FERVOR");
+    }
+
+    private void ShowFervorFlames(bool on)
+    {
+        if (!on)
+        {
+            foreach (var f in _fervorFlames) if (f != null && GodotObject.IsInstanceValid(f)) f.QueueFree();
+            _fervorFlames.Clear();
+            return;
+        }
+        if (_fervorFlames.Count > 0) return;
+        var col = DamageTypes.Col(DamageType.Ember);
+        var mounts = new System.Collections.Generic.List<(Node3D parent, Vector3 pos, float r)>();
+        if (_handMeshL != null) mounts.Add((_handMeshL, Vector3.Zero, 0.14f));   // view-model fists (local view)
+        if (_handMeshR != null) mounts.Add((_handMeshR, Vector3.Zero, 0.14f));
+        if (_bodyModel != null) { mounts.Add((_bodyModel, new Vector3(-0.18f, 0.12f, 0f), 0.16f)); mounts.Add((_bodyModel, new Vector3(0.18f, 0.12f, 0f), 0.16f)); }   // feet on the body model
+        foreach (var (parent, pos, r) in mounts)
+        {
+            if (parent == null || !GodotObject.IsInstanceValid(parent)) continue;
+            var fl = new MeshInstance3D { Mesh = new SphereMesh { Radius = r, Height = r * 2f, RadialSegments = 6, Rings = 4 } };
+            var mm = Game.Emissive(col, 3.2f); mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; mm.AlbedoColor = new Color(1f, 0.5f, 0.15f, 0.75f); fl.MaterialOverride = mm;
+            parent.AddChild(fl); fl.Position = pos;
+            fl.AddChild(new OmniLight3D { OmniRange = 2f, LightColor = col, LightEnergy = 1.4f });
+            _fervorFlames.Add(fl);
         }
     }
 
@@ -3369,6 +3890,7 @@ public partial class Player : Node3D
     public void TryUlt()
     {
         if (Ult == UltKind.None) return;
+        if (Ult == UltKind.WildfireRush && UltActive && _flameDashCharges > 0) { FlameDash(); return; }   // (NEW) Q during the Wildfire window = a flame dash
         if (UltActive || UltCharge < 1f) return;
         ActivateUlt();
     }
@@ -3770,6 +4292,42 @@ public partial class Player : Node3D
             case UltKind.LifeCurse:
                 FireLifeCurse(UltTier);   // instant missing-HP rune nuke (no channel)
                 break;
+            case UltKind.MeteorDescent:
+            {
+                UltActive = true;
+                _meteorAscend = true; _meteorAscendT = 5f; _meteorBaseY = GlobalPosition.Y;
+                _grounded = false; _vy = 0f; _noFall = 999f; _iframe = 999f;   // rise, invulnerable, no fall damage until the slam
+                EndFlameCone();
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 6f, 0.6f);
+                Game.I.NetMgr?.BroadcastVfx(68, GlobalPosition, Vector3.Up, 0f, 5f, DamageTypes.Col(DamageType.Ember));   // allies see her launch skyward
+                CamKick(0.5f); Game.I.Sfx?.ChargeUp(DamageType.Ember); Game.I.Hud?.Banner("METEOR DESCENT — aim, then drop");
+                break;
+            }
+            case UltKind.WildfireRush:
+            {
+                int t = UltTier;
+                UltActive = true; UltActiveT = 10f;
+                _flameDashCharges = 3 + (t + 1) / 2;             // 3 → 5 dashes across tiers
+                _flameDashWindowT = 10f;
+                BurnLifestealT = 16f;                            // her burn ticks heal her while the trails burn
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 5f, 0.5f);
+                Game.I.NetMgr?.BroadcastVfx(69, GlobalPosition, Vector3.Zero, 5f, 0f, DamageTypes.Col(DamageType.Ember));
+                CamKick(0.4f); Game.I.Sfx?.Release(DamageType.Ember); Game.I.Hud?.Banner($"WILDFIRE RUSH — {_flameDashCharges} flame dashes [Q]");
+                break;
+            }
+            case UltKind.PhoenixAscend:
+            {
+                int t = UltTier;
+                UltActive = true; UltActiveT = 10f + t * 1.5f;
+                _phoenix = true; _phoenixRebirth = true; _phoenixAuraT = 0f;
+                _grounded = false; _vy = 2f; _noFall = 999f;
+                if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) _phoenixVfx.QueueFree();
+                _phoenixVfx = BuildPhoenixAura(); AddChild(_phoenixVfx);
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 7f, 0.7f);
+                Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition, Vector3.Zero, UltActiveT, 0f, DamageTypes.Col(DamageType.Ember));
+                CamKick(0.6f); Game.I.Sfx?.ModEmber(GlobalPosition); Game.I.Hud?.Banner("PHOENIX ASCENDANT");
+                break;
+            }
         }
     }
 
@@ -3989,6 +4547,18 @@ public partial class Player : Node3D
             UltActiveT -= dt;
             if (UltActiveT <= 0f) { UltActive = false; UltDmgMul = 1f; }
         }
+        if (BurnLifestealT > 0f) BurnLifestealT -= dt;   // (NEW) Wildfire Rush lifesteal window
+        if (EmberFervorT > 0f)   // (NEW) Ember Fervor buff: decay + a periodic ember pulse so allies see the flames
+        {
+            EmberFervorT -= dt; _fervorNetT -= dt;
+            if (_fervorNetT <= 0f) { _fervorNetT = 0.5f; Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition + Vector3.Up * 0.5f, Vector3.Zero, 1.6f, 0f, DamageTypes.Col(DamageType.Ember)); }
+            if (EmberFervorT <= 0f) ShowFervorFlames(false);
+        }
+        if (UltActive && Ult == UltKind.WildfireRush)     // (NEW) Wildfire Rush: dash window ends after 10s or once all charges are spent
+        {
+            _flameDashWindowT -= dt;
+            if (_flameDashWindowT <= 0f || _flameDashCharges <= 0) UltActive = false;
+        }
         if (UltActive && Ult == UltKind.HexCircle) UpdateHexCircle(dt);   // (NEW) Forsaken curse field
         if (UltActive && Ult == UltKind.Crescent)
         {
@@ -4182,6 +4752,7 @@ public partial class Player : Node3D
     }
 
     public void AddMana(float amt) { Mana = Mathf.Clamp(Mana + amt, 0, S.ManaMax); }
+    public void TryBurnLifesteal(float dmg) { if (BurnLifestealT > 0f && !Downed && Hp < S.MaxHp) Heal(dmg); }   // (NEW) Wildfire Rush: 100% of burn-tick damage heals her while the window is live
     public bool SpendMana(float n = 1f) { if (Mana >= n) { Mana -= n; return true; } ResFail(); return false; }
     // a cast couldn't be paid for (mana for most witches, HP for Crimson): flash the bar + sputter.
     // rising-edge sound so holding the button with an empty bar doesn't machine-gun the sparks.
@@ -4257,6 +4828,7 @@ public partial class Player : Node3D
         if (dmg > 0)
         {
             Hp -= dmg;
+            Game.I.MyStats.DamageTaken += dmg;   // (NEW) end-of-run tally
             if (Combo > 1)   // a hit that reaches HP breaks your combo (shield protects it)
             {
                 Combo = (int)(Combo * ComboBreakKeep);
@@ -4267,6 +4839,7 @@ public partial class Player : Node3D
             if (Hp <= 0)
             {
                 if (GodMode) { Hp = 1f; }   // (NEW) god mode takes the hit + shows numbers, but never dies
+                else if (PhoenixActive && _phoenixRebirth) { PhoenixRebirth(); return; }   // (NEW) Phoenix Ascendant: reborn in flame instead of dying (once)
                 else if (Interventions > 0) { DivineRez(GlobalPosition, true); return; }
                 else { Hp = 0; GoDown(); }
             }
@@ -4278,6 +4851,11 @@ public partial class Player : Node3D
     {
         if (Downed) return;
         Downed = true; Hp = 0f; ReviveProg = 0f;
+        _meteorAscend = false; _phoenix = false; _flameDashT = 0f;   // (NEW) cancel any Ember flight ult cleanly
+        if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) { _phoenixVfx.QueueFree(); _phoenixVfx = null; }
+        HideEmberAimRing();
+        EmberFervorT = 0f; ShowFervorFlames(false);   // (NEW) drop the Ember Fervor buff/flames
+        Game.I.MyStats.TimesDowned++;   // (NEW) end-of-run tally
         Charging = false; ChargeAmt = 0f;
         if (_beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; _beamT = 0; }
         Game.I.Hud?.Banner("DOWNED — hold on for an ally");

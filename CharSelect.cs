@@ -41,6 +41,10 @@ public partial class CharSelect : Control
                 Desc = "A cursed puppeteer. Her lock-on beam tethers foes into groups that share every wound — melt one and you melt the whole pack.",
                 Passives = new[]{ "Curse tethers — foes share damage", "Voodoo Crush — detonate stacked curses", "Low direct damage, immense control" },
                 Power = 2, Resil = 3, Mobi = 3 },
+        new W { Name = "The Ember Witch", Elem = DamageType.Ember, Role = "Pyromancer",
+                Desc = "A gleeful arsonist. Her flamethrower coats foes in burn; enough stacks turn them into a Living Bomb that erupts — again on death, chaining fire through the horde.",
+                Passives = new[]{ "Flamethrower — stacking burn (faster with cast speed)", "Living Bomb — foes detonate at max burn & on death", "Meteor — an aimed sky-strike that seeds burn" },
+                Power = 3, Resil = 2, Mobi = 3 },
     };
 
     private static readonly Color Ink = new Color(0.93f, 0.88f, 0.72f);

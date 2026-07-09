@@ -47,6 +47,9 @@ public partial class Bolt : Node3D
     private bool _entRefunded = false;// a charged detonation refunds at most one ent
     public float SpeedMul = 1f;       // applied to homing cruise speed (initial Vel is pre-scaled by ProjSpeed)
     public bool Forked = false;       // a Twin Light fork — won't fork again
+    public bool RadiantHeal = false;  // (NEW) Divine Radiant Ascension: mend allies this mote passes through (once each)
+    public float HealAmt = 0f;
+    private bool _didHeal = false;
     private Node3D _crescent;
     private float _baseRadius = 0.5f;
     private bool _holyRay = false;    // (NEW) charged Holy right-click: drop a flickering ground scorch as it flies
@@ -301,6 +304,8 @@ public partial class Bolt : Node3D
                     if (t != null && GodotObject.IsInstanceValid(t) && GlobalPosition.DistanceTo(t.GlobalPosition) < 1.9f) dk += t.Detonate();
                 if (dk > 0 && !_entRefunded) { _entRefunded = true; Src.RefundEnt(); }   // a charged detonation that scores a kill (incl. chain) refunds ONE ent
             }
+            if (RadiantHeal && !_didHeal && Src != null && Game.I.NetMgr != null && Game.I.NetMgr.Active)   // (NEW) Radiant Ascension: mend allies this mote flies through, once each, then carry on to the foe behind
+                if (Game.I.NetMgr.HealAlliesNear(GlobalPosition, 1.7f, HealAmt)) _didHeal = true;
             var enemies = Game.I.Enemies.ToArray();   // (FIX) snapshot — a hit can kill/spawn and mutate the live list
             for (int i = enemies.Length - 1; i >= 0; i--)
             {
@@ -321,7 +326,7 @@ public partial class Bolt : Node3D
                     bool bcrit = Crit; float bdmg = Dmg;
                     if (!bcrit && Src != null && e.IsCritZone(GlobalPosition)) { bdmg *= Src.CritMult(); bcrit = true; }   // (NEW) head / shoulder-goblin hits always crit THE HOLLOW MOON
                     if (bcrit) e.CritHitReact(GlobalPosition);   // boss/goblin yelp (crit ping is played centrally in Hurt)
-                    if (FrostSpear && FrostSpearFull && e.Frozen) e.ShatterInstant();   // (NEW) full-charge / Glacial Impaler shatters a frozen foe
+                    if (FrostSpear && FrostSpearFull && e.Frozen) { e.ShatterInstant(); Game.I.MyStats.Highlight++; }   // (NEW) full-charge / Glacial Impaler shatters a frozen foe (+ Frost highlight)
                     else e.Hurt(bdmg, DType, FromCombo, bcrit);   // the spear just damages — the BEAM does the freezing
                     if (Vel.LengthSquared() > 0.01f) e.HitFrom(GlobalPosition - Vel.Normalized() * 25f);   // (NEW) idle zombie turns + investigates up the shot line
                     {   // (NEW) impact mark ON the enemy surface, facing outward, parented so it moves with them
