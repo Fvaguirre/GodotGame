@@ -12,7 +12,7 @@ public static class DamageTypes
 
     public static Color Col(DamageType t) => t switch {
         DamageType.Lunar    => new Color(0.91f, 0.89f, 1.00f),
-        DamageType.Arcane   => new Color(0.725f, 0.553f, 1.0f),
+        DamageType.Arcane   => new Color(0.52f, 0.24f, 0.98f),   // deep saturated violet (was a pale neon lavender that bloomed to white)
         DamageType.Nature   => new Color(0.37f, 0.89f, 0.60f),
         DamageType.Frost    => new Color(0.55f, 0.85f, 1.0f),
         DamageType.Curse    => new Color(0.82f, 0.36f, 0.90f),

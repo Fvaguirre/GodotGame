@@ -1,9 +1,9 @@
 using Godot;
 
-// FireWall.cs — the Ring of Fire finisher. A continuous CURTAIN of flame (a cylindrical shell driven by a procedural fire
-// shader: hot/opaque at the base, flickering ragged flame-tips up top, additive glow) that rings the caster for Dur seconds.
-// It burns foes standing in the ring band (owner-authoritative); incoming-projectile eating is handled host-side via
-// Game.FireRings (registered by FinFireWall). Allies render a Remote visual-only copy (VFX kind 72).
+// FireWall.cs — the Ring of Fire finisher. A ring of LIVE FLAMES: emissive flame tongues continuously spawn all around the
+// perimeter, licking upward, flickering, and fading (not a smooth cylinder). It burns foes standing in the ring band
+// (owner-authoritative); the incoming-projectile eating is host-side via Game.FireRings. Allies render a Remote visual copy
+// (VFX kind 72) — the flames are spawned locally on every machine, so the ring looks alive for everyone.
 public partial class FireWall : Node3D
 {
     public Vector3 Center;
@@ -11,66 +11,76 @@ public partial class FireWall : Node3D
     public int OwnerPeer = 0;
     public bool Remote = false;
 
-    private float _t = 0f, _dmgTick = 0f;
-    private MeshInstance3D _outer, _inner;
+    private float _t = 0f, _dmgTick = 0f, _flameT = 0f;
+    private MeshInstance3D _base;
     private Color _col;
-
-    private static ShaderMaterial _fireMat;
-    private static ShaderMaterial FireMat()
-    {
-        if (_fireMat != null) return _fireMat;
-        var sh = new Shader { Code = @"
-shader_type spatial;
-render_mode unshaded, cull_disabled, blend_add, depth_draw_never;
-uniform vec3 hot : source_color = vec3(1.0, 0.92, 0.5);
-uniform vec3 mid : source_color = vec3(1.0, 0.45, 0.1);
-uniform vec3 cool : source_color = vec3(0.8, 0.13, 0.04);
-uniform float speed = 1.7;
-float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-float vnoise(vec2 p){
-    vec2 i = floor(p); vec2 f = fract(p); f = f*f*(3.0-2.0*f);
-    float a = hash(i); float b = hash(i+vec2(1.0,0.0));
-    float c = hash(i+vec2(0.0,1.0)); float d = hash(i+vec2(1.0,1.0));
-    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
-}
-float fbm(vec2 p){ float v=0.0; float a=0.5; for(int i=0;i<4;i++){ v+=a*vnoise(p); p*=2.0; a*=0.5; } return v; }
-void fragment(){
-    float y = UV.y;
-    float n = fbm(vec2(UV.x*13.0 + TIME*0.4, UV.y*9.0 - TIME*speed));   // more vertical detail so a tall wall isn't a stretched smear
-    float a = smoothstep(0.05, 0.5, (1.0 - y*0.7) * (0.45 + 1.0*n));    // flames climb most of the height, ragged tips up top
-    vec3 col = mix(hot, mid, clamp(y*3.0, 0.0, 1.0));
-    col = mix(col, cool, clamp((y-0.35)*2.0, 0.0, 1.0));
-    ALBEDO = col;
-    EMISSION = col * (1.6 + 1.6*n);
-    ALPHA = a;
-}" };
-        _fireMat = new ShaderMaterial { Shader = sh };
-        return _fireMat;
-    }
-
-    private MeshInstance3D MakeCurtain(float r, float h)
-    {
-        // an OPEN cylinder shell (no caps) = a ring wall; the fire shader paints the flames onto it
-        var mi = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = r, BottomRadius = r, Height = h, RadialSegments = 44, Rings = 1, CapTop = false, CapBottom = false }, MaterialOverride = FireMat() };
-        mi.Position = new Vector3(0, h * 0.5f, 0);
-        return mi;
-    }
 
     public override void _Ready()
     {
         _col = DamageTypes.Col(DamageType.Ember);
-        float h = 8f;   // tall curtain — walls the caster off and covers projectiles at any height
-        _outer = MakeCurtain(Radius, h); AddChild(_outer);              // outer flame sheet
-        _inner = MakeCurtain(Radius * 0.94f, h * 0.9f); AddChild(_inner);   // a second, inner sheet for depth
-        AddChild(new OmniLight3D { OmniRange = Radius * 1.8f, LightColor = _col, LightEnergy = 2.4f, Position = new Vector3(0, 2.2f, 0) });
+        // a low, glowing molten ring at the base to ground the fire (a flat emissive torus)
+        _base = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = Radius - 0.6f, OuterRadius = Radius + 0.6f, Rings = 24, RingSegments = 40 } };
+        var bm = Game.Emissive(new Color(1f, 0.4f, 0.1f), 2.4f);
+        bm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; bm.AlbedoColor = new Color(1f, 0.4f, 0.1f, 0.7f);
+        _base.MaterialOverride = bm; _base.Position = new Vector3(0, 0.12f, 0); AddChild(_base);
+        AddChild(new OmniLight3D { OmniRange = Radius * 1.8f, LightColor = _col, LightEnergy = 2.6f, Position = new Vector3(0, 2.2f, 0) });
+    }
+
+    // shared painterly flame-tongue material — a cone with hot base (-Y) → wispy tip (flame.gdshader). One instance for
+    // every tongue on every wall (no per-flame allocation like the old Game.Emissive path).
+    private static ShaderMaterial _tongueMat;
+    private static ShaderMaterial TongueMat()
+    {
+        if (_tongueMat != null) return _tongueMat;
+        var m = new ShaderMaterial { Shader = GD.Load<Shader>("res://shaders/flame.gdshader") };
+        m.SetShaderParameter("hot_color", new Color(1f, 0.9f, 0.5f));
+        m.SetShaderParameter("mid_color", new Color(1f, 0.5f, 0.14f));
+        m.SetShaderParameter("cool_color", new Color(0.7f, 0.12f, 0.03f));
+        m.SetShaderParameter("flame_axis", new Vector3(0f, -1f, 0f));   // hot at the base, wispy licking tip up top
+        m.SetShaderParameter("half_len", 1.0f);                          // cone Height = 2.0 → half-length 1.0
+        _tongueMat = m; return m;
+    }
+
+    // one rising flame tongue at angle a on the ring — an authored CONE flame silhouette, not a round puff
+    private void SpawnFlame(float a)
+    {
+        float rr = Radius + (GD.Randf() - 0.5f) * 1.0f;
+        float s = 0.35f + GD.Randf() * 0.5f;
+        var m = new MeshInstance3D
+        {
+            Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.5f, Height = 2.0f, RadialSegments = 6 },   // unit cone (point up); node scale sizes it
+            MaterialOverride = TongueMat(),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Scale = Vector3.One * s
+        };
+        AddChild(m);
+        var start = new Vector3(Mathf.Cos(a) * rr, 0.1f + s, Mathf.Sin(a) * rr);   // cone base near the ground
+        m.Position = start;
+        float h = 2.5f + GD.Randf() * 6.0f;   // licks up toward the ~8u wall height
+        var end = start + new Vector3((GD.Randf() - 0.5f) * 0.6f, h, (GD.Randf() - 0.5f) * 0.6f);
+        var tw = m.CreateTween(); tw.SetParallel(true);
+        tw.TweenProperty(m, "position", end, 0.55f).SetEase(Tween.EaseType.Out);
+        tw.TweenProperty(m, "scale", Vector3.One * (s * 0.18f), 0.55f);   // taper as it rises (flame tip)
+        tw.TweenProperty(m, "transparency", 1f, 0.55f);                    // additive flame fades out (node transparency)
+        tw.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(m)) m.QueueFree(); }));
     }
 
     public override void _Process(double delta)
     {
-        var g = Game.I; if (g == null || g.State != GameState.Playing) return;
+        var g = Game.I; if (g == null || !g.SimActive) return;
         float dt = (float)delta; _t += dt;
-        float fade = Mathf.Clamp(Dur - _t, 0f, 1f);   // over the last second the flames die DOWN into the ground (node is anchored at ground level)
-        Scale = new Vector3(1f, 0.15f + 0.85f * fade, 1f);
+        float fade = Mathf.Clamp(Dur - _t, 0f, 1f);
+        if (_base != null && _base.MaterialOverride is StandardMaterial3D bm) bm.AlbedoColor = new Color(1f, 0.4f, 0.1f, 0.7f * (0.4f + 0.6f * fade));
+
+        // continuously spawn flame tongues around the ring so it reads as living fire
+        _flameT -= dt;
+        if (_flameT <= 0f && fade > 0.05f)
+        {
+            _flameT = 0.05f;
+            int burst = Mathf.Max(3, (int)(6 * g.ParticleScale));
+            for (int i = 0; i < burst; i++) SpawnFlame(GD.Randf() * Mathf.Tau);
+        }
+
         if (!Remote)
         {
             _dmgTick += dt;

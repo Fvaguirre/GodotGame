@@ -44,7 +44,7 @@ public partial class EclipseBurst : Node3D
     public override void _Process(double delta)
     {
         var g = Game.I;
-        if (g == null || g.State != GameState.Playing) return;
+        if (g == null || !g.SimActive) return;
         float dt = (float)delta;
         _t += dt;
 

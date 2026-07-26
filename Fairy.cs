@@ -40,16 +40,36 @@ public partial class Fairy : Node3D
         _sinceWisp = WispEvery;   // drop one immediately so the way is marked from the start
     }
 
+    private Vector3 _wp; private bool _haveWp = false;
+
     public override void _Process(double delta)
     {
         if (Game.I == null || !Game.I.InMaze) { QueueFree(); return; }
         float dt = (float)delta; _phase += dt * 8f;
 
-        var to = Portal - GlobalPosition; to.Y = 0f;
-        float d = to.Length();
-        if (d < 1.6f) { HighlightPortal(); QueueFree(); return; }   // reached the portal
+        var toPortal = Portal - GlobalPosition; toPortal.Y = 0f;
+        if (toPortal.Length() < 1.8f) { HighlightPortal(); QueueFree(); return; }   // reached the exit
 
-        GlobalPosition += to.Normalized() * Speed * dt;   // straight line, through walls
+        var m = Game.I.MazeInfo;
+        if (m != null)   // follow the CORRIDORS toward the exit, cell to cell — never cut through a hedge
+        {
+            var cell = Maze.CellOf(m, GlobalPosition);
+            if (!_haveWp || new Vector2(GlobalPosition.X - _wp.X, GlobalPosition.Z - _wp.Z).Length() < 0.5f)
+            {
+                var dir = Game.I.MazePathDir(cell);   // axis-aligned step down the path
+                if (dir.LengthSquared() > 0.001f)
+                {
+                    var next = cell + new Vector2I(Mathf.RoundToInt(dir.X), Mathf.RoundToInt(dir.Z));
+                    _wp = m.CellCenter(m.In(next) && !m.Blocked(cell, next) ? next : cell);   // stay centred in the corridor
+                }
+                else _wp = m.CellCenter(cell);
+                _haveWp = true;
+            }
+            var to = _wp - GlobalPosition; to.Y = 0f;
+            if (to.LengthSquared() > 1e-5f) GlobalPosition += to.Normalized() * Speed * dt;
+        }
+        else GlobalPosition += toPortal.Normalized() * Speed * dt;
+
         _body.Position = new Vector3(0, 1.5f + Mathf.Sin(_phase) * 0.18f, 0);
         float flap = Mathf.Sin(_phase * 2.2f) * 0.5f;
         if (_wingL != null) _wingL.Rotation = new Vector3(0, 0.5f + flap, 0);

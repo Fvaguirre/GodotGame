@@ -7,6 +7,8 @@ public partial class Chest : Node3D
     public bool Opened = false;
     public int NetId = 0;
     public bool Remote = false;   // client-side ghost: never opens locally, host owns it
+    public int SpecialGold = 0;   // >0 = a portal reward chest: gives this much gold to EVERY player on open (not normal loot)
+    public bool Hidden = false;   // no skybeam beacon + not shown on the minimap (the secret portal gold chest)
     private float _bob;
     private MeshInstance3D _lid;
     private OmniLight3D _light;
@@ -29,7 +31,7 @@ public partial class Chest : Node3D
         AddChild(seam);
         _light = new OmniLight3D { OmniRange = 7f, LightColor = gold, LightEnergy = 1.4f, Position = new Vector3(0, 1.4f, 0) };
         AddChild(_light);
-        _beacon = Game.AddBeacon(this, gold);
+        if (!Hidden) _beacon = Game.AddBeacon(this, gold);   // the secret portal chest has no skybeam
     }
 
     public override void _Process(double delta)
@@ -50,6 +52,7 @@ public partial class Chest : Node3D
         _lid.Position = new Vector3(0, 1.1f, -0.5f);
         if (_light != null) _light.LightEnergy = 0.4f;
         if (_beacon != null && GodotObject.IsInstanceValid(_beacon)) { _beacon.QueueFree(); _beacon = null; }
-        Game.I.OpenChestReward(GlobalPosition, openerPeer);
+        if (SpecialGold > 0) Game.I.RewardGoldAll(SpecialGold);   // portal reward chest → gold to every warden
+        else Game.I.OpenChestReward(GlobalPosition, openerPeer);
     }
 }

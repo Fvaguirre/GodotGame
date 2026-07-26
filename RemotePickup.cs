@@ -20,7 +20,7 @@ public partial class RemotePickup : Node3D
         }
         else
         {
-            var chest = new Chest { Remote = true };
+            var chest = new Chest { Remote = true, Hidden = kind == 2 };   // kind 2 = the secret portal gold chest (no skybeam)
             AddChild(chest); // Chest._Ready builds the real model + light beam; Remote stops it opening
         }
     }

@@ -21,6 +21,9 @@ public class MazeData
     public List<Vector2I> Spawns = new();   // one spread-out spawn per player (deterministic by seed)
     public List<Vector2I> Chambers = new();
     public List<int> ChamberElem = new();   // element index (DamageType) for each chamber's statue
+    public List<Vector2I> Plazas = new();    // big open cottage-garden clearings (no statue) — plants + trees scattered inside
+    public List<int> PlazaR = new();         // each plaza's radius in cells
+    public List<Vector2I> DecorCells = new();   // dead-ends holding a landmark prop (topiary/fountain/etc.) — the cauldron avoids these
     public Vector3 Origin;           // world-space offset of the maze's (0,0) corner
 
     public Vector3 CellCenter(Vector2I c) => Origin + new Vector3((c.X + 0.5f) * Cell, 0f, (c.Y + 0.5f) * Cell);
@@ -99,6 +102,26 @@ public static class Maze
                 }
         }
 
+        // big open cottage-garden clearings (no statue) scattered through the maze — plants + trees fill these later
+        int plazas = 2 + n / 16;
+        for (int i = 0; i < plazas; i++)
+        {
+            int pr = rng.Randf() < 0.3f ? 2 : 1;   // modest clearings (3-5 cells across), not maze-swallowing
+            var pcz = new Vector2I(rng.RandiRange(pr + 1, n - 2 - pr), rng.RandiRange(pr + 1, n - 2 - pr));
+            m.Plazas.Add(pcz); m.PlazaR.Add(pr);
+            for (int x = -pr; x <= pr; x++)
+                for (int y = -pr; y <= pr; y++)
+                {
+                    if (x * x + y * y > pr * pr) continue;
+                    var p = pcz + new Vector2I(x, y);
+                    if (!m.In(p)) continue;
+                    if (p.X < n - 1) m.WallE[p.X, p.Y] = false;
+                    if (p.X > 0) m.WallE[p.X - 1, p.Y] = false;
+                    if (p.Y < n - 1) m.WallN[p.X, p.Y] = false;
+                    if (p.Y > 0) m.WallN[p.X, p.Y - 1] = false;
+                }
+        }
+
         // one spread-out spawn per player (deterministic → identical on every machine)
         var ctr = new Vector2(n * 0.5f, n * 0.5f);
         float sr = n * 0.36f;
@@ -139,6 +162,7 @@ public static class Maze
                 int dd = dist[x, y];
                 if (dd < 0) continue;              // unreachable — never a portal
                 var c = new Vector2I(x, y);
+                if (m.DecorCells.Contains(c)) continue;   // don't drop the exit portal on a decor prop (would block reaching it)
                 if (dd > bestAnyD) { bestAnyD = dd; bestAny = c; }
                 bool anyLoS = false;
                 foreach (var f in from) if (HasLoS(m, c, f)) { anyLoS = true; break; }
@@ -195,7 +219,7 @@ public static class Maze
         floor.Position = new Vector3(m.Origin.X + fw * 0.5f, 0.02f, m.Origin.Z + fh * 0.5f);
         root.AddChild(floor);
 
-        var hedgeMat = Mat(new Color(0.09f, 0.19f, 0.11f));
+        var hedgeMat = HedgeMat();   // leafy, mottled, flowering, wind-swept hedges (shared shader)
 
         // one wall segment = a tall hedge mesh + a Deck (rectangular horizontal collision, standable-but-unreachable top)
         void Wall(float cx, float cz, float hx, float hz)
@@ -228,16 +252,80 @@ public static class Maze
             Wall(m.Origin.X + m.W * cell, oz + cell * 0.5f, th * 0.5f, cell * 0.5f + th * 0.5f);
         }
 
+        // landmark decor: distinctive props tucked into dead-ends so players build a mental map while searching
+        {
+            var drng = new RandomNumberGenerator { Seed = (ulong)((long)m.W * 2246822519L ^ (long)m.H * 3266489917L ^ 0x2545F491L) };
+            var stone = Mat(new Color(0.42f, 0.42f, 0.40f));
+            var stoneDk = Mat(new Color(0.27f, 0.27f, 0.26f));
+            var leafy = Game.ToonEmissive(new Color(0.12f, 0.30f, 0.15f), 0.12f, 0.04f);
+            var decorFlowers = new[] { new Color(1f, 0.5f, 0.7f), new Color(1f, 1f, 0.9f), new Color(1f, 0.85f, 0.35f), new Color(0.75f, 0.55f, 1f) };
+            var dirs = new[] { new Vector2I(0, 1), new Vector2I(0, -1), new Vector2I(1, 0), new Vector2I(-1, 0) };
+            void Topiary(Vector3 at)
+            {
+                int tiers = drng.RandiRange(2, 4);
+                for (int t = 0; t < tiers; t++) { float s = 1.35f - t * 0.32f; var sp = new MeshInstance3D { Mesh = new SphereMesh { Radius = s, Height = s * 1.8f }, MaterialOverride = leafy }; sp.Position = at + new Vector3(0, 1.0f + t * 1.25f, 0); root.AddChild(sp); }
+                var pot = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.9f, BottomRadius = 0.7f, Height = 0.8f, RadialSegments = 8 }, MaterialOverride = stoneDk }; pot.Position = at + new Vector3(0, 0.4f, 0); root.AddChild(pot);
+                g.Blockers.Add(new Blocker { Pos = at, Radius = 1.0f });
+            }
+            void Obelisk(Vector3 at)
+            {
+                var b = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(1.5f, 0.8f, 1.5f) }, MaterialOverride = stone }; b.Position = at + new Vector3(0, 0.4f, 0); root.AddChild(b);
+                var spire = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.6f, Height = 5.5f, RadialSegments = 4 }, MaterialOverride = stone }; spire.Position = at + new Vector3(0, 3.5f, 0); spire.RotationDegrees = new Vector3(0, 45, 0); root.AddChild(spire);
+                var mo = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.4f, Height = 0.8f }, MaterialOverride = leafy }; mo.Position = at + new Vector3(0.3f, 1.4f, 0.3f); mo.Scale = new Vector3(1f, 1.3f, 0.4f); root.AddChild(mo);
+                g.Blockers.Add(new Blocker { Pos = at, Radius = 0.95f });
+            }
+            void Fountain(Vector3 at)
+            {
+                var basin = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 1.6f, BottomRadius = 1.85f, Height = 0.9f, RadialSegments = 16 }, MaterialOverride = stone }; basin.Position = at + new Vector3(0, 0.45f, 0); root.AddChild(basin);
+                var wm = Game.Emissive(new Color(0.35f, 0.6f, 0.85f), 0.7f); wm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; wm.AlbedoColor = new Color(0.2f, 0.4f, 0.6f, 0.82f);
+                var water = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 1.5f, BottomRadius = 1.5f, Height = 0.1f }, MaterialOverride = wm }; water.Position = at + new Vector3(0, 0.86f, 0); root.AddChild(water);
+                var pil = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.22f, BottomRadius = 0.34f, Height = 1.7f }, MaterialOverride = stone }; pil.Position = at + new Vector3(0, 1.7f, 0); root.AddChild(pil);
+                var top = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.4f, Height = 0.8f }, MaterialOverride = wm }; top.Position = at + new Vector3(0, 2.6f, 0); root.AddChild(top);
+                root.AddChild(new OmniLight3D { Position = at + new Vector3(0, 2f, 0), OmniRange = 7f, LightColor = new Color(0.5f, 0.7f, 0.9f), LightEnergy = 1.3f });
+                g.Blockers.Add(new Blocker { Pos = at, Radius = 1.7f });
+            }
+            void Lantern(Vector3 at)
+            {
+                var post = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.08f, BottomRadius = 0.12f, Height = 3.3f, RadialSegments = 6 }, MaterialOverride = stoneDk }; post.Position = at + new Vector3(0, 1.65f, 0); root.AddChild(post);
+                var col = drng.Randf() < 0.5f ? new Color(1f, 0.75f, 0.4f) : new Color(0.6f, 0.85f, 1f);
+                var lamp = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.5f, 0.6f, 0.5f) }, MaterialOverride = Game.Emissive(col, 2.6f) }; lamp.Position = at + new Vector3(0, 3.4f, 0); root.AddChild(lamp);
+                root.AddChild(new OmniLight3D { Position = at + new Vector3(0, 3.4f, 0), OmniRange = 8f, LightColor = col, LightEnergy = 1.9f });
+                g.Blockers.Add(new Blocker { Pos = at, Radius = 0.4f });
+            }
+            void Urn(Vector3 at)
+            {
+                var urn = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.72f, Height = 1.5f }, MaterialOverride = stone }; urn.Position = at + new Vector3(0, 0.72f, 0); root.AddChild(urn);
+                for (int f = 0; f < 6; f++) { float a = f / 6f * Mathf.Tau; var bl = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.14f, Height = 0.28f }, MaterialOverride = Game.ToonEmissive(decorFlowers[drng.RandiRange(0, decorFlowers.Length - 1)], 0.9f, 0f) }; bl.Position = at + new Vector3(Mathf.Cos(a) * 0.5f, 1.4f + drng.RandfRange(0f, 0.3f), Mathf.Sin(a) * 0.5f); root.AddChild(bl); }
+                g.Blockers.Add(new Blocker { Pos = at, Radius = 0.72f });
+            }
+            var deadEnds = new List<Vector2I>();
+            for (int x = 0; x < m.W; x++) for (int y = 0; y < m.H; y++)
+            {
+                var c = new Vector2I(x, y);
+                int open = 0; foreach (var d in dirs) { var nb = c + d; if (m.In(nb) && !m.Blocked(c, nb)) open++; }
+                if (open != 1 || m.Chambers.Contains(c) || m.Spawns.Exists(sp => Mathf.Abs(sp.X - x) + Mathf.Abs(sp.Y - y) < 2)) continue;
+                deadEnds.Add(c);
+            }
+            for (int i = deadEnds.Count - 1; i > 0; i--) { int j = drng.RandiRange(0, i); (deadEnds[i], deadEnds[j]) = (deadEnds[j], deadEnds[i]); }
+            int want = Mathf.Min(deadEnds.Count, 8 + m.W / 5);
+            for (int i = 0; i < want; i++)
+            {
+                var dc = deadEnds[i]; m.DecorCells.Add(dc); var p = m.CellCenter(dc);
+                switch (drng.RandiRange(0, 4)) { case 0: Topiary(p); break; case 1: Obelisk(p); break; case 2: Fountain(p); break; case 3: Lantern(p); break; default: Urn(p); break; }
+            }
+        }
+
         // chamber landmarks — elemental statue (pillar + glowing orb + light) + a couple of trees
         for (int i = 0; i < m.Chambers.Count; i++)
         {
             var cpos = m.CellCenter(m.Chambers[i]);
             var col = DamageTypes.Col((DamageType)m.ChamberElem[i]);
+            var cnode = new Node3D { Name = $"Chamber{i}" }; root.AddChild(cnode);   // the elemental statue landmark — hidden if the ritual cauldron takes this chamber
             var pillar = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.4f, BottomRadius = 0.8f, Height = 4.2f }, MaterialOverride = Game.ToonEmissive(col.Lerp(new Color(0.15f, 0.15f, 0.17f), 0.55f), 0.6f, 0.03f) };
-            pillar.Position = cpos + new Vector3(0, 2.1f, 0); root.AddChild(pillar);
+            pillar.Position = cpos + new Vector3(0, 2.1f, 0); cnode.AddChild(pillar);
             var orb = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.7f, Height = 1.4f }, MaterialOverride = Game.Emissive(col, 2.6f) };
-            orb.Position = cpos + new Vector3(0, 4.9f, 0); root.AddChild(orb);
-            root.AddChild(new OmniLight3D { Position = cpos + new Vector3(0, 4.9f, 0), OmniRange = cell * 3f, LightColor = col, LightEnergy = 2.2f });
+            orb.Position = cpos + new Vector3(0, 4.9f, 0); cnode.AddChild(orb);
+            cnode.AddChild(new OmniLight3D { Position = cpos + new Vector3(0, 4.9f, 0), OmniRange = cell * 3f, LightColor = col, LightEnergy = 2.2f });
             g.Blockers.Add(new Blocker { Pos = cpos, Radius = 0.9f });
             var treeMat = Mat(new Color(0.10f, 0.17f, 0.12f));
             var trunkMat = Mat(new Color(0.16f, 0.11f, 0.07f));
@@ -253,10 +341,99 @@ public static class Maze
             }
         }
 
+        // ---- cottage-garden dressing: trees, bushes and flowerbeds filling the open plazas (+ a ring of flowers
+        // around each statue). Deterministic rng (seeded from the grid dims) so every machine builds the same garden.
+        var rng = new RandomNumberGenerator { Seed = (ulong)((long)m.W * 73856093L ^ (long)m.H * 19349663L ^ 0x51ED2701L) };
+        var stemMat = Mat(new Color(0.14f, 0.32f, 0.16f));
+        var bushMat = Mat(new Color(0.11f, 0.25f, 0.13f));
+        var trMat = Mat(new Color(0.16f, 0.11f, 0.07f));
+        var lfMat = Mat(new Color(0.10f, 0.20f, 0.12f));
+        var flowerCols = new[] { new Color(1f, 0.5f, 0.7f), new Color(1f, 1f, 0.9f), new Color(1f, 0.85f, 0.35f), new Color(0.75f, 0.55f, 1f), new Color(1f, 0.4f, 0.4f) };
+        Vector3 InDisc(Vector3 c, float rad) { float a = rng.RandfRange(0, Mathf.Tau), r = rad * Mathf.Sqrt(rng.Randf()); return c + new Vector3(Mathf.Cos(a) * r, 0, Mathf.Sin(a) * r); }
+        void Flower(Vector3 at)
+        {
+            var stem = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.02f, BottomRadius = 0.035f, Height = 0.5f }, MaterialOverride = stemMat };
+            stem.Position = at + new Vector3(0, 0.25f, 0); root.AddChild(stem);
+            var bloom = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.13f, Height = 0.26f }, MaterialOverride = Game.ToonEmissive(flowerCols[rng.RandiRange(0, flowerCols.Length - 1)], 0.9f, 0f) };
+            bloom.Position = at + new Vector3(0, 0.56f, 0); root.AddChild(bloom);
+        }
+        void Bush(Vector3 at)
+        {
+            float s = 0.55f + rng.Randf() * 0.55f;
+            var b = new MeshInstance3D { Mesh = new SphereMesh { Radius = s, Height = s * 1.4f }, MaterialOverride = bushMat };
+            b.Position = at + new Vector3(0, s * 0.6f, 0); root.AddChild(b);
+            g.Blockers.Add(new Blocker { Pos = at, Radius = s * 0.55f });
+        }
+        void Tree(Vector3 at)
+        {
+            float sc = 0.9f + rng.Randf() * 0.7f;
+            var trunk = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.18f * sc, BottomRadius = 0.3f * sc, Height = 3f * sc }, MaterialOverride = trMat };
+            trunk.Position = at + new Vector3(0, 1.5f * sc, 0); root.AddChild(trunk);
+            var canopy = new MeshInstance3D { Mesh = new SphereMesh { Radius = 1.7f * sc, Height = 2.6f * sc }, MaterialOverride = lfMat };
+            canopy.Position = at + new Vector3(0, 3.4f * sc, 0); root.AddChild(canopy);
+            g.Blockers.Add(new Blocker { Pos = at, Radius = 0.42f * sc });
+        }
+        for (int i = 0; i < m.Plazas.Count; i++)   // fill each open clearing with a little cottage garden
+        {
+            var pcz = m.CellCenter(m.Plazas[i]);
+            int prc = m.PlazaR[i];
+            float pr = prc * cell;
+            int trees = prc + rng.RandiRange(0, 1), bushes = prc + 1 + rng.RandiRange(0, 2), flowers = prc * 5 + rng.RandiRange(0, 4);
+            for (int t = 0; t < trees; t++) Tree(InDisc(pcz, pr * 0.8f));
+            for (int t = 0; t < bushes; t++) Bush(InDisc(pcz, pr * 0.8f));
+            for (int t = 0; t < flowers; t++) Flower(InDisc(pcz, pr * 0.9f));
+        }
+        for (int i = 0; i < m.Chambers.Count; i++)   // a flowerbed ring around each statue
+        {
+            var cpos = m.CellCenter(m.Chambers[i]);
+            for (int t = 0; t < 6; t++) Flower(InDisc(cpos, cell * 1.6f));
+            for (int t = 0; t < 2; t++) Bush(InDisc(cpos, cell * 1.4f));
+        }
+
         return root;
     }
 
     private static StandardMaterial3D Mat(Color c) => new StandardMaterial3D { AlbedoColor = c, Roughness = 0.95f, Metallic = 0f };
+
+    // leafy hedge shader: world-position value-noise mottles two greens for a clumpy foliage look, sparse flower
+    // specks (pink/gold), a darker shaded base + lighter trimmed top, and a gentle top-only wind sway. Shared by
+    // every wall segment (one material → cheap), and world-based so adjacent walls blend seamlessly.
+    private static Shader _hedgeShader;
+    private const string HedgeCode = @"
+shader_type spatial;
+render_mode cull_back;
+varying vec3 wp;
+float h3(vec3 p){ p=fract(p*0.3183099+0.1); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float n3(vec3 x){ vec3 p=floor(x),f=fract(x); f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(h3(p),h3(p+vec3(1,0,0)),f.x),mix(h3(p+vec3(0,1,0)),h3(p+vec3(1,1,0)),f.x),f.y),
+             mix(mix(h3(p+vec3(0,0,1)),h3(p+vec3(1,0,1)),f.x),mix(h3(p+vec3(0,1,1)),h3(p+vec3(1,1,1)),f.x),f.y),f.z); }
+void vertex(){
+  wp=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz;
+  float top=smoothstep(12.0,26.0,wp.y);
+  VERTEX.x+=sin(wp.z*0.18+TIME*0.7)*top*0.35;
+  VERTEX.z+=cos(wp.x*0.16+TIME*0.6)*top*0.35;
+}
+void fragment(){
+  // clumpy foliage: two octaves for the leaf pattern, plus a 3rd sampled around the point for a cheap normal bump
+  float e=0.55;
+  float n=n3(wp*0.75), n2=n3(wp*2.3);
+  float bx=n3((wp+vec3(e,0.0,0.0))*2.3), bz=n3((wp+vec3(0.0,0.0,e))*2.3);
+  float leaf=clamp(n*0.62+n2*0.38,0.0,1.0);
+  vec3 col=mix(vec3(0.035,0.10,0.055),vec3(0.16,0.35,0.17),leaf);
+  col*=mix(0.5,1.0,clamp(wp.y/5.0,0.0,1.0));                          // shaded, cool base
+  col=mix(col,vec3(0.26,0.46,0.25),smoothstep(23.0,28.0,wp.y)*0.55); // sunlit trimmed top
+  float fl=n3(wp*2.7+9.0);                                            // sparse flowers
+  if(fl>0.85){ vec3 fc=(fl>0.93)?vec3(1.0,0.9,0.5):vec3(1.0,0.55,0.72); col=mix(col,fc,smoothstep(0.85,0.93,fl)); }
+  ALBEDO=col;
+  // leafy bumps that catch the light: perturb the normal by the local noise gradient (tangent-space nudge)
+  NORMAL=normalize(NORMAL+TANGENT*(bx-n2)*1.6+BINORMAL*(bz-n2)*1.6);
+  ROUGHNESS=0.62+n2*0.28;          // varied waxy-leaf sheen
+  SPECULAR=0.28;
+  AO=mix(0.45,1.0,leaf);           // darker in the leaf crevices
+  AO_LIGHT_AFFECT=0.8;
+  RIM=0.35; RIM_TINT=0.4;          // soft translucent foliage edge light
+}";
+    private static ShaderMaterial HedgeMat() { _hedgeShader ??= new Shader { Code = HedgeCode }; return new ShaderMaterial { Shader = _hedgeShader }; }
 
     // ---- navigation (fairy wisps + wrong-direction spawns) --------------------------------------------
     public static Vector2I CellOf(MazeData m, Vector3 pos)

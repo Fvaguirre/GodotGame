@@ -12,13 +12,15 @@ public partial class AirMine : Node3D
     private float _arm = 0.4f;          // brief arming delay so it doesn't pop on the dropper
     private float _life = 10f;          // self-despawn if nothing trips it
     private bool _spent = false;
-    private const float TriggerR = 2.6f, BlastR = 4.5f, PopUp = 16f;
+    private const float TriggerR = 2.6f, PopUp = 16f;
+    private float _blast = 4.5f;   // base blast radius × caster's SpellArea, set in Init
     private MeshInstance3D _orb;
     private float _bob = 0f;
 
     public void Init(Player caster, Vector3 pos, float dmg)
     {
         _caster = caster; _dmg = dmg;
+        _blast = 4.5f * (caster != null ? caster.S.SpellArea : 1f);   // scale the blast with area cards
         GlobalPosition = new Vector3(pos.X, pos.Y + 0.7f, pos.Z);   // floats just off the ground
 
         var col = DamageTypes.Col(DamageType.Wind);
@@ -28,8 +30,9 @@ public partial class AirMine : Node3D
             Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
             ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
         };
-        _orb = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.35f, Height = 0.7f }, MaterialOverride = mat };
+        _orb = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.32f, Height = 0.64f }, MaterialOverride = mat };
         AddChild(_orb);
+        Game.AddSpikes(_orb, mat, 0.32f, 0.28f, 8);   // (PHASE 3) spiked wind-mine casing (spins with the orb)
         var ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = 0.5f, OuterRadius = 0.62f }, MaterialOverride = mat };
         ring.RotationDegrees = new Vector3(90, 0, 0);
         _orb.AddChild(ring);
@@ -38,7 +41,7 @@ public partial class AirMine : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || _spent || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || _spent || !Game.I.SimActive) return;   // freeze while paused (NEW)
         float dt = (float)delta;
         if (_arm > 0f) _arm -= dt;
         _life -= dt;
@@ -61,12 +64,12 @@ public partial class AirMine : Node3D
     {
         _spent = true;
         Vector3 at = new Vector3(GlobalPosition.X, GlobalPosition.Y - 0.7f, GlobalPosition.Z);
-        Game.I.NetMgr?.StormForce(at, BlastR, 2, _dmg);     // small impact damage on the spot
-        Game.I.NetMgr?.StormForce(at, BlastR, 1, PopUp);    // launch them up → fall damage on landing
+        Game.I.NetMgr?.StormForce(at, _blast, 2, _dmg);     // small impact damage on the spot
+        Game.I.NetMgr?.StormForce(at, _blast, 1, PopUp);    // launch them up → fall damage on landing
         var col = DamageTypes.Col(DamageType.Wind);
-        Game.I.NetMgr?.BroadcastVfx(0, at, Vector3.Up, BlastR, 0f, col);   // allies see the pop ring (kind 0)
+        Game.I.NetMgr?.BroadcastVfx(0, at, Vector3.Up, _blast, 0f, col);   // allies see the pop ring (kind 0)
         // local burst: a quick expanding ring + flash
-        var ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = BlastR * 0.7f, OuterRadius = BlastR * 0.8f } };
+        var ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = _blast * 0.7f, OuterRadius = _blast * 0.8f } };
         var rm = new StandardMaterial3D {
             AlbedoColor = new Color(col.R, col.G, col.B, 0.6f), EmissionEnabled = true, Emission = col,
             EmissionEnergyMultiplier = 2.5f, Transparency = BaseMaterial3D.TransparencyEnum.Alpha,

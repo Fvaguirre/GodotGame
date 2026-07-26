@@ -30,12 +30,33 @@ public partial class HolyPulse : Node3D
         _disc.Position = new Vector3(0, 0.06f, 0);
         AddChild(_disc);
         AddChild(new OmniLight3D { OmniRange = Radius * 1.4f, LightColor = col, LightEnergy = 1.6f });
+        SpawnPulseRing();   // (PHASE 3) a ring on the opening cast
+    }
+
+    // (PHASE 3) an expanding holy shockwave ring — spawned on each damage/heal beat so the pulse is READABLE (authored
+    // silhouette that grows to the full radius and fades), instead of an invisible beat under a flat glowing disc.
+    private void SpawnPulseRing()
+    {
+        var col = DamageTypes.Col(DamageType.Holy).Lerp(Colors.White, 0.45f);
+        var ring = new MeshInstance3D
+        {
+            Mesh = new TorusMesh { InnerRadius = 0.86f, OuterRadius = 1.0f },
+            MaterialOverride = Game.Emissive(col, 2.2f),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Position = new Vector3(0, 0.09f, 0),
+            Scale = Vector3.One * (Radius * 0.16f)
+        };
+        AddChild(ring);
+        var t = ring.CreateTween();
+        t.TweenProperty(ring, "scale", Vector3.One * Radius, 0.6f).SetEase(Tween.EaseType.Out);
+        t.Parallel().TweenProperty(ring, "transparency", 1f, 0.62f);
+        t.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(ring)) ring.QueueFree(); }));
     }
 
     public override void _Process(double delta)
     {
         var g = Game.I;
-        if (g == null || g.State != GameState.Playing) return;
+        if (g == null || !g.SimActive) return;
         float dt = (float)delta;
         Dur -= dt;
         _beat -= dt;
@@ -51,6 +72,7 @@ public partial class HolyPulse : Node3D
         if (_beat <= 0f)
         {
             _beat = Interval;
+            SpawnPulseRing();   // (PHASE 3) visible shockwave on every beat
             foreach (var e in g.Enemies.ToArray())
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;

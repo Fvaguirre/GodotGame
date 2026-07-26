@@ -18,6 +18,8 @@ public partial class Hud : Control
     public Rect2 ROverRetry, ROverCharSelect, ROverEnd;   // (NEW) MP game-over host options
     public Rect2 RPauseBloom, RPauseSsao, RPauseSsil;   // (NEW) post-processing toggles
     public Rect2[] RPauseGfx = new Rect2[3];             // (NEW) LOW / MED / HIGH preset buttons
+    public Rect2[] RPauseView = new Rect2[3];            // (NEW) Render Distance LOW / MED / HIGH — now in the pause menu too, matching the main-menu options
+    public Rect2[] RPauseShadow = new Rect2[3];          // (NEW) independent Shadows LOW / MED / HIGH
     public Rect2[] RPauseBind = new Rect2[5];
     public int PauseBindAt(Vector2 pos)
     {
@@ -57,6 +59,29 @@ public partial class Hud : Control
 
     private int _gen = -1;
     private float _panelT = 0f;
+
+    // ===== level-up SLOT ROLL state (NEW) — cards spin, tick past, then slam to a stop left→right =====
+    private const float RollSpinBase = 0.55f;    // when the FIRST card locks
+    private const float RollStagger = 0.42f;     // gap between successive card locks
+    private const float RollScramble = 0.055f;   // how fast the fake rarity flickers while spinning
+    private bool _rollActive = false;
+    private readonly bool[] _rollLocked = new bool[3];
+    private float _rollTickT = 0f;                // throttle for the spin tick sound
+    private int _rollScrambleTier = 0;           // the fake rarity currently shown on spinning cards
+    private float _rollScrambleT = 0f;
+    // the moment card i comes to rest
+    private static float RollLockAt(int i) => RollSpinBase + i * RollStagger;
+    private float RollTotal => RollLockAt(2);
+    public bool RollBusy => _rollActive && _panelT < RollTotal;
+    // click/keypress during the spin slams everything to a stop instead of selecting
+    public void FinishRoll()
+    {
+        if (!_rollActive) return;
+        var g = Game.I;
+        for (int i = 0; i < 3; i++)
+            if (!_rollLocked[i]) { _rollLocked[i] = true; if (g?.Choices != null && i < g.Choices.Count) g.Sfx?.RollLock((int)g.Choices[i].Rarity); }
+        _panelT = Mathf.Max(_panelT, RollTotal);
+    }
 
     private struct Pop { public Vector3 W; public string Txt; public Color Col; public float T; }
     private readonly List<Pop> _pops = new();
@@ -134,13 +159,56 @@ public partial class Hud : Control
         float dt = (float)delta;
         if (_bannerT > 0) _bannerT -= dt;
         var g = Game.I;
-        if (g != null && g.ChoiceGen != _gen) { _gen = g.ChoiceGen; _panelT = 0f; }
+        if (g != null && g.ChoiceGen != _gen)
+        {
+            _gen = g.ChoiceGen; _panelT = 0f;
+            // (NEW) arm the slot roll whenever a fresh pick-3 (or reroll) appears
+            _rollActive = g.State == GameState.LevelUp && g.Choices != null && g.Choices.Count > 0;
+            for (int i = 0; i < 3; i++) _rollLocked[i] = false;
+            _rollTickT = 0f; _rollScrambleT = 0f;
+        }
         _panelT += dt;
+        UpdateRoll(g, dt);
         for (int i = _pops.Count - 1; i >= 0; i--) { var p = _pops[i]; p.T += dt; _pops[i] = p; if (p.T >= PopMax) _pops.RemoveAt(i); }
         if (_flourT > 0f) _flourT -= dt;
         if (_comboPopT > 0f) _comboPopT -= dt;   // (NEW)
         if (_breakT > 0f) _breakT -= dt;
         QueueRedraw();
+    }
+
+    // drive the slot roll's sounds + scramble in _Process (not _Draw) so the ticks fire steadily regardless of frame timing
+    private void UpdateRoll(Game g, float dt)
+    {
+        if (!_rollActive) return;
+        if (g == null || g.State != GameState.LevelUp || g.Choices == null) { _rollActive = false; return; }
+
+        // the flickering fake rarity shown on every still-spinning card
+        _rollScrambleT -= dt;
+        if (_rollScrambleT <= 0f)
+        {
+            _rollScrambleT = RollScramble;
+            _rollScrambleTier = (_rollScrambleTier + 1 + _orng.RandiRange(0, 3)) % 5;   // jump around the rarity ladder
+        }
+
+        bool anySpinning = false;
+        for (int i = 0; i < g.Choices.Count && i < 3; i++)
+        {
+            if (_rollLocked[i]) continue;
+            if (_panelT >= RollLockAt(i))
+            {
+                _rollLocked[i] = true;
+                g.Sfx?.RollLock((int)g.Choices[i].Rarity);   // this card slams home — sound scales with its rarity
+            }
+            else anySpinning = true;
+        }
+
+        // steady witchy ticking while anything is still spinning; speeds up slightly as it's about to stop
+        if (anySpinning)
+        {
+            _rollTickT -= dt;
+            if (_rollTickT <= 0f) { _rollTickT = 0.052f; g.Sfx?.RollTick(); }
+        }
+        else _rollActive = false;   // all three settled
     }
 
     private float U => Mathf.Clamp(GetViewportRect().Size.Y / 900f, 0.62f, 2.4f);
@@ -190,11 +258,11 @@ public partial class Hud : Control
     // a top-right radar: player-relative (up = facing), dots for nearby threats & points of interest
     private void DrawMinimap(Game g, Player p, Vector2 vp, float u)
     {
-        float radius = 72 * u, range = 46f;
+        float radius = 90 * u, range = 57.5f;   // (TUNE) +25% bigger radar, +25% more world shown around the player
         float cx = vp.X - radius - 18 * u, cy = radius + 18 * u;
         var ctr = new Vector2(cx, cy);
         DrawCircle(ctr, radius + 3 * u, new Color(0, 0, 0, 0.45f));
-        DrawCircle(ctr, radius, new Color(0.05f, 0.06f, 0.10f, 0.72f));
+        DrawCircle(ctr, radius, g.InOverworld ? new Color(0.02f, 0.025f, 0.04f, 0.9f) : new Color(0.05f, 0.06f, 0.10f, 0.72f));   // (NEW) heavy fog base in the overworld — cleared cells drawn lighter over it
         DrawArc(ctr, radius, 0, Tau, 44, new Color(0.6f, 0.7f, 0.9f, 0.5f), 1.5f * u);
 
         float yaw = p.Rotation.Y;
@@ -210,14 +278,158 @@ public partial class Hud : Control
             return new Vector2(plotCtr.X + rxr * sc, plotCtr.Y + rzr * sc);
         }
 
-        foreach (var r in g.Rituals)
-        { if (r == null || !GodotObject.IsInstanceValid(r)) continue; var sp = Plot(r.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 4 * u, new Color(0.8f, 0.5f, 1f, 0.95f)); }
-        foreach (var ch in g.Chests)
-        { if (ch == null || !GodotObject.IsInstanceValid(ch)) continue; var sp = Plot(ch.GlobalPosition, out var ir); if (ir) DrawRect(new Rect2(sp.X - 3 * u, sp.Y - 3 * u, 6 * u, 6 * u), new Color(1f, 0.82f, 0.3f, 0.95f)); }
-        if (g.VendorMystic != null && GodotObject.IsInstanceValid(g.VendorMystic))
-        { var sp = Plot(g.VendorMystic.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 3.5f * u, new Color(0.4f, 0.95f, 0.9f, 0.95f)); }
-        if (g.VendorScroll != null && GodotObject.IsInstanceValid(g.VendorScroll))
-        { var sp = Plot(g.VendorScroll.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 3.5f * u, new Color(0.6f, 0.9f, 0.5f, 0.95f)); }
+        // ---- fog of war (overworld only): dark until your forward vision cone sweeps a cell; cleared cells persist ----
+        Vector2 Clamp(Vector2 sp) { var dv = sp - ctr; return dv.Length() > radius ? ctr + dv.Normalized() * radius : sp; }
+        if (g.InOverworld)
+        {
+            var exploredCol = new Color(0.17f, 0.19f, 0.25f, 0.6f);
+            float cellPx = Game.DiscCell * sc;
+            int cr = Mathf.CeilToInt(range / Game.DiscCell) + 1;
+            int pcx = Mathf.FloorToInt(p.GlobalPosition.X / Game.DiscCell), pcz = Mathf.FloorToInt(p.GlobalPosition.Z / Game.DiscCell);
+            for (int cxi = pcx - cr; cxi <= pcx + cr; cxi++)
+                for (int czi = pcz - cr; czi <= pcz + cr; czi++)
+                {
+                    if (!g.DiscoveredCell(cxi, czi)) continue;
+                    var sp = Plot(new Vector3((cxi + 0.5f) * Game.DiscCell, 0, (czi + 0.5f) * Game.DiscCell), out _);
+                    if (sp.DistanceTo(ctr) > radius) continue;   // clip fog cells to the radar disc
+                    DrawCircle(sp, cellPx * 0.72f, exploredCol);
+                }
+        }
+
+        // ---- discoverables: shown only once the fog reveals their cell; each with its own icon (edge-clamped off-radar) ----
+        foreach (var r in g.Rituals)   // light circle in the rite's colour
+        {
+            if (r == null || !GodotObject.IsInstanceValid(r) || !g.Discovered(r.GlobalPosition)) continue;
+            var sp = Clamp(Plot(r.GlobalPosition, out _));
+            var rc = (r.Type == RiteType.Ward ? DamageTypes.Col(DamageType.Lunar) : r.Type == RiteType.Summon ? DamageTypes.Col(DamageType.Curse) : DamageTypes.Col(DamageType.Holy)).Lerp(Colors.White, 0.35f);
+            DrawCircle(sp, 5.5f * u, new Color(rc.R, rc.G, rc.B, 0.3f));
+            DrawCircle(sp, 3.2f * u, rc);
+        }
+        foreach (var ch in g.Chests)   // gold rectangle — greyed once opened
+        {
+            if (ch == null || !GodotObject.IsInstanceValid(ch) || ch.Hidden || !g.Discovered(ch.GlobalPosition)) continue;
+            var raw = Plot(ch.GlobalPosition, out bool chIn);
+            if (ch.Opened && !chIn) continue;                 // (FIX) a LOOTED chest is only a memory marker — don't edge-clamp it to the rim; just show it when it's actually on the radar
+            var sp = ch.Opened ? raw : Clamp(raw);            // unopened chests still clamp to the edge so they point you toward loot
+            var chc = ch.Opened ? new Color(0.5f, 0.5f, 0.55f, 0.75f) : new Color(1f, 0.82f, 0.3f, 0.98f);   // (NEW) opened → greyed out
+            var clc = ch.Opened ? new Color(0.32f, 0.32f, 0.34f, 0.75f) : new Color(0.45f, 0.33f, 0.1f, 0.95f);
+            DrawRect(new Rect2(sp.X - 3.6f * u, sp.Y - 3.6f * u, 7.2f * u, 7.2f * u), chc);
+            DrawRect(new Rect2(sp.X - 3.6f * u, sp.Y - 0.7f * u, 7.2f * u, 1.4f * u), clc);   // clasp line
+        }
+        foreach (var ef in g.Effigies)   // diamond in the effigy's theme colour
+        {
+            if (ef == null || !GodotObject.IsInstanceValid(ef) || ef.Claimed || !g.Discovered(ef.GlobalPosition)) continue;
+            var sp = Clamp(Plot(ef.GlobalPosition, out _));
+            var col = EffigyCol(ef.Kind);
+            DrawCircle(sp, 4.8f * u, new Color(col.R, col.G, col.B, 0.28f));
+            Diamond(sp, 3.6f * u, col);
+        }
+        foreach (var gp in g.GalePads)   // (GALE NET) wind pad: a dot with a tick pointing the way it launches you (dir rotated into the player-locked frame)
+        {
+            if (gp == null || !GodotObject.IsInstanceValid(gp) || !g.Discovered(gp.GlobalPosition)) continue;
+            var sp = Clamp(Plot(gp.GlobalPosition, out _));
+            var wc = DamageTypes.Col(DamageType.Wind).Lerp(Colors.White, 0.2f);
+            var ld = gp.LaunchDir;
+            float tx = ld.X * cosY - ld.Z * sinY, tz = ld.X * sinY + ld.Z * cosY;
+            var tip = new Vector2(sp.X + tx * 8f * u, sp.Y + tz * 8f * u);
+            DrawCircle(sp, 3.4f * u, new Color(wc.R, wc.G, wc.B, 0.3f));
+            DrawLine(sp, tip, wc, 1.6f * u);
+            DrawCircle(tip, 1.4f * u, wc);
+            DrawCircle(sp, 2.1f * u, wc);
+        }
+        foreach (var mg in g.Magnets)   // (MAGNET DROP) a dropped lodestone — ALWAYS shown (valuable + transient), edge-clamped; little violet horseshoe
+        {
+            if (mg == null || !GodotObject.IsInstanceValid(mg)) continue;
+            var sp = Clamp(Plot(mg.GlobalPosition, out _));
+            var mc = new Color(0.82f, 0.55f, 1f);
+            DrawCircle(sp, 5f * u, new Color(mc.R, mc.G, mc.B, 0.3f));                        // pull glow
+            DrawRect(new Rect2(sp.X - 3f * u, sp.Y - 3.2f * u, 1.7f * u, 5f * u), mc);        // left prong
+            DrawRect(new Rect2(sp.X + 1.3f * u, sp.Y - 3.2f * u, 1.7f * u, 5f * u), mc);      // right prong
+            DrawRect(new Rect2(sp.X - 3f * u, sp.Y + 1.4f * u, 6f * u, 1.7f * u), mc);        // base
+        }
+        // (NERFER) the 3 boss-weakening shrines — ALWAYS revealed (no fog gate) and edge-CLAMPED to the radar rim, so they
+        // read as a standing objective you can navigate to from anywhere. Brighter + a pulse ring once armed.
+        foreach (var s in g.Nerfers)
+        {
+            if (s == null || !GodotObject.IsInstanceValid(s)) continue;
+            var sp = Clamp(Plot(s.GlobalPosition, out var ir));
+            var nc = s.IconColor;
+            if (!ir) DrawCircle(sp, 6.5f * u, new Color(nc.R, nc.G, nc.B, 0.25f));     // off-radar: a soft halo so the clamped pin reads as "over there"
+            DrawArc(sp, 4.8f * u, 0, Tau, 18, nc, (s.State == 2 ? 2.4f : 1.6f) * u);   // ring
+            DrawCircle(sp, 2f * u, nc);                                                // core
+        }
+        // vendors — each its own icon (fog-gated like the other discoverables)
+        if (g.VendorMystic != null && GodotObject.IsInstanceValid(g.VendorMystic) && g.Discovered(g.VendorMystic.GlobalPosition))
+        {
+            var sp = Clamp(Plot(g.VendorMystic.GlobalPosition, out _)); var mc = new Color(0.4f, 0.95f, 0.9f);
+            DrawCircle(sp, 4f * u, new Color(mc.R, mc.G, mc.B, 0.3f)); DrawCircle(sp, 3.2f * u, mc); DrawCircle(sp, 1.3f * u, new Color(0.03f, 0.06f, 0.08f));   // teal ringed eye
+        }
+        if (g.VendorScroll != null && GodotObject.IsInstanceValid(g.VendorScroll) && g.Discovered(g.VendorScroll.GlobalPosition))
+        {
+            var sp = Clamp(Plot(g.VendorScroll.GlobalPosition, out _)); var scol = new Color(0.88f, 0.8f, 0.52f);
+            DrawRect(new Rect2(sp.X - 3f * u, sp.Y - 4f * u, 6f * u, 8f * u), scol);   // parchment scroll
+            DrawRect(new Rect2(sp.X - 3f * u, sp.Y - 1.3f * u, 6f * u, 0.9f * u), new Color(0.38f, 0.3f, 0.14f, 0.85f));
+            DrawRect(new Rect2(sp.X - 3f * u, sp.Y + 0.8f * u, 6f * u, 0.9f * u), new Color(0.38f, 0.3f, 0.14f, 0.85f));
+        }
+        if (g.VendorShop != null && GodotObject.IsInstanceValid(g.VendorShop) && g.Discovered(g.VendorShop.GlobalPosition))
+        {
+            var sp = Clamp(Plot(g.VendorShop.GlobalPosition, out _));
+            SafePoly(new[] { new Vector2(sp.X, sp.Y - 4.6f * u), new Vector2(sp.X + 4.6f * u, sp.Y + 3f * u), new Vector2(sp.X - 4.6f * u, sp.Y + 3f * u) }, new Color(1f, 0.66f, 0.28f));   // peddler stall (tent)
+        }
+        foreach (var rl in g.RouletteList)   // wheel of fortune
+        {
+            if (rl == null || !GodotObject.IsInstanceValid(rl) || !g.Discovered(rl.GlobalPosition)) continue;
+            var sp = Clamp(Plot(rl.GlobalPosition, out _)); var wc2 = new Color(1f, 0.85f, 0.35f);
+            DrawArc(sp, 3.8f * u, 0, Tau, 18, wc2, 1.6f * u);
+            DrawLine(new Vector2(sp.X - 3.8f * u, sp.Y), new Vector2(sp.X + 3.8f * u, sp.Y), wc2, 1.1f * u);
+            DrawLine(new Vector2(sp.X, sp.Y - 3.8f * u), new Vector2(sp.X, sp.Y + 3.8f * u), wc2, 1.1f * u);
+        }
+        // garden travel portals + gate — navigation aids, ALWAYS shown (not fog-gated). NOT edge-clamped (user pref):
+        // they only appear once actually on the radar, vanishing off-rim instead of pinning to the edge.
+        foreach (var pt in g.GardenPortals)
+        {
+            if (pt == null || !GodotObject.IsInstanceValid(pt) || !pt.IsEntrance) continue;
+            var sp = Plot(pt.GlobalPosition, out var ir); if (!ir) continue;
+            DrawArc(sp, 4.4f * u, 0, Tau, 18, new Color(pt.Tint.R, pt.Tint.G, pt.Tint.B, 0.9f), 1.8f * u);   // portal ring
+            DrawCircle(sp, 1.5f * u, pt.Tint);
+        }
+        if (g.GardenGateActive)
+        {
+            var sp = Plot(g.GardenGatePos, out var ir);
+            if (ir)
+            {
+                DrawArc(sp, 5f * u, 0, Tau, 20, new Color(0.6f, 1f, 0.7f, 0.85f), 2f * u);
+                DrawCircle(sp, 2.4f * u, new Color(0.6f, 1f, 0.7f));
+            }
+        }
+        // (BOSS-LAIR) the world objective — ALWAYS shown, edge-clamped; colour = state (sealed red / active amber / conquered grey)
+        if (g.Lair != null && GodotObject.IsInstanceValid(g.Lair))
+        {
+            var sp = Clamp(Plot(g.Lair.GlobalPosition, out _));
+            var lc = g.Lair.IconColor;
+            DrawCircle(sp, 7f * u, new Color(lc.R, lc.G, lc.B, 0.32f));
+            SafePoly(new[] { new Vector2(sp.X - 4.6f * u, sp.Y - 4f * u), new Vector2(sp.X + 4.6f * u, sp.Y - 4f * u), new Vector2(sp.X, sp.Y + 4.8f * u) }, lc);   // a fanged maw pointing down
+            DrawArc(sp, 7f * u, 0, Tau, 22, new Color(lc.R, lc.G, lc.B, 0.95f), 1.8f * u);
+        }
+        // (HAUNT) the roaming hot-zone — ALWAYS shown, edge-clamped, a pulsing magenta ring with the fill arc inside
+        if (g.HauntActive)
+        {
+            var hc = new Color(0.9f, 0.34f, 0.72f);
+            var sp = Clamp(Plot(g.HauntCenter, out var ir));
+            float pr = 0.5f + 0.5f * Mathf.Sin((float)Time.GetTicksMsec() * 0.005f);
+            if (ir)
+            {
+                float rr = Mathf.Max(6f * u, g.HauntRadius * sc);   // draw the zone at true scale when on-radar
+                DrawCircle(sp, rr, new Color(hc.R, hc.G, hc.B, 0.12f + 0.06f * pr));
+                DrawArc(sp, rr, 0, Tau, 28, new Color(hc.R, hc.G, hc.B, 0.85f), 1.8f * u);
+                if (g.HauntFrac > 0.001f) DrawArc(sp, rr - 2.5f * u, -Mathf.Pi / 2f, -Mathf.Pi / 2f + Tau * g.HauntFrac, 26, new Color(1f, 0.85f, 0.4f), 2.4f * u);   // fill ring
+            }
+            else
+            {
+                DrawCircle(sp, 6.5f * u, new Color(hc.R, hc.G, hc.B, 0.28f));
+                DrawArc(sp, 5f * u, 0, Tau, 18, new Color(hc.R, hc.G, hc.B, 0.7f + 0.3f * pr), 2f * u);
+            }
+        }
         var orbCol = new Color(0.62f, 0.86f, 1f, 0.8f);   // (NEW) tiny XP-orb specks (persistent on the map)
         foreach (var o in g.Orbs)
         { if (o == null || !GodotObject.IsInstanceValid(o)) continue; var sp = Plot(o.GlobalPosition, out var ir); if (ir) DrawCircle(sp, 1.1f * u, orbCol); }
@@ -282,6 +494,29 @@ public partial class Hud : Control
             DrawArc(sp2, 6f * u, 0, Tau, 18, new Color(mc.R, mc.G, mc.B, 0.8f), 1.6f * u);
         }
 
+        // (NEW) revealed cauldron — a cauldron icon, edge-clamped so it always points the way (pinned from the skybeam reveal on)
+        var cpz = g.MazeCauldronRevealedPos;
+        if (cpz.HasValue)
+        {
+            var sp = Plot(cpz.Value, out var ir);
+            if (!ir) { var dv = sp - ctr; if (dv.Length() > radius) sp = ctr + dv.Normalized() * radius; }
+            var cauCol = new Color(0.78f, 0.5f, 1f);   // witchy cauldron glow
+            DrawCircle(sp, 5.5f * u, new Color(cauCol.R, cauCol.G, cauCol.B, 0.4f));                 // halo
+            DrawCircle(sp, 3.6f * u, new Color(0.12f, 0.10f, 0.16f));                                // dark iron body
+            DrawArc(sp, 3.6f * u, 0, Tau, 16, cauCol, 1.6f * u);                                     // glowing rim
+            DrawRect(new Rect2(sp.X - 4.4f * u, sp.Y - 4.8f * u, 8.8f * u, 1.4f * u), cauCol);        // handle bar across the top
+        }
+        // (NEW) exit portal — a portal ring icon once the way out is open (pinned until you leave)
+        if (g.InMaze && g.MazeFound)
+        {
+            var sp = Plot(g.MazePortalWorld, out var ir);
+            if (!ir) { var dv = sp - ctr; if (dv.Length() > radius) sp = ctr + dv.Normalized() * radius; }
+            var exCol = new Color(0.55f, 1f, 0.72f);   // mint escape portal
+            DrawArc(sp, 5f * u, 0, Tau, 20, exCol, 2f * u);                                          // portal ring
+            DrawArc(sp, 3f * u, 0, Tau, 16, new Color(exCol.R, exCol.G, exCol.B, 0.7f), 1.4f * u);
+            DrawCircle(sp, 1.4f * u, new Color(exCol.R, exCol.G, exCol.B, 0.95f));                    // swirling core
+        }
+
         foreach (var bl in g.Blips)   // (NEW) firework pings — triangulate allies (edge-clamped so they point)
         {
             var bp = Plot(bl.Pos, out var bir);
@@ -301,17 +536,8 @@ public partial class Hud : Control
     private void DrawTooltip(Vector2 mouse, Vector2 vp, string title, string body, Color col, float u)
     {
         if (string.IsNullOrEmpty(body)) return;
-        float w = 252 * u, pad = 10 * u, lineH = 15 * u;
-        var words = body.Split(' ');
-        var lines = new System.Collections.Generic.List<string>();
-        string cur = "";
-        foreach (var wd in words)
-        {
-            string next = cur.Length == 0 ? wd : cur + " " + wd;
-            if (next.Length > 38) { if (cur.Length > 0) lines.Add(cur); cur = wd; }
-            else cur = next;
-        }
-        if (cur.Length > 0) lines.Add(cur);
+        float w = 268 * u, pad = 10 * u, lineH = 15 * u;
+        var lines = WrapText(_body, body, 12 * u, w - pad * 2);   // (NEW) pixel-accurate wrap — never overflows the panel width
         float h = pad * 2 + 20 * u + lines.Count * lineH;
         float x = mouse.X + 16 * u, y = mouse.Y + 10 * u;
         if (x + w > vp.X - 4 * u) x = mouse.X - w - 16 * u;
@@ -332,6 +558,31 @@ public partial class Hud : Control
         int fs = Mathf.Max(1, Mathf.RoundToInt(size));
         DrawMultilineString(f, p, s, HorizontalAlignment.Left, w, fs, -1, col);
     }
+
+    // (NEW) auto-fit multi-line text into a box: shrink the font until the wrapped text fits within maxH so descriptions
+    // NEVER clip, no matter how long — dynamic for any future spell/mod text.
+    private void TMFit(Font f, Vector2 p, string s, float size, Color col, float w, float maxH)
+    {
+        int fs = Mathf.Max(1, Mathf.RoundToInt(size));
+        while (fs > 7 && f.GetMultilineStringSize(s, HorizontalAlignment.Left, w, fs).Y > maxH) fs--;
+        DrawMultilineString(f, p, s, HorizontalAlignment.Left, w, fs, -1, col);
+    }
+
+    // (NEW) pixel-accurate word wrap (measures each word, unlike the old char-count heuristic that could overflow the box)
+    private System.Collections.Generic.List<string> WrapText(Font f, string s, float size, float maxW)
+    {
+        int fs = Mathf.Max(1, Mathf.RoundToInt(size));
+        var lines = new System.Collections.Generic.List<string>();
+        string cur = "";
+        foreach (var wd in s.Split(' '))
+        {
+            string next = cur.Length == 0 ? wd : cur + " " + wd;
+            if (cur.Length > 0 && f.GetStringSize(next, HorizontalAlignment.Left, -1, fs).X > maxW) { lines.Add(cur); cur = wd; }
+            else cur = next;
+        }
+        if (cur.Length > 0) lines.Add(cur);
+        return lines;
+    }
     private void Frame(Rect2 r, Color col, float wd) => DrawRect(r, col, false, wd);
     private void Bar(float x, float y, float w, float h, float frac, Color fill)
     {
@@ -344,19 +595,184 @@ public partial class Hud : Control
     private void Diamond(Vector2 c, float s, Color col)
         => SafePoly(new[] { new Vector2(c.X, c.Y - s), new Vector2(c.X + s, c.Y), new Vector2(c.X, c.Y + s), new Vector2(c.X - s, c.Y) }, col);
 
-    // DrawColoredPolygon throws "Invalid polygon data, triangulation failed" on degenerate input — a zero-size
-    // marker (s≈0), NaN/Inf coords, or collinear points. Every dynamically-sized polygon goes through here. (NEW)
+    // (CONTINUOUS) difficulty-meter escalation bands: threshold tier → name + colour (green → white-hot). Never caps.
+    private static readonly (float t, string name, Color col)[] DiffBands = {
+        (0f,  "CALM",        new Color(0.42f, 0.85f, 0.5f)),
+        (3f,  "STIRRING",    new Color(0.62f, 0.9f, 0.35f)),
+        (6f,  "RESTLESS",    new Color(0.95f, 0.85f, 0.3f)),
+        (10f, "MENACING",    new Color(1f, 0.62f, 0.2f)),
+        (15f, "FRENZIED",    new Color(1f, 0.36f, 0.15f)),
+        (22f, "RUINOUS",     new Color(0.95f, 0.2f, 0.2f)),
+        (30f, "CATACLYSMIC", new Color(0.85f, 0.28f, 0.9f)),
+        (45f, "APOCALYPSE",  new Color(1f, 0.92f, 1f)),
+        (70f, "OBLIVION",    new Color(1f, 1f, 1f)),
+    };
+
+    // (NEW) minimap effigy-diamond colour by theme (0 survival / 1 power / 2 fortune / 3 swiftness / 4 coven)
+    private static Color EffigyCol(int kind) => kind switch
+    {
+        0 => new Color(0.45f, 0.9f, 0.5f),    // survival — green
+        1 => new Color(1f, 0.42f, 0.36f),     // power — red
+        2 => new Color(1f, 0.83f, 0.32f),     // fortune — gold
+        3 => new Color(0.45f, 0.85f, 1f),     // swiftness — cyan
+        _ => new Color(0.72f, 0.5f, 1f),      // coven — purple
+    };
+
+    // DrawColoredPolygon throws "Invalid polygon data, triangulation failed" even on perfectly valid small
+    // triangles in this Godot build — the triangulator is simply unreliable. So we NEVER call it: instead we
+    // scanline-fill the polygon with horizontal DrawLine spans. Works for any convex shape (all our uses are
+    // triangles or quads: popup tails, diamonds, minimap arrows, sheen quads). 100% reliable, no triangulator.
     private void SafePoly(Vector2[] p, Color col)
     {
-        if (p == null || p.Length < 3) return;
-        foreach (var v in p) if (!float.IsFinite(v.X) || !float.IsFinite(v.Y) || Mathf.Abs(v.X) > 1e6f || Mathf.Abs(v.Y) > 1e6f) return;   // off-screen extremes lose precision
-        for (int i = 0; i < p.Length; i++)
-            for (int j = i + 1; j < p.Length; j++)
-                if (p[i].DistanceSquaredTo(p[j]) < 4.0f) return;   // points within ~2px → triangulation yields no indices
-        float area = 0f;
-        for (int i = 0; i < p.Length; i++) { var a = p[i]; var b = p[(i + 1) % p.Length]; area += a.X * b.Y - b.X * a.Y; }
-        if (Mathf.Abs(area) < 8.0f) return;   // ~zero area (thin/collinear) → triangulation would fail
-        DrawColoredPolygon(p, col);
+        if (p == null || p.Length < 3 || col.A <= 0f) return;
+        float minY = float.MaxValue, maxY = float.MinValue;
+        foreach (var v in p)
+        {
+            if (!float.IsFinite(v.X) || !float.IsFinite(v.Y) || Mathf.Abs(v.X) > 1e6f || Mathf.Abs(v.Y) > 1e6f) return;   // off-screen extremes lose precision
+            if (v.Y < minY) minY = v.Y;
+            if (v.Y > maxY) maxY = v.Y;
+        }
+        int y0 = Mathf.FloorToInt(minY), y1 = Mathf.CeilToInt(maxY);
+        if (y1 - y0 > 2048 || y1 < y0) return;   // absurd extent guard
+        for (int y = y0; y <= y1; y++)
+        {
+            float sy = y + 0.5f;
+            float lx = float.MaxValue, rx = float.MinValue;
+            for (int i = 0; i < p.Length; i++)   // find where scanline crosses each edge
+            {
+                var a = p[i]; var b = p[(i + 1) % p.Length];
+                if ((a.Y <= sy && b.Y > sy) || (b.Y <= sy && a.Y > sy))
+                {
+                    float x = a.X + (sy - a.Y) / (b.Y - a.Y) * (b.X - a.X);
+                    if (x < lx) lx = x;
+                    if (x > rx) rx = x;
+                }
+            }
+            if (rx > lx) DrawLine(new Vector2(lx, sy), new Vector2(rx, sy), col, 1.0f);
+        }
+    }
+
+    // dev perf/network overlay (top-left), toggled lobby-wide via the console 'perf' command. Shows frame-time,
+    // draw stats, live entity counts, and — on the host — the per-tick snapshot packet sizes vs the ~1392B MTU,
+    // so we can see at a glance whether a fight is CPU-bound, GPU-bound, or just saturating the network.
+    private void DrawPerf(Font f, float u)
+    {
+        var g = Game.I; if (g == null) return;
+        var white  = new Color(0.82f, 0.88f, 1f);
+        var green  = new Color(0.50f, 1f, 0.60f);
+        var yellow = new Color(1f, 0.85f, 0.35f);
+        var red    = new Color(1f, 0.45f, 0.40f);
+
+        double fps = Engine.GetFramesPerSecond();
+        float procMs = (float)Performance.GetMonitor(Performance.Monitor.TimeProcess) * 1000f;
+        float physMs = (float)Performance.GetMonitor(Performance.Monitor.TimePhysicsProcess) * 1000f;
+        int draws = (int)Performance.GetMonitor(Performance.Monitor.RenderTotalDrawCallsInFrame);
+        int nodes = (int)Performance.GetMonitor(Performance.Monitor.ObjectNodeCount);
+        float vram = (float)Performance.GetMonitor(Performance.Monitor.RenderVideoMemUsed) / 1048576f;
+
+        var lines = new System.Collections.Generic.List<(string, Color)>();
+        lines.Add(($"FPS {fps:0}   frame {procMs:0.0}ms", fps >= 55 ? green : fps >= 30 ? yellow : red));
+        lines.Add(($"phys {physMs:0.0}ms   draws {draws}   nodes {nodes}", white));
+        lines.Add(($"vram {vram:0}MB", white));
+        lines.Add(($"enemies {g.Enemies.Count}   orbs {g.Orbs.Count}", white));
+
+        var net = g.NetMgr;
+        if (net != null && net.Active)
+        {
+            lines.Add(($"net {(g.IsAuthority ? "HOST" : "CLIENT")} @ {Net.NetHz:0}Hz   MTU 1392B", white));
+            if (g.IsAuthority)   // only the host builds/sends the snapshots
+            {
+                lines.Add(($"  enemy pkt {net.NetEnemyBytes}B ({net.NetEnemiesSynced} synced)", net.NetEnemyBytes > 1392 ? red : net.NetEnemyBytes > 1100 ? yellow : green));
+                lines.Add(($"  pickup pkt {net.NetPickupBytes}B ({net.NetOrbsSynced} orbs)", net.NetPickupBytes > 1392 ? red : net.NetPickupBytes > 1100 ? yellow : green));
+            }
+        }
+        else lines.Add(("net: solo", white));
+
+        float fs = 15 * u, lh = fs * 1.35f, pad = 8 * u;
+        float w = 0f;
+        foreach (var (s, _) in lines) w = Mathf.Max(w, f.GetStringSize(s, HorizontalAlignment.Left, -1, Mathf.RoundToInt(fs)).X);
+        var org = new Vector2(10 * u, 10 * u);
+        DrawRect(new Rect2(org, new Vector2(w + pad * 2, lines.Count * lh + pad * 2)), new Color(0.03f, 0.02f, 0.06f, 0.72f));
+        Frame(new Rect2(org, new Vector2(w + pad * 2, lines.Count * lh + pad * 2)), new Color(0.5f, 0.7f, 1f, 0.35f), 1.5f * u);
+        float y = org.Y + pad + fs;
+        foreach (var (s, col) in lines) { T(f, new Vector2(org.X + pad, y), s, fs, col, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u)); y += lh; }
+    }
+
+    // Arcane witch "Conduit" mark glyph — a node with four conduit prongs + a bright core (built from circles/lines; the
+    // build's DrawColoredPolygon triangulation is unreliable, so no polygons).
+    private void DrawConduit(Vector2 c, float r, Color col)
+    {
+        DrawCircle(c, r + 2f, new Color(0, 0, 0, 0.5f));                       // dark backing for contrast
+        for (int i = 0; i < 4; i++)
+        {
+            float a = i * Mathf.Pi / 2f + Mathf.Pi / 4f;
+            var d = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+            DrawLine(c + d * r * 0.7f, c + d * r * 1.9f, new Color(col.R, col.G, col.B, 0.9f), Mathf.Max(1.5f, r * 0.26f));   // conduit prongs
+        }
+        DrawCircle(c, r, col);
+        DrawCircle(c, r * 0.42f, new Color(1f, 0.98f, 1f, 0.95f));            // bright core
+    }
+
+    // Divine Intervention glyph — a radiant halo ring with a cross inside + a bright core (cheat-death charge).
+    private void DrawHalo(Vector2 c, float r, Color col)
+    {
+        DrawCircle(c, r + 2.5f, new Color(0, 0, 0, 0.45f));                                  // dark backing for contrast
+        float pulse = 0.75f + 0.25f * Mathf.Sin(Time.GetTicksMsec() * 0.005f);
+        DrawArc(c, r * 1.35f, 0f, Mathf.Tau, 28, new Color(col.R, col.G, col.B, 0.5f * pulse), Mathf.Max(1f, r * 0.14f));   // outer glow ring
+        DrawArc(c, r, 0f, Mathf.Tau, 28, new Color(col.R, col.G, col.B, 0.95f), Mathf.Max(1.5f, r * 0.2f));                // the halo
+        var cr = new Color(1f, 0.98f, 0.85f, 0.95f); float a = r * 0.62f, cw = Mathf.Max(1.5f, r * 0.2f);
+        DrawLine(c + new Vector2(0, -a), c + new Vector2(0, a * 0.9f), cr, cw);              // cross — vertical
+        DrawLine(c + new Vector2(-a * 0.62f, -a * 0.12f), c + new Vector2(a * 0.62f, -a * 0.12f), cr, cw);   // cross — horizontal (high bar)
+        DrawCircle(c, r * 0.17f, new Color(1f, 1f, 0.92f, 0.98f));                           // bright core
+    }
+
+    // Divine Intervention tracker for the local Divine witch — a row of halo glyphs (cheat-death charges) near the reticle.
+    private void DrawInterventionTracker(Vector2 vp, float u, Player p)
+    {
+        int n = p.Interventions;
+        var col = DamageTypes.Col(DamageType.Holy);
+        float r = 7f * u, gap = 24f * u;
+        float cx = vp.X * 0.5f - (n - 1) * gap * 0.5f, cy = vp.Y * 0.5f - 74f * u;   // (FIX) moved ABOVE the crosshair — was +68u, overlapping the spell-combo/finisher pip row below
+        T(_body, new Vector2(0, cy - 24f * u), n == 1 ? "INTERVENTION" : $"INTERVENTIONS  {n}", 11f * u, new Color(col.R, col.G, col.B, 0.8f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+        for (int i = 0; i < n; i++) DrawHalo(new Vector2(cx + i * gap, cy), r, col);
+    }
+
+    // Conduit tracker for the local Arcane witch — filled/empty node slots below the crosshair (max 4).
+    private void DrawConduitTracker(Vector2 vp, float u, Player p)
+    {
+        int have = p.ArcaneMarkCount;
+        if (have <= 0) return;   // (OVERHAUL) marks are uncapped now — nothing to show when none are live
+        var col = DamageTypes.Col(DamageType.Arcane);
+        float r = 6f * u, gap = 22f * u;
+        int shown = Mathf.Min(have, 12);   // cap the ICONS (not the marks) so a huge chain doesn't span the screen
+        float cx = vp.X * 0.5f - (shown - 1) * gap * 0.5f, cy = vp.Y * 0.5f + 48f * u;
+        T(_body, new Vector2(0, cy - 22f * u), $"CONDUITS  {have}", 11f * u, new Color(col.R, col.G, col.B, 0.8f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+        for (int i = 0; i < shown; i++) DrawConduit(new Vector2(cx + i * gap, cy), r, col);
+    }
+
+    // TEMP gamepad diagnostic — shows what Godot actually receives from the controller. Toggle with F3 (Game.PadDebug).
+    private void DrawPadDebug(Vector2 vp, float u)
+    {
+        float x = vp.X - 340 * u, y = 96 * u, lh = 19 * u;
+        DrawRect(new Rect2(x - 12 * u, y - 22 * u, 344 * u, 232 * u), new Color(0, 0, 0, 0.74f));
+        var pads = Input.GetConnectedJoypads();
+        void L(string s, Color col) { T(_body, new Vector2(x, y), s, 13 * u, col, HorizontalAlignment.Left, -1, Mathf.RoundToInt(1 * u)); y += lh; }
+        L("GAMEPAD DEBUG  (F3 to hide)", Gold);
+        L($"Connected joypads: {pads.Count}", pads.Count > 0 ? new Color(0.5f, 1f, 0.5f) : new Color(1f, 0.5f, 0.5f));
+        foreach (var id in pads) L($"  #{id}: {Input.GetJoyName(id)}", new Color(0.8f, 0.85f, 1f));
+        if (pads.Count == 0) L("  nothing detected (Parsec? focus?)", new Color(1f, 0.72f, 0.4f));
+        else
+        {
+            int d = pads[0];
+            L($"L stick: {Input.GetJoyAxis(d, JoyAxis.LeftX):0.00}, {Input.GetJoyAxis(d, JoyAxis.LeftY):0.00}", Colors.White);
+            L($"R stick: {Input.GetJoyAxis(d, JoyAxis.RightX):0.00}, {Input.GetJoyAxis(d, JoyAxis.RightY):0.00}", Colors.White);
+            L($"LT / RT: {Input.GetJoyAxis(d, JoyAxis.TriggerLeft):0.00} / {Input.GetJoyAxis(d, JoyAxis.TriggerRight):0.00}", Colors.White);
+            var btns = new (JoyButton b, string n)[] { (JoyButton.A, "A"), (JoyButton.B, "B"), (JoyButton.X, "X"), (JoyButton.Y, "Y"), (JoyButton.LeftShoulder, "LB"), (JoyButton.RightShoulder, "RB"), (JoyButton.LeftStick, "L3"), (JoyButton.RightStick, "R3"), (JoyButton.Back, "Back"), (JoyButton.Start, "Start"), (JoyButton.DpadUp, "U"), (JoyButton.DpadDown, "D"), (JoyButton.DpadLeft, "L"), (JoyButton.DpadRight, "R") };
+            string pressed = "";
+            foreach (var (b, n) in btns) if (Input.IsJoyButtonPressed(d, b)) pressed += n + " ";
+            L($"Buttons: {(pressed == "" ? "(none)" : pressed)}", new Color(1f, 0.9f, 0.5f));
+        }
+        L($"PadActive={Game.PadActive}  SpellHeld={Game.PadSpellHeld()}", new Color(0.7f, 1f, 0.9f));
     }
 
     public override void _Draw()
@@ -370,11 +786,42 @@ public partial class Hud : Control
         float m = 22 * u;
         var p = g.Player;
 
+        if (Game.PadDebug) DrawPadDebug(vp, u);   // gamepad diagnostic (F3)
+
         if (g.State == GameState.Lobby) return;
         if (g.State == GameState.CharSelect) { DrawToast(g, vp, u); return; }   // the CharSelect Control node draws the roster now
 
-        T(_head, new Vector2(m, m + 24 * u), $"Wave {g.Wave}", 26 * u, Gold, HorizontalAlignment.Left, -1, Mathf.RoundToInt(3 * u));
-        T(_body, new Vector2(m, m + 50 * u), $"{g.Score} banished", 15 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
+        // (NEW) full-screen damage feedback — red vignette on hits, a pulsing alarm while low, a cyan flash when the shield breaks
+        if (p != null)
+        {
+            if (p.HurtFlash > 0.001f) Vignette(vp, new Color(0.92f, 0.06f, 0.09f), p.HurtFlash);
+            if (p.LowHp) { float lp = 0.30f + 0.28f * Mathf.Sin((float)Time.GetTicksMsec() * 0.006f); Vignette(vp, new Color(0.85f, 0.04f, 0.06f), lp); }
+            if (p.ShieldBreakT > 0.001f) Vignette(vp, new Color(0.42f, 0.78f, 1f), Mathf.Clamp(p.ShieldBreakT / 0.6f, 0f, 1f) * 0.7f);
+        }
+
+        // (CONTINUOUS) top-left: shrines found (replaces the wave counter) + the run score
+        int shrDone = g.ShrinesDone;
+        string shrStr = $"{shrDone}/{Game.ShrinesTotal} SHRINES";
+        T(_head, new Vector2(m, m + 24 * u), shrStr, 24 * u, shrDone >= Game.ShrinesTotal ? new Color(1f, 0.86f, 0.35f) : Gold, HorizontalAlignment.Left, -1, Mathf.RoundToInt(3 * u));
+        T(_body, new Vector2(m, m + 50 * u), $"{g.Score} score", 15 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
+
+        // (CONTINUOUS) DIFFICULTY meter — a climbing tier + escalating name + intensifying colour + a bar filling within the band
+        {
+            float d = g.Difficulty;
+            int bi = 0; for (int i = DiffBands.Length - 1; i >= 0; i--) if (d >= DiffBands[i].t) { bi = i; break; }
+            var band = DiffBands[bi];
+            float lo = band.t, hi = bi < DiffBands.Length - 1 ? DiffBands[bi + 1].t : lo + 25f;
+            float frac = Mathf.Clamp((d - lo) / Mathf.Max(0.01f, hi - lo), 0f, 1f);
+            var hc = band.col;
+            if (bi >= DiffBands.Length - 3) { float pz = 0.72f + 0.28f * Mathf.Sin((float)Time.GetTicksMsec() * 0.008f); hc = new Color(hc.R * pz + (1 - pz), hc.G * pz, hc.B * pz + (1 - pz) * 0.5f, 1f); }   // top bands seethe
+            var ssz = _head.GetStringSize(shrStr, HorizontalAlignment.Left, -1, Mathf.RoundToInt(24 * u));
+            float hx = m + ssz.X + 26 * u, hw = 150 * u, hh = 13 * u;
+            T(_body, new Vector2(hx, m + 10 * u), $"DIFFICULTY  ·  tier {Mathf.FloorToInt(d)}", 12 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(1 * u));
+            DrawRect(new Rect2(hx, m + 12 * u, hw, hh), new Color(0, 0, 0, 0.5f));
+            DrawRect(new Rect2(hx, m + 12 * u, hw * frac, hh), hc);
+            Frame(new Rect2(hx, m + 12 * u, hw, hh), new Color(hc.R, hc.G, hc.B, 0.75f), Mathf.Max(1f, u));
+            T(_body, new Vector2(hx + hw + 8 * u, m + 23 * u), band.name, 14 * u, hc, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
+        }
 
         if (g.Goblin != null && GodotObject.IsInstanceValid(g.Goblin))
         {
@@ -384,15 +831,25 @@ public partial class Hud : Control
             T(_head, new Vector2(0f, m + 24 * u), gtxt, 18 * u, gc, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
         }
 
-        // Gold (persists across runs)
+        // Gold (persists across runs) + Souls (per-run) \u2014 one row, LEFT of the minimap (souls sits to the RIGHT of gold)
         var goldCol = new Color(1f, 0.82f, 0.32f);
-        T(_head, new Vector2(vp.X - 230 * u, m), $"\u29c9 {g.Gold}", 22 * u, goldCol, HorizontalAlignment.Right, 210 * u, Mathf.RoundToInt(3 * u));
+        var soulCol = new Color(0.72f, 0.56f, 1f);
+        float curRight = vp.X - 210 * u;                       // right edge of the pair \u2014 clears the top-right minimap (its left edge \u2248 vp.X - 198u after the +25% size bump)
+        float soulsW = 100 * u, goldW = 150 * u, curGap = 12 * u;
+        float soulsX = curRight - soulsW;
+        float goldX = soulsX - curGap - goldW;
+        T(_head, new Vector2(goldX, m), $"\u29c9 {g.Gold}", 22 * u, goldCol, HorizontalAlignment.Right, goldW, Mathf.RoundToInt(3 * u));
+        T(_head, new Vector2(soulsX, m + 2 * u), $"\u2620 {g.Souls}", 20 * u, soulCol, HorizontalAlignment.Right, soulsW, Mathf.RoundToInt(2 * u));   // (NEW) souls now ride the gold row (was tucked under gold, behind the minimap)
         if (g.GoldFlash > 0f)
-            T(_body, new Vector2(vp.X - 230 * u, m + 26 * u), $"+{g.LastWaveGold}", 15 * u, new Color(1f, 0.82f, 0.32f, Mathf.Clamp(g.GoldFlash, 0f, 1f)), HorizontalAlignment.Right, 210 * u, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(goldX, m + 26 * u), $"+{g.LastWaveGold}", 15 * u, new Color(1f, 0.82f, 0.32f, Mathf.Clamp(g.GoldFlash, 0f, 1f)), HorizontalAlignment.Right, goldW, Mathf.RoundToInt(2 * u));
 
-        // Day/night phase + countdown (top center)
-        var phaseCol = g.IsNight ? new Color(0.6f, 0.65f, 1f) : new Color(1f, 0.85f, 0.6f);
-        T(_head, new Vector2(0f, m), $"{g.PhaseName}  ·  {Mathf.CeilToInt(g.PhaseTimeLeft)}s", 16 * u, phaseCol, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        // Day/night phase + countdown (top center) — hidden inside the maze (the wave clock is paused there)
+        if (!g.InMaze)
+        {
+            var phaseCol = g.IsNight ? new Color(0.6f, 0.65f, 1f) : new Color(1f, 0.85f, 0.6f);
+            T(_head, new Vector2(0f, m), $"{g.PhaseName}  ·  {Mathf.CeilToInt(g.PhaseTimeLeft)}s", 16 * u, phaseCol, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        }
+        if (p != null && g.RitualActive) DrawRitual(g, vp, u);
         if (p != null && p.Minors.Count > 0) DrawMinors(p, vp, u, m);
 
         if (p != null) DrawVitals(p, vp, u, m);
@@ -405,6 +862,14 @@ public partial class Hud : Control
         }
         if (p != null && g.NetMgr != null && g.NetMgr.Active) DrawAllyRoster(g, vp, u);
         if (p != null) DrawDamageDir(p, c, vp, u);
+        if (p != null && g.WorldRunning) DrawThreats(p, c, vp, u);   // (NEW) incoming-projectile warnings
+        if (p != null)   // (NEW) big legible callouts the moment a layer of protection drops
+        {
+            if (p.ShieldBreakT > 0.001f)
+                T(_head, new Vector2(0, vp.Y * 0.34f), "SHIELD DOWN", 22 * u, new Color(0.62f, 0.86f, 1f, Mathf.Clamp(p.ShieldBreakT / 0.6f, 0f, 1f)), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            if (p.ArmorBreakT > 0.001f)
+                T(_head, new Vector2(0, vp.Y * 0.38f), "ARMOR BROKEN", 20 * u, new Color(1f, 0.62f, 0.45f, Mathf.Clamp(p.ArmorBreakT / 0.6f, 0f, 1f)), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        }
         if (p != null && p.HealFlash > 0f)
         {
             float ha = Mathf.Clamp(p.HealFlash / 0.5f, 0f, 1f) * 0.22f;
@@ -426,15 +891,23 @@ public partial class Hud : Control
         if (p != null && p.CrimsonWitch) DrawBloodStacks(p, c, vp, u);
         if (p != null && p.VerdantWitch) DrawEntStatus(p, c, vp, u);
         if (p != null) DrawEnemyBars(u);
+        if (p != null && p.ArcaneWitch && g.State == GameState.Playing) DrawConduitTracker(vp, u, p);   // (NEW) Arcane conduit-mark tracker under the crosshair
+        if (p != null && p.DivineWitch && p.Interventions > 0 && g.State == GameState.Playing) DrawInterventionTracker(vp, u, p);   // (NEW) Divine Intervention charges as halo glyphs near the reticle
         if (p != null && g.State == GameState.Playing) DrawMinimap(g, p, vp, u);
+        if (p != null && g.PlayerInHaunt && g.State == GameState.Playing) DrawHaunt(g, vp, u);   // (HAUNT) "in the zone" banner + break meter
         if (p != null) DrawRituals(u);
+        if (p != null && g.SummonerActive) DrawSummonerTimer(g, vp, u);   // (NERFER) the Summoning defend-timer
         if (p != null && g.InIntermission) DrawIntermission(g, vp, u);
         if (p != null && p.Downed) DrawDowned(g, vp, u);
         if (p != null && g.State == GameState.Playing && !g.WorldRunning) DrawWaiting(g, vp, u);
-        if (p != null && g.HoldEActive) DrawHoldE(g, vp, u);
+        if (p != null && g.HoldEActive && !g.HoldEIsRitual) DrawHoldE(g, vp, u);   // (NEW) rituals show their hold-E on the world panel (DrawRituals), not center-screen
+        else if (p != null && g.HoldEDisabled)   // greyed "can't use yet" note, no progress ring
+            T(_body, new Vector2(0, vp.Y * 0.62f), g.HoldEDisabledText, 16 * u, new Color(0.72f, 0.72f, 0.74f, 0.9f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
 
         DrawPops(u);
         DrawFlourish(u);
+
+        if (g.PerfOverlay) DrawPerf(_impact, u);
 
         if (_bannerT > 0)
         {
@@ -443,6 +916,7 @@ public partial class Hud : Control
         }
 
         if (g.State == GameState.LevelUp && g.Choices != null) DrawLevelUp(g, c, vp, u);
+        if (g.State == GameState.Attune && p != null) DrawAttune(g, p, vp, u);
         if (g.State == GameState.Swap && p != null) DrawSwap(g, p, c, vp, u);
         if (g.State == GameState.Stats && p != null) DrawStats(g, p, c, vp, u);
         if (g.State == GameState.Element && p != null) DrawElement(g, p, c, vp, u);
@@ -460,7 +934,7 @@ public partial class Hud : Control
             DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.72f));
             float top = vp.Y * 0.08f;
             T(_head, new Vector2(0f, top), "YOU FELL", 46 * u, new Color(0.95f, 0.4f, 0.45f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
-            T(_body, new Vector2(0f, top + 52 * u), $"Wave {g.Wave}  ·  {g.Score} banished  ·  best combo x{p?.BestCombo}", 17 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(0f, top + 52 * u), $"tier {g.Wave}  ·  {g.Score} score  ·  best combo x{p?.BestCombo}", 17 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
 
             // ---- scoreboard: one row per warden (solo = one). Kills come from the host's authoritative tally, not the personal block ----
             var pr = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<long, RunStats>>(g.AllStats);
@@ -534,7 +1008,7 @@ public partial class Hud : Control
         T(_head, new Vector2(0f, y + 11 * u), g.Toast, 16 * u, new Color(0.8f, 0.92f, 1f, a), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
     }
 
-    private static string UltName(Player.UltKind k) => k switch
+    public static string UltName(Player.UltKind k) => k switch
     {
         Player.UltKind.Eclipse => "Lunar Eclipse",
         Player.UltKind.LunarLight => "Lunar Light",
@@ -560,6 +1034,9 @@ public partial class Hud : Control
         Player.UltKind.MeteorDescent => "Meteor Descent",  // (NEW)
         Player.UltKind.WildfireRush => "Wildfire Rush",    // (NEW)
         Player.UltKind.PhoenixAscend => "Phoenix Ascendant",// (NEW)
+        Player.UltKind.ArcaneAscend => "Arcane Ascension",   // (NEW)
+        Player.UltKind.ArcaneEruption => "Arcane Eruption",  // (NEW)
+        Player.UltKind.ArcaneOvercharge => "Arcane Storm",     // (REWORK)
         _ => "—"
     };
 
@@ -589,8 +1066,37 @@ public partial class Hud : Control
         Player.UltKind.MeteorDescent => "Rise into the sky invulnerable and aim a landing zone with your reticle (5s, or auto-drop). SLAM down for massive damage — devastating at the core, fading to the rim — brand every foe there with a Living Bomb, and leave a 6s inferno that keeps stacking burn. Radius scales with AoE cards.",   // (NEW)
         Player.UltKind.WildfireRush => "Gain 3 flame dashes (press [Q]) for ~10s. Each dash blazes a long burning trail that stacks burn on foes for 10s — and every point of BURN damage heals you. Allies who run the trail gain move speed + a light heal (not you). Trails sized by AoE cards.",   // (NEW)
         Player.UltKind.PhoenixAscend => "Become a phoenix for ~10s: fly freely (Space up / Ctrl down), an immolation aura torches nearby foes, and your flamethrower turns free & huge. If you'd die during it, you're reborn in a fiery burst instead — once.",   // (NEW)
+        Player.UltKind.ArcaneAscend => "A bolt of raw arcane erupts you into the sky (flat-damaging everything ~5m around your launch) — then fly freely for ~10s (Space up / Ctrl down) and rain massive chain-lightning with [LMB] that strikes several foes at once and arcs to their neighbours (can crit). Kills heal you. Upgrades: more damage, more heal per kill, longer.",   // (NEW)
+        Player.UltKind.ArcaneEruption => "Release a huge burst of raw arcane around you — heavy damage that's strongest at the center and tapers to the rim (can crit). Survivors are flung back and knocked skyward, harder the closer they were. Bigger with AoE cards + tier.",   // (NEW)
+        Player.UltKind.ArcaneOvercharge => "Call down a large arcane storm at your cursor that rains bolts on every foe caught inside it for 13s. Bolts hit tougher foes harder (capped on bosses), can crit, and strike each foe once a second. Everything scales up as you upgrade it.",   // (REWORK)
         _ => ""
     };
+
+    // (REWORK) a row of pips = charges remaining on a Q-charge ult (Wind Rush / Flame Dash), auto-updating as you spend them
+    // a slim centered labelled progress bar (used for the rush spend-window + last-dash linger meters)
+    private void DrawMiniMeter(Vector2 vp, float u, float by, Color col, string label, float frac)
+    {
+        float bw = 170 * u, bh = 7 * u, bx = (vp.X - bw) / 2f;
+        DrawRect(new Rect2(bx - 1 * u, by - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.5f));
+        DrawRect(new Rect2(bx, by, bw * Mathf.Clamp(frac, 0f, 1f), bh), col);
+        Frame(new Rect2(bx, by, bw, bh), new Color(col.R, col.G, col.B, 0.8f), 1.2f * u);
+        T(_body, new Vector2(bx, by - 13 * u), label, 10.5f * u, col, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
+    }
+
+    private void DrawUltCharges(Vector2 vp, float u, float y, string label, int charges, Color col)
+    {
+        float by = y - 62 * u, r = 6.5f * u, gap = 20 * u;
+        int shown = Mathf.Clamp(charges, 0, 12);
+        float cx = vp.X * 0.5f - (Mathf.Max(1, shown) - 1) * gap * 0.5f;
+        T(_body, new Vector2(0, by - 15 * u), $"{label}  ×{charges}  ·  [Q]", 12 * u, col, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+        for (int i = 0; i < shown; i++)
+        {
+            var c = new Vector2(cx + i * gap, by);
+            DrawCircle(c, r + 1.5f * u, new Color(0, 0, 0, 0.5f));
+            DrawCircle(c, r, col);
+            DrawCircle(c, r * 0.42f, new Color(1f, 1f, 1f, 0.85f));
+        }
+    }
 
     private void DrawUlt(Player p, Vector2 vp, float u)
     {
@@ -603,29 +1109,39 @@ public partial class Hud : Control
         Frame(new Rect2(x, y, w, h), new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
         string tag = p.UltActive ? "  · ACTIVE" : (p.UltCharge >= 1f ? "  · READY [Q]" : "");
         T(_body, new Vector2(x, y - 16 * u), $"{UltName(p.Ult)}  (T{p.UltTier + 1}){tag}", 13 * u, new Color(col.R, col.G, col.B), HorizontalAlignment.Center, w, Mathf.RoundToInt(2 * u));
-        if (Game.I.BossTokens > 0f)
-            T(_body, new Vector2(x, y + 14 * u), $"\u25d0 {Game.I.BossTokens:0.#} tokens  ·  [U] altar", 12 * u, GoldDim, HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+        // (REMOVED) boss-token readout + [U] altar hint — ults are card-based now; tokens are deprecated
 
-        // Lunar Eclipse timer — refills on each kill (kills extend it); red so it reads as the blood moon
-        if (p.Ult == Player.UltKind.Eclipse && p.UltActive)
+        // (ULT METERS) generic ACTIVE-DURATION bar — shows for any timed ult that doesn't have a bespoke bar below
+        // (Stormform / Barkskin / Faith Shield draw their own). Covers Eclipse, Lunar Light, Divinity, Hurricane, etc.
+        bool hasBespoke = p.StormActive || p.BarkActive || (Game.I.Shield != null && GodotObject.IsInstanceValid(Game.I.Shield));
+        float durNow = Mathf.Max(p.UltActive ? p.UltActiveT : 0f, p.UltLingerT);   // active window OR the lingering fields (Blizzard/Judgement) — whichever is running (field ults keep a 1s UltActive flag alongside a long UltLingerT)
+        if (durNow > 0.05f && p.UltMax > 0.1f && !hasBespoke)
         {
+            bool ecl = p.Ult == Player.UltKind.Eclipse;
+            var dc = ecl ? new Color(0.92f, 0.92f, 1f) : DamageTypes.Col(p.WitchDamage);
+            float frac = Mathf.Clamp(durNow / Mathf.Max(0.01f, p.UltMax), 0f, 1f);
             float bw = 200 * u, bh = 9 * u, bx = (vp.X - bw) / 2f, by = y - 60 * u;
-            var rcol = new Color(0.85f, 0.12f, 0.14f);
-            DrawRect(new Rect2(bx - 1 * u, by - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.5f));
-            DrawRect(new Rect2(bx, by, bw * p.EclipseFrac, bh), rcol);
-            Frame(new Rect2(bx, by, bw, bh), new Color(rcol.R, rcol.G, rcol.B, 0.85f), 1.5f * u);
-            T(_body, new Vector2(bx, by - 15 * u), $"ECLIPSE  {Mathf.CeilToInt(p.EclipseTime)}s  ·  +crit", 12 * u, rcol, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
+            DrawRect(new Rect2(bx - 1 * u, by - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, ecl ? 0.85f : 0.5f));   // eclipse: darker trough
+            DrawRect(new Rect2(bx, by, bw * frac, bh), dc);
+            Frame(new Rect2(bx, by, bw, bh), new Color(dc.R, dc.G, dc.B, 0.85f), 1.5f * u);
+            string extra = ecl ? "  ·  blink · ×2 spd · +crit" : "";
+            T(_body, new Vector2(bx, by - 15 * u), $"{UltName(p.Ult).ToUpper()}  {Mathf.CeilToInt(durNow)}s{extra}", 12 * u, dc, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
         }
 
-        // Stormform timer (Gale) — wind-tinted countdown while the self-buff is up (NEW)
-        if (p.StormActive)
+        // (REWORK) charge readouts — Stormform (Wind Rush) & Wildfire Rush show CHARGES LEFT, plus a spend-window meter
+        // and a "last dash still burning" meter (the flame trail / wind area lingers after each dash).
+        bool rushWind = p.StormActive;
+        bool rushFire = p.Ult == Player.UltKind.WildfireRush && p.UltActive;
+        if (rushWind || rushFire)
         {
-            float bw = 200 * u, bh = 9 * u, bx = (vp.X - bw) / 2f, by = y - 60 * u;
-            var wcol = DamageTypes.Col(DamageType.Wind);
-            DrawRect(new Rect2(bx - 1 * u, by - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.5f));
-            DrawRect(new Rect2(bx, by, bw * p.StormFrac, bh), wcol);
-            Frame(new Rect2(bx, by, bw, bh), new Color(wcol.R, wcol.G, wcol.B, 0.85f), 1.5f * u);
-            T(_body, new Vector2(bx, by - 15 * u), $"STORMFORM  {Mathf.CeilToInt(p.StormTime)}s  ·  swift", 12 * u, wcol, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
+            var rcol = DamageTypes.Col(rushWind ? DamageType.Wind : DamageType.Ember);
+            DrawUltCharges(vp, u, y, rushWind ? "WIND RUSH" : "FLAME DASH", rushWind ? p.WindCharges : p.FlameCharges, rcol);
+            // spend-window meter — you must use your charges before this closes
+            if (p.RushWindowT > 0.05f)
+                DrawMiniMeter(vp, u, y - 46 * u, rcol, $"WINDOW  {Mathf.CeilToInt(p.RushWindowT)}s", p.RushWindowFrac);
+            // last-dash lingering field meter — how long the trail/area you just laid still burns
+            if (p.RushDashLingerT > 0.05f)
+                DrawMiniMeter(vp, u, y - 33 * u, rcol.Lerp(Colors.White, 0.3f), $"LAST DASH  {Mathf.CeilToInt(p.RushDashLingerT)}s", p.RushDashLingerFrac);
         }
 
         // Barkskin timer (Verdant) — green countdown so the player can read the thorns window; shows on every player's HUD since the ult barks the whole team
@@ -639,24 +1155,19 @@ public partial class Hud : Control
             T(_body, new Vector2(bx, by - 15 * u), $"BARKSKIN  {Mathf.CeilToInt(p.BarkTime)}s", 12 * u, gcol, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
         }
 
-        // Faith Shield HP bar
+        // Faith Shield duration bar (it can't be broken — it just counts down, then shatters)
         var sh = Game.I.Shield;
         if (sh != null && GodotObject.IsInstanceValid(sh))
         {
             float sw = 200 * u, sh2 = 9 * u, sxp = (vp.X - sw) / 2f, syp = y - 44 * u;
             DrawRect(new Rect2(sxp - 1 * u, syp - 1 * u, sw + 2 * u, sh2 + 2 * u), new Color(0, 0, 0, 0.5f));
-            DrawRect(new Rect2(sxp, syp, sw * Mathf.Clamp(sh.Hp / sh.MaxHp, 0f, 1f), sh2), col);
+            DrawRect(new Rect2(sxp, syp, sw * Mathf.Clamp(sh.Dur / Mathf.Max(0.01f, sh.DurMax), 0f, 1f), sh2), col);
             Frame(new Rect2(sxp, syp, sw, sh2), new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
-            T(_body, new Vector2(sxp, syp - 15 * u), $"FAITH SHIELD  {Mathf.CeilToInt(sh.Hp)}", 12 * u, new Color(col.R, col.G, col.B), HorizontalAlignment.Center, sw, Mathf.RoundToInt(1 * u));
+            T(_body, new Vector2(sxp, syp - 15 * u), $"FAITH SHIELD  {Mathf.CeilToInt(sh.Dur)}s", 12 * u, new Color(col.R, col.G, col.B), HorizontalAlignment.Center, sw, Mathf.RoundToInt(1 * u));
         }
 
         // Divine passive readout — Intervention pips
-        if (p.DivineWitch && p.Interventions > 0)
-        {
-            string pips = "";
-            for (int i = 0; i < p.Interventions; i++) pips += "\u271d ";
-            T(_body, new Vector2(x, y + (Game.I.BossTokens > 0f ? 28 * u : 14 * u)), $"Intervention {pips}", 12 * u, DamageTypes.Col(DamageType.Holy), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
-        }
+        // (Divine Intervention charges now render as drawn halo glyphs near the reticle \u2014 see DrawInterventionTracker.)
     }
 
     // (NEW) Self status-effect chips — ALWAYS drawn for the local player (unlike DrawUlt, which bails when no ult
@@ -665,6 +1176,7 @@ public partial class Hud : Control
     {
         var chips = new System.Collections.Generic.List<(string label, float t, Color col)>();
         if (p.BlessedT > 0f) chips.Add(("\u271d BLESSED", p.BlessedT, DamageTypes.Col(DamageType.Holy)));
+        if (p.VenomT > 0f) chips.Add(("\u2620 VENOM", p.VenomT, new Color(0.55f, 0.85f, 0.30f)));   // (NEW) phalanx arrow-poison \u2014 Blessed purges it
         if (p.EmberFervorActive) chips.Add(("EMBER FERVOR", p.EmberFervorT, DamageTypes.Col(DamageType.Ember)));   // (NEW) active fervor buff
         if (chips.Count == 0) return;
         float cw = 132 * u, chh = 26 * u, gap = 8 * u;
@@ -1003,11 +1515,7 @@ public partial class Hud : Control
         var col = DamageTypes.Col(DamageType.Lunar);
         float y = vp.Y * 0.16f;
         T(_head, new Vector2(0, y), $"NEXT WAVE IN  {Mathf.CeilToInt(g.WaveGap)}s", 26 * u, col, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
-        // enemy-director threat readout
-        float heat = g.Heat;
-        string tier = heat >= 1.45f ? "RAVENOUS" : heat >= 1.25f ? "RESTLESS" : heat >= 1.08f ? "STIRRING" : heat <= 0.92f ? "DROWSY" : "CALM";
-        var tcol = heat >= 1.25f ? new Color(1f, 0.45f, 0.4f) : heat >= 1.08f ? new Color(1f, 0.78f, 0.4f) : new Color(0.5f, 0.85f, 0.6f);
-        T(_body, new Vector2(0, y + 60 * u), $"the grove · {tier}  ({heat:0.00}x)", 13 * u, tcol, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+        // (the threat readout now lives permanently in the top-left THREAT meter — no centered "the grove · …" line here)
         float sh = g.SkipHoldFrac;
         if (sh > 0f)
         {
@@ -1061,21 +1569,31 @@ public partial class Hud : Control
         Frame(RPauseSens, new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
         T(_body, new Vector2(0, sy + bh + 4 * u), $"{Mathf.RoundToInt(sv * 100)}%", 13 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
 
-        // (NEW) Graphics quality preset — per-machine, for multiplayer performance
+        // (NEW) Graphics Quality + Shadows + Render Distance presets — three groups across, per-machine (matches the main-menu options)
         float qy = vp.Y * 0.56f;
-        T(_body, new Vector2(0, qy - 20 * u), "Graphics Quality", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
         string[] qlab = { "LOW", "MED", "HIGH" };
-        float qbw = 88 * u, qbh = 28 * u, qgap = 10 * u;
-        float qtot = 3 * qbw + 2 * qgap, qsx = vp.X / 2f - qtot / 2f;
-        for (int i = 0; i < 3; i++)
+        float qbw = 46 * u, qbh = 26 * u, qgap = 6 * u;
+        float grpW = 3 * qbw + 2 * qgap, colGap = 28 * u;
+        float totalW = 3 * grpW + 2 * colGap;
+        float x1 = vp.X / 2f - totalW / 2f, x2 = x1 + grpW + colGap, x3 = x2 + grpW + colGap;
+        T(_body, new Vector2(x1, qy - 18 * u), "Graphics", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(x2, qy - 18 * u), "Shadows", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(x3, qy - 18 * u), "Render Dist", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
+        void PresetRow(float sx, Rect2[] rects, int cur)
         {
-            var qr = new Rect2(qsx + i * (qbw + qgap), qy, qbw, qbh);
-            RPauseGfx[i] = qr;
-            bool sel = g.GfxQuality == i;
-            DrawRect(qr, sel ? new Color(col.R, col.G, col.B, 0.35f) : new Color(0, 0, 0, 0.4f));
-            Frame(qr, new Color(col.R, col.G, col.B, sel ? 0.9f : 0.5f), 1.5f * u);
-            T(_body, new Vector2(qr.Position.X, qy + 7 * u), qlab[i], 15 * u, sel ? new Color(col.R, col.G, col.B) : GoldDim, HorizontalAlignment.Center, qbw, Mathf.RoundToInt(2 * u));
+            for (int i = 0; i < 3; i++)
+            {
+                var qr = new Rect2(sx + i * (qbw + qgap), qy, qbw, qbh);
+                rects[i] = qr;
+                bool sel = cur == i;
+                DrawRect(qr, sel ? new Color(col.R, col.G, col.B, 0.35f) : new Color(0, 0, 0, 0.4f));
+                Frame(qr, new Color(col.R, col.G, col.B, sel ? 0.9f : 0.5f), 1.5f * u);
+                T(_body, new Vector2(qr.Position.X, qy + 6 * u), qlab[i], 13 * u, sel ? new Color(col.R, col.G, col.B) : GoldDim, HorizontalAlignment.Center, qbw, Mathf.RoundToInt(2 * u));
+            }
         }
+        PresetRow(x1, RPauseGfx, g.GfxQuality);
+        PresetRow(x2, RPauseShadow, g.ShadowQuality);
+        PresetRow(x3, RPauseView, g.ViewDist);
 
         // (NEW) per-effect toggles — damage numbers + post-processing (each independently overridable)
         float ty = vp.Y * 0.63f;
@@ -1175,6 +1693,145 @@ public partial class Hud : Control
         T(_body, new Vector2(0, vp.Y * 0.42f + 66 * u), "[U] or Esc to close", 14 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
     }
 
+    // (NEW) soft edge-hugging vignette faked with nested fading frames — used for hit / low-health / shield feedback
+    private void Vignette(Vector2 vp, Color col, float intensity)
+    {
+        intensity = Mathf.Clamp(intensity, 0f, 1f);
+        if (intensity <= 0.001f) return;
+        int bands = 7;
+        float maxW = Mathf.Min(vp.X, vp.Y) * 0.17f;
+        float bandW = maxW / bands;
+        for (int i = 0; i < bands; i++)
+        {
+            float t = i / (float)(bands - 1);                    // 0 outer → 1 inner
+            float inset = t * (maxW - bandW);
+            float a = intensity * (1f - t) * (1f - t) * 0.55f;   // strongest at the very edge, fading inward
+            if (a <= 0.002f) continue;
+            Frame(new Rect2(inset, inset, vp.X - inset * 2f, vp.Y - inset * 2f), new Color(col.R, col.G, col.B, a), bandW + 1f);
+        }
+    }
+
+    // (NEW) a bold chevron pinned to the screen edge, pointing toward a world direction relative to the player's camera.
+    // Drawn with a dark glow backing + black outline so it stays hard-to-miss against any scene.
+    private void EdgeArrow(Vector3 camFwd, Vector3 camRight, Vector3 worldDir, Vector2 c, float edgeR, float u, Color col, float sizeScale)
+    {
+        worldDir.Y = 0; if (worldDir.LengthSquared() < 0.001f) return; worldDir = worldDir.Normalized();
+        float ang = Mathf.Atan2(worldDir.Dot(camRight), worldDir.Dot(camFwd));
+        var pos = c + new Vector2(Mathf.Sin(ang), -Mathf.Cos(ang)) * edgeR;
+        float s = 27 * u * sizeScale;   // (BUFF) much bigger than before (was 18)
+        var dir = (pos - c).Normalized(); var perp = new Vector2(-dir.Y, dir.X);
+        DrawCircle(pos, s * 1.2f, new Color(0f, 0f, 0f, 0.35f * col.A));   // soft dark halo so it reads on bright terrain
+        SafePoly(new[] { pos + dir * s * 1.18f, pos - dir * s * 0.5f + perp * s * 1.18f, pos - dir * s * 0.5f - perp * s * 1.18f }, new Color(0f, 0f, 0f, 0.85f * col.A));   // black outline
+        var bright = new Color(col.R, col.G, col.B, Mathf.Min(1f, col.A + 0.3f));
+        SafePoly(new[] { pos + dir * s, pos - dir * s * 0.4f + perp * s, pos - dir * s * 0.4f - perp * s }, bright);   // bright fill
+    }
+
+    // (NEW) incoming-projectile warnings: pre-fire telegraphs on charging foes, plus predictive arrows / brackets /
+    // directional glow for any straight-line enemy bolt on a collision course with the local player. Everything is gated
+    // on the exact threat test (EnemyBolt.ThreatTo) so harmless fire whizzing past never clutters the screen.
+    private void DrawThreats(Player p, Vector2 c, Vector2 vp, float u)
+    {
+        var cam = p.Cam;
+        if (cam == null) return;
+        var basis = cam.GlobalTransform.Basis;
+        Vector3 camFwd = -basis.Z; camFwd.Y = 0; if (camFwd.LengthSquared() < 0.001f) return; camFwd = camFwd.Normalized();
+        Vector3 camRight = basis.X; camRight.Y = 0; camRight = camRight.Normalized();
+        Vector3 pp = p.GlobalPosition;
+        float edgeR = Mathf.Min(vp.X, vp.Y) * 0.40f;
+
+        // ---- ① pre-fire telegraph: mark ranged foes winding up a shot ----
+        int teleShown = 0;
+        foreach (var e in Game.I.Enemies)
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.Telegraphing) continue;
+            if (teleShown++ >= 6) break;
+            float tf = e.TeleFrac;
+            var tcol = new Color(1f, 0.75f, 0.2f, 0.5f + 0.45f * tf);
+            Vector3 wp = e.GlobalPosition + new Vector3(0, e.Radius + 1.2f, 0);
+            bool behind = cam.IsPositionBehind(wp);
+            Vector2 sp = behind ? Vector2.Zero : cam.UnprojectPosition(wp);
+            bool onScreen = !behind && sp.X >= 0 && sp.X <= vp.X && sp.Y >= 0 && sp.Y <= vp.Y;
+            if (onScreen)
+            {
+                float rr = Mathf.Lerp(22f, 9f, tf) * u;   // ring tightens as the shot charges
+                DrawArc(sp, rr, 0, Mathf.Tau, 20, tcol, 2f * u);
+                T(_head, new Vector2(sp.X - 40 * u, sp.Y - 13 * u), "!", 22 * u, tcol, HorizontalAlignment.Center, 80 * u, Mathf.RoundToInt(2 * u));
+            }
+            else EdgeArrow(camFwd, camRight, e.GlobalPosition - pp, c, edgeR, u, tcol, 0.8f);
+        }
+
+        // ---- diver / bat swoops: airborne BODY threats (no bolt) — warn like an incoming shot ----
+        foreach (var e in Game.I.Enemies)
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.Diving) continue;
+            var dcol = new Color(0.85f, 0.5f, 1f, 0.92f);   // diver purple
+            Vector3 wp = e.GlobalPosition;
+            bool behind = cam.IsPositionBehind(wp);
+            Vector2 sp = behind ? Vector2.Zero : cam.UnprojectPosition(wp);
+            bool onScreen = !behind && sp.X >= 0 && sp.X <= vp.X && sp.Y >= 0 && sp.Y <= vp.Y;
+            if (onScreen) { DrawArc(sp, 17 * u, 0, Mathf.Tau, 22, dcol, 2.5f * u); DrawArc(sp, 9 * u, 0, Mathf.Tau, 16, dcol, 1.5f * u); }
+            else EdgeArrow(camFwd, camRight, wp - pp, c, edgeR, u, dcol, 1.0f);
+        }
+
+        // ---- special infected (Taker): always-on locator, escalating to a loud GRAB warning while it charges ----
+        foreach (var e in Game.I.Enemies)
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.IsSpecial) continue;
+            bool charging = e.SpecialCharging;
+            var scol = charging ? new Color(1f, 0.28f, 0.32f, 0.95f) : new Color(0.78f, 0.35f, 0.92f, 0.7f);
+            float pulse = charging ? 0.6f + 0.4f * Mathf.Sin((float)Time.GetTicksMsec() * 0.02f) : 1f;
+            Vector3 wp = e.GlobalPosition + new Vector3(0, e.Radius + 1.6f, 0);
+            bool behind = cam.IsPositionBehind(wp);
+            Vector2 sp = behind ? Vector2.Zero : cam.UnprojectPosition(wp);
+            bool onScreen = !behind && sp.X >= 0 && sp.X <= vp.X && sp.Y >= 0 && sp.Y <= vp.Y;
+            if (onScreen)
+            {
+                float rr = (charging ? 26f : 15f) * u * pulse;
+                DrawArc(sp, rr, 0, Mathf.Tau, 26, scol, (charging ? 3f : 2f) * u);
+                T(_body, new Vector2(sp.X - 70 * u, sp.Y - rr - 15 * u), charging ? e.SpecialWarn : e.SpecialTag, (charging ? 18f : 12f) * u, scol, HorizontalAlignment.Center, 140 * u, Mathf.RoundToInt(2 * u));
+            }
+            else EdgeArrow(camFwd, camRight, wp - pp, c, edgeR, u, scol, charging ? 1.4f : 1.0f);
+        }
+
+        // ---- ②③④ in-flight bolts on a collision course ----
+        float urgentTti = 99f; Vector2 urgentEdge = c; bool anyUrgent = false;
+        int shown = 0;
+        foreach (var b in EnemyBolt.All)
+        {
+            if (b == null || !GodotObject.IsInstanceValid(b)) continue;
+            if (!b.ThreatTo(pp, out float tti, out float miss)) continue;
+            if (shown++ >= 10) break;
+            float a = Mathf.Clamp(1f - tti / 1.6f, 0.25f, 1f);   // closer = more opaque
+            var col = new Color(1f, 0.24f, 0.28f, a);
+            Vector3 bw = b.GlobalPosition;
+            bool behind = cam.IsPositionBehind(bw);
+            Vector2 sp = behind ? Vector2.Zero : cam.UnprojectPosition(bw);
+            bool onScreen = !behind && sp.X >= 0 && sp.X <= vp.X && sp.Y >= 0 && sp.Y <= vp.Y;
+            if (onScreen)
+            {
+                DrawArc(sp, 15 * u, 0, Mathf.Tau, 22, col, 2f * u);                         // ③ target bracket ring
+                float ir = 15f * u * Mathf.Clamp(tti / 1.2f, 0.12f, 1f);
+                DrawArc(sp, ir, 0, Mathf.Tau, 22, new Color(1f, 0.55f, 0.3f, a), 2f * u);   // closing ring = time to impact
+            }
+            else EdgeArrow(camFwd, camRight, bw - pp, c, edgeR, u, col, 0.85f + (1f - Mathf.Clamp(tti / 1.2f, 0f, 1f)) * 0.6f);   // ②
+
+            if (tti < urgentTti)
+            {
+                urgentTti = tti; anyUrgent = true;
+                Vector3 dd = bw - pp; dd.Y = 0;
+                if (dd.LengthSquared() > 0.001f) { dd = dd.Normalized(); float ang = Mathf.Atan2(dd.Dot(camRight), dd.Dot(camFwd)); urgentEdge = c + new Vector2(Mathf.Sin(ang), -Mathf.Cos(ang)) * edgeR; }
+            }
+        }
+
+        // ④ directional danger glow at the most urgent threat's screen edge, swelling in the last ~0.7s
+        if (anyUrgent && urgentTti < 0.7f)
+        {
+            float gi = 1f - urgentTti / 0.7f;
+            for (int k = 0; k < 4; k++)
+                DrawCircle(urgentEdge, (34 + k * 20) * u, new Color(1f, 0.12f, 0.14f, 0.10f * gi));
+        }
+    }
+
     private void DrawDamageDir(Player p, Vector2 c, Vector2 vp, float u)
     {
         if (p.DmgDirT <= 0f) return;
@@ -1196,20 +1853,52 @@ public partial class Hud : Control
         SafePoly(new[] { pos + dir * s, pos - dir * s * 0.4f + perp * s, pos - dir * s * 0.4f - perp * s }, col);
     }
 
+    // (NERFER Summoner) a top-centre defend objective: "DEFEND THE SUMMONING" + seconds + a draining bar, so the 45s isn't invisible
+    // (HAUNT) shown while the local player fights inside the hot-zone: a title + the break-meter you fill by killing here
+    private void DrawHaunt(Game g, Vector2 vp, float u)
+    {
+        var hc = new Color(0.95f, 0.42f, 0.78f);
+        float pulse = 0.6f + 0.4f * Mathf.Sin((float)Time.GetTicksMsec() * 0.006f);
+        float y = vp.Y * 0.165f;
+        T(_body, new Vector2(0, y), "☠  IN THE HAUNT  ☠", 16 * u, new Color(hc.R, hc.G, hc.B, 0.85f + 0.15f * pulse), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        float bw = 300 * u, bh = 9 * u, bx = vp.X / 2f - bw / 2f, by = y + 24 * u;
+        DrawRect(new Rect2(bx - 1.5f * u, by - 1.5f * u, bw + 3 * u, bh + 3 * u), new Color(0, 0, 0, 0.55f));
+        DrawRect(new Rect2(bx, by, bw * g.HauntFrac, bh), new Color(1f, 0.78f, 0.32f).Lerp(hc, 0.3f));
+        Frame(new Rect2(bx, by, bw, bh), new Color(hc.R, hc.G, hc.B, 0.8f), 1.3f * u);
+        T(_body, new Vector2(0, by + 12 * u), "break the haunt — kills here feed the meter", 11.5f * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+    }
+
+    private void DrawSummonerTimer(Game g, Vector2 vp, float u)
+    {
+        float tl = g.SummonerTimeLeft;
+        var col = NerfShrine.KindColor(NerfKind.Summoner);
+        float y = vp.Y * 0.11f;
+        T(_body, new Vector2(0, y), "DEFEND THE SUMMONING", 20 * u, col.Lerp(Colors.White, 0.3f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(0, y + 26 * u), $"{Mathf.CeilToInt(tl)}s", 26 * u, Colors.White, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        float bw = 260 * u, bh = 8 * u, bx = vp.X / 2f - bw / 2f, by = y + 62 * u;
+        DrawRect(new Rect2(bx - 1.5f * u, by - 1.5f * u, bw + 3 * u, bh + 3 * u), new Color(0, 0, 0, 0.55f));
+        DrawRect(new Rect2(bx, by, bw * Mathf.Clamp(tl / 45f, 0f, 1f), bh), col);
+    }
+
     private void DrawRituals(float u)
     {
         var cam = Game.I.Player?.Cam;
         if (cam == null) return;
+        var pp = Game.I.Player.GlobalPosition;
         foreach (var r in Game.I.Rituals)
         {
             if (r == null || r.Done || !IsInstanceValid(r)) continue;
-            var top = r.GlobalPosition + new Vector3(0, 6.5f, 0);
+            // (NEW) only show a circle's panel when you're within ~10u of its OUTSIDE edge \u2014 with 5\u00d7players rituals spread across
+            // the map, showing every one you glance toward would clog the HUD. Its minimap pin still guides you to it from afar.
+            if (new Vector2(r.GlobalPosition.X - pp.X, r.GlobalPosition.Z - pp.Z).Length() > r.Radius + 10f) continue;
+            var top = r.GlobalPosition + new Vector3(0, 3.2f, 0);   // (NEW) lowered (was 6.5) \u2014 sits near eye level so you don't crane up at the center pillar
             if (cam.IsPositionBehind(top)) continue;
             var sp = cam.UnprojectPosition(top);
             Color col = r.Type == RiteType.Ward ? DamageTypes.Col(DamageType.Lunar)
                       : r.Type == RiteType.Summon ? DamageTypes.Col(DamageType.Curse)
                       : DamageTypes.Col(DamageType.Holy);
-            float w = 158 * u, h = 44 * u;
+            bool inside = !r.Active && new Vector2(r.GlobalPosition.X - pp.X, r.GlobalPosition.Z - pp.Z).Length() <= r.Radius;   // (NEW) inside the ring \u2192 show the hold-E affordance
+            float w = 158 * u, h = (inside ? 62 : 44) * u;
             var box = new Rect2(sp.X - w / 2f, sp.Y - h, w, h);
             DrawRect(box, new Color(0.05f, 0.03f, 0.09f, 0.5f));     // see-through panel
             Frame(box, new Color(col.R, col.G, col.B, 0.85f), Mathf.Max(1.5f, 2f * u));
@@ -1217,16 +1906,30 @@ public partial class Hud : Control
             string title = r.Type == RiteType.Ward ? "WARDING RITE" : r.Type == RiteType.Summon ? "RITE OF SUMMONING" : "CLEANSING RITE";
             T(_body, new Vector2(box.Position.X, box.Position.Y + 13 * u), title, 11 * u, new Color(col.R, col.G, col.B), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
 
-            string info;
-            float pf;
-            if (!r.Active) { info = $"enter to begin  \u00b7  {Mathf.CeilToInt(r.SecondsLeft)}s"; pf = 0f; }
-            else if (r.Type == RiteType.Ward) { info = $"charging  {Mathf.RoundToInt(r.Status * 100)}%"; pf = r.Status; }
-            else if (r.Type == RiteType.Summon) { info = $"slay it  \u00b7  {Mathf.CeilToInt(r.SecondsLeft)}s"; pf = r.Status; }
-            else { info = $"{r.Killed}/{r.KillTarget}  \u00b7  {Mathf.CeilToInt(r.SecondsLeft)}s"; pf = Mathf.Clamp((float)r.Killed / Mathf.Max(1, r.KillTarget), 0f, 1f); }
-            T(_body, new Vector2(box.Position.X, box.Position.Y + 29 * u), info, 11 * u, Gold, HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
-
-            if (r.Active)
+            if (!r.Active)
+            {
+                // rituals are FREE now (souls come from Haunts) \u2014 show what the rite does; the hold-E prompt + fill appear BELOW once you're inside
+                string rsub = r.Type == RiteType.Ward ? "wards the grove" : r.Type == RiteType.Summon ? "summons a challenge" : "cleanse the horde";
+                T(_body, new Vector2(box.Position.X, box.Position.Y + 29 * u), rsub, 11 * u, new Color(col.R, col.G, col.B, 0.85f), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+                if (inside)
+                {
+                    T(_body, new Vector2(box.Position.X, box.Position.Y + 44 * u), "hold E to begin", 11 * u, new Color(0.95f, 0.92f, 0.8f), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+                    float pf = Game.I.HoldEIsRitual ? Game.I.HoldEFrac : 0f;
+                    float bw = w - 24 * u, bx = box.Position.X + 12 * u, by = box.Position.Y + h - 8 * u, bh = 5 * u;
+                    DrawRect(new Rect2(bx - 1 * u, by - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.55f));
+                    if (pf > 0f) DrawRect(new Rect2(bx, by, bw * pf, bh), col);
+                    Frame(new Rect2(bx, by, bw, bh), new Color(col.R, col.G, col.B, 0.7f), 1f * u);
+                }
+            }
+            else
+            {
+                string info; float pf;
+                if (r.Type == RiteType.Ward) { info = $"charging  {Mathf.RoundToInt(r.Status * 100)}%"; pf = r.Status; }
+                else if (r.Type == RiteType.Summon) { info = $"slay it  \u00b7  {Mathf.CeilToInt(r.SecondsLeft)}s"; pf = r.Status; }
+                else { info = $"{r.Killed}/{r.KillTarget}  \u00b7  {Mathf.CeilToInt(r.SecondsLeft)}s"; pf = Mathf.Clamp((float)r.Killed / Mathf.Max(1, r.KillTarget), 0f, 1f); }
+                T(_body, new Vector2(box.Position.X, box.Position.Y + 29 * u), info, 11 * u, Gold, HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
                 DrawRect(new Rect2(box.Position.X, box.Position.Y + h - 4 * u, w * Mathf.Clamp(pf, 0f, 1f), 4 * u), col);
+            }
         }
     }
 
@@ -1234,12 +1937,15 @@ public partial class Hud : Control
     {
         var cam = Game.I.Player?.Cam;
         if (cam == null) return;
+        ulong now = Time.GetTicksMsec();
         foreach (var e in Game.I.Enemies)
         {
             if (e == null || e.Dead || !IsInstanceValid(e)) continue;
             var head = e.GlobalPosition + new Vector3(0, e.Radius + 0.8f, 0);
             if (cam.IsPositionBehind(head)) continue;
-            if (Game.I.SightBlocked(cam.GlobalPosition, head)) continue;   // (NEW) don't draw bars through walls
+            // (PERF) the wall-occlusion test is a physics raycast — throttle it to ~15Hz per foe and reuse the cached result each draw
+            if (now >= e.PlateLosMs) { e.PlateLosMs = now + 66; e.PlateOccluded = Game.I.SightBlocked(cam.GlobalPosition, head); }
+            if (e.PlateOccluded) continue;   // (NEW) don't draw bars through walls
             var sp = cam.UnprojectPosition(head);
             float frac = e.MaxHp > 0 ? Mathf.Clamp(e.Hp / e.MaxHp, 0, 1) : 0;
             float w = Mathf.Clamp(e.Radius * 26f, 30f, 130f) * u;
@@ -1261,6 +1967,14 @@ public partial class Hud : Control
                 float pulse = 0.5f + 0.5f * Mathf.Sin((Time.GetTicksMsec() % 900) / 900f * Mathf.Tau);
                 IconLabel(_head, sp.X, y - 26f * u, true, $"x{e.LivingBombStacks}", 11f * u, new Color(1f, 0.5f + 0.4f * pulse, 0.15f), pulse);
             }
+            if (e.WardUp)   // (NEW) WARDED PHALANX: the ward bar sits under the health bar and IS the real fight
+            {
+                float wy = y + h + 1f * u, wh = 3.2f * u;
+                DrawRect(new Rect2(x - 1 * u, wy - 1 * u, w + 2 * u, wh + 2 * u), new Color(0, 0, 0, 0.6f));
+                float wf = e.WardFrac;
+                DrawRect(new Rect2(x, wy, w * wf, wh), new Color(0.62f, 0.48f, 1f).Lerp(new Color(1f, 0.35f, 0.42f), 1f - wf));
+                Frame(new Rect2(x, wy, w, wh), new Color(0.8f, 0.7f, 1f, 0.9f), Mathf.Max(1f, 1.1f * u));
+            }
             if (e.IsBoss)   // (NEW) aggression / heat meter — thin bar under the health bar
             {
                 float hy = y + h + 1f * u, hh = 2.2f * u;
@@ -1277,14 +1991,19 @@ public partial class Hud : Control
             }
             if (e.Label != "")
                 T(_body, new Vector2(x, y - 4 * u), e.Label, (e.IsBoss ? 12f : 10f) * u, e.Elite ? new Color(1f, 0.86f, 0.3f) : Gold, HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
-            string plate = e.PlateText();
-            if (plate != "")
-                T(_body, new Vector2(x, y - (e.Label != "" ? 15f : 4f) * u), plate, 8.5f * u, e.PlateColor(), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+            string tag = e.PlateTag();   // affix ICON + archetype WORD (e.g. "💢 Stunner")
+            if (tag != "")
+            {
+                float tfs = 10.5f * u, ty = y - (e.Label != "" ? 17f : 6f) * u;
+                var tw = _head.GetStringSize(tag, HorizontalAlignment.Left, -1, Mathf.RoundToInt(tfs));
+                T(_head, new Vector2(sp.X - tw.X / 2f, ty), tag, tfs, new Color(1f, 0.97f, 0.86f), HorizontalAlignment.Left, -1, Mathf.RoundToInt(1.5f * u));   // centered on the foe, NO width clip → never cut off
+            }
             float px = x, py = y + h + 3 * u, ps = 6 * u;
             void Pip(bool on, Color col) { if (on) { DrawRect(new Rect2(px, py, ps, ps), col); px += ps + 2 * u; } }
             Pip(e.SlowT > 0, DamageTypes.Col(DamageType.Frost));
             Pip(e.RootT > 0, DamageTypes.Col(DamageType.Nature));
             Pip(e.MarkT > 0, DamageTypes.Col(DamageType.Curse));
+            if (e.ArcaneMarked) DrawConduit(new Vector2(x - 11 * u, y + h * 0.5f), 6f * u, DamageTypes.Col(DamageType.Arcane));   // (NEW) CONDUIT — the chain-lightning arcs through it
         }
     }
 
@@ -1327,11 +2046,31 @@ public partial class Hud : Control
         }
     }
 
+    // maze-ritual banner: a 3:00 countdown while hunting the hidden statue, then a FLEE warning + veil-fill bar
+    private void DrawRitual(Game g, Vector2 vp, float u)
+    {
+        if (g.RitualVeil)
+        {
+            float a = 0.6f + 0.4f * Mathf.Sin(Time.GetTicksMsec() * 0.01f);
+            T(_head, new Vector2(0, vp.Y * 0.14f), "FLEE THE DARKNESS", 40 * u, new Color(0.85f, 0.35f, 1f, a), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
+            float bw = 300 * u, bx = vp.X * 0.5f - bw * 0.5f, by = vp.Y * 0.205f;
+            DrawRect(new Rect2(bx - 2 * u, by - 2 * u, bw + 4 * u, 10 * u + 4 * u), new Color(0, 0, 0, 0.5f));
+            Bar(bx, by, bw, 10 * u, g.RitualVeilFrac, new Color(0.55f, 0.12f, 0.65f));
+            return;
+        }
+        float t = Mathf.Max(0f, g.RitualTimeLeft);
+        int mm = (int)t / 60, ss = (int)t % 60;
+        var tc = t < 30f ? new Color(1f, 0.4f, 0.4f) : new Color(0.92f, 0.86f, 1f);
+        T(_head, new Vector2(0, vp.Y * 0.12f), $"RITUAL   {mm}:{ss:00}", 30 * u, tc, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
+        T(_body, new Vector2(0, vp.Y * 0.12f + 34 * u), "find the hidden statue", 15 * u, new Color(0.82f, 0.80f, 0.92f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+    }
+
     private void DrawAllyRoster(Game g, Vector2 vp, float u)
     {
         var allies = g.NetMgr.AllyAvatars();
         if (allies.Count == 0) return;
-        float w = 190 * u, x = vp.X - w - 12 * u, y = 92 * u;
+        // start BELOW the top-right minimap (centered at y=108u, radius 90u → bottom ≈198u) so the two don't overlap
+        float w = 190 * u, x = vp.X - w - 12 * u, y = 212 * u;
         float rowH = 42 * u, pad = 6 * u, bw = w - 2 * pad;
         float pulse = 0.5f + 0.5f * Mathf.Sin(Time.GetTicksMsec() * 0.012f);
         bool anyCrit = false;
@@ -1412,6 +2151,11 @@ public partial class Hud : Control
         Bar(bx + hShake, hpY, bw, bh, hf, hf > 0.35f ? Palette.Verdant : Palette.Blood);
         if (p.CrimsonWitch && rf > 0f) Frame(new Rect2(bx + hShake - 2 * u, hpY - 2 * u, bw + 4 * u, bh + 4 * u), rfBorder, Mathf.Max(2f, 2.5f * u));
         T(_body, new Vector2(bx + hShake + bw + 8 * u, hpY + bh * 0.78f), $"{Mathf.CeilToInt(p.Hp)}/{Mathf.RoundToInt(p.S.MaxHp)}", 13 * u, Gold, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
+        if (hf <= 0.20f && !p.Downed)   // (NEW) low-health: pulsing alarm frame around the HP bar
+        {
+            float lp = 0.45f + 0.45f * Mathf.Sin((float)Time.GetTicksMsec() * 0.011f);
+            Frame(new Rect2(bx + hShake - 3 * u, hpY - 3 * u, bw + 6 * u, bh + 6 * u), new Color(1f, 0.2f, 0.2f, 0.35f + 0.5f * lp), Mathf.Max(2f, 3f * u));
+        }
 
         if (!p.CrimsonWitch)   // Crimson casts on HP, not mana — no mana bar for her
         {
@@ -1540,6 +2284,115 @@ public partial class Hud : Control
         => (t == FinType.Fullmod && p != null) ? DamageTypes.Col(p.SecondaryType) : FinMeta.Col(t);
 
     // ===== card panel (typed + rarity-loud) =====
+    // a card mid-spin: no real face, a flickering rarity colour, streaking motion blur and a scrambling glyph. Reads as
+    // a slot reel whirling before it stops.
+    // deterministic per-cell rarity so the reel reads as a fixed strip of symbols scrolling past (not random noise)
+    private static int ReelTier(long m) { ulong h = (ulong)(m * 2654435761L); h ^= h >> 13; return (int)(h % 5UL); }
+
+    // A real slot reel: a vertical strip of witchy sigils scrolls UP through the card window, motion-blurred and
+    // decelerating with an easeOutBack detent bounce, a glowing payline across the middle, and reel-shading top/bottom.
+    private void DrawSpinningCard(Rect2 r, int idx, int finalTier, float u)
+    {
+        float t = _panelT, lockAt = RollLockAt(idx);
+        float frac = Mathf.Clamp(t / lockAt, 0f, 1f);
+        // easeOutBack — races, then overshoots the detent and settles back into it (the slot "ka-chunk")
+        float c1 = 1.9f, c3 = c1 + 1f, f1 = frac - 1f;
+        float eased = 1f + c3 * f1 * f1 * f1 + c1 * f1 * f1;
+        float speed = Mathf.Clamp((1f - frac) * (1f - frac), 0f, 1f);   // blur/stretch proxy: fast early, still at the end
+
+        float midY = r.Position.Y + r.Size.Y * 0.5f;
+        float spacing = 46f * u;
+        int cellsPassed = 30 + idx * 5;                 // total symbols that fly past before it stops
+        float scroll = cellsPassed * spacing * eased;   // final scroll lands exactly on a detent → a symbol dead-centre
+        long mCenter = (long)Mathf.Round(scroll / spacing);
+
+        // background window + a faint rarity wash that resolves toward the real colour as it slows
+        var rc = Rarities.Col((Rarity)Mathf.Clamp(ReelTier(mCenter), 0, 4)).Lerp(Rarities.Col((Rarity)Mathf.Clamp(finalTier, 0, 4)), frac);
+        DrawRect(r, new Color(0.05f, 0.045f, 0.08f, 0.97f));
+        DrawRect(r, new Color(rc.R, rc.G, rc.B, 0.10f));
+
+        float margin = 18f * u;
+        for (long o = -3; o <= 3; o++)
+        {
+            long m = mCenter + o;
+            float y = midY + (m * spacing - scroll);
+            if (y < r.Position.Y - spacing || y > r.Position.Y + r.Size.Y + spacing) continue;
+            // the symbol that ends up centred at the stop IS the real rarity; the strip resolves to it as it slows
+            int tier = (m == (long)cellsPassed) ? finalTier : ReelTier(m);
+            if (frac > 0.55f && o == 0) tier = finalTier;
+            float edgeFade = Mathf.Clamp((y - r.Position.Y) / margin, 0f, 1f) * Mathf.Clamp((r.Position.Y + r.Size.Y - y) / margin, 0f, 1f);
+            float vstretch = 1f + speed * 2.2f;   // smear along travel while fast
+            // motion-blur ghosts trailing DOWNward (symbols move up)
+            int ghosts = Mathf.RoundToInt(speed * 3f);
+            for (int gI = ghosts; gI >= 1; gI--)
+                DrawReelSymbol(r.Position.X + r.Size.X * 0.5f, y + gI * spacing * 0.42f * speed, 15f * u, vstretch, tier, m, 0.16f * edgeFade, t);
+            DrawReelSymbol(r.Position.X + r.Size.X * 0.5f, y, 15f * u, vstretch, tier, m, 0.95f * edgeFade, t);
+        }
+
+        // reel shading — dark gradient bands top & bottom fake the curve of a physical reel
+        int shN = 5;
+        for (int b = 0; b < shN; b++)
+        {
+            float a = 0.5f * (1f - b / (float)shN);
+            DrawRect(new Rect2(r.Position.X, r.Position.Y + b * 5f * u, r.Size.X, 5f * u), new Color(0.03f, 0.02f, 0.05f, a));
+            DrawRect(new Rect2(r.Position.X, r.Position.Y + r.Size.Y - (b + 1) * 5f * u, r.Size.X, 5f * u), new Color(0.03f, 0.02f, 0.05f, a));
+        }
+        // the PAYLINE — a glowing horizontal bar across the middle where the symbol locks in
+        float payGlow = 0.5f + 0.5f * Mathf.Sin(t * 12f);
+        var pc = Rarities.Col((Rarity)Mathf.Clamp(finalTier, 0, 4));
+        DrawRect(new Rect2(r.Position.X, midY - 2f * u, r.Size.X, 4f * u), new Color(pc.R, pc.G, pc.B, 0.28f + 0.22f * payGlow));
+        DrawLine(new Vector2(r.Position.X + 3 * u, midY), new Vector2(r.Position.X + r.Size.X - 3 * u, midY), new Color(1f, 0.95f, 0.8f, 0.35f + 0.3f * payGlow), 1.4f * u);
+        // little payline arrows pointing in from both edges
+        float ax = 8f * u;
+        SafePoly(new[] { new Vector2(r.Position.X, midY - ax), new Vector2(r.Position.X + ax, midY), new Vector2(r.Position.X, midY + ax) }, new Color(pc.R, pc.G, pc.B, 0.9f));
+        SafePoly(new[] { new Vector2(r.Position.X + r.Size.X, midY - ax), new Vector2(r.Position.X + r.Size.X - ax, midY), new Vector2(r.Position.X + r.Size.X, midY + ax) }, new Color(pc.R, pc.G, pc.B, 0.9f));
+
+        // anticipation: the frame brightens + the top/bottom bars flash as it's about to stop
+        float antic = Mathf.SmoothStep(0.55f, 1f, frac);
+        Frame(r, rc.Lerp(new Color(1f, 0.95f, 0.75f), antic * (0.4f + 0.6f * payGlow)), (3f + antic * 1.5f) * u);
+    }
+
+    // one witchy reel sigil — an outer bloom, a rarity gem/ring/crescent/star by seed, tinted to its rarity
+    private void DrawReelSymbol(float cx, float cy, float s, float vstretch, int tier, long seed, float alpha, float t)
+    {
+        if (alpha <= 0.01f) return;
+        var rc = Rarities.Col((Rarity)Mathf.Clamp(tier, 0, 4));
+        var c = new Vector2(cx, cy);
+        float sy = s * vstretch;
+        // soft bloom
+        DrawCircle(c, s * 1.35f, new Color(rc.R, rc.G, rc.B, 0.10f * alpha));
+        int kind = (int)(((ulong)(seed * 6364136223846793005L) >> 33) % 4UL);
+        var bright = rc.Lerp(Colors.White, 0.45f);
+        switch (kind)
+        {
+            case 0:   // gem — a tall diamond
+                SafePoly(new[] { new Vector2(cx, cy - sy), new Vector2(cx + s * 0.7f, cy), new Vector2(cx, cy + sy), new Vector2(cx - s * 0.7f, cy) }, new Color(rc.R, rc.G, rc.B, alpha));
+                SafePoly(new[] { new Vector2(cx, cy - sy * 0.5f), new Vector2(cx + s * 0.34f, cy), new Vector2(cx, cy + sy * 0.5f), new Vector2(cx - s * 0.34f, cy) }, new Color(bright.R, bright.G, bright.B, alpha));
+                break;
+            case 1:   // ring / arcane sigil
+                DrawArc(c, s * 0.85f, 0f, Mathf.Tau, 20, new Color(rc.R, rc.G, rc.B, alpha), 2.6f * (s / 15f), true);
+                DrawCircle(c, s * 0.28f, new Color(bright.R, bright.G, bright.B, alpha));
+                break;
+            case 2:   // crescent moon — bright disc with a dark bite offset
+                DrawCircle(c, s * 0.8f, new Color(rc.R, rc.G, rc.B, alpha));
+                DrawCircle(new Vector2(cx + s * 0.34f, cy - s * 0.12f), s * 0.72f, new Color(0.05f, 0.045f, 0.08f, alpha));
+                break;
+            default:  // 4-point star (two crossed diamonds)
+                float rot = t * 2f;
+                for (int q = 0; q < 2; q++)
+                {
+                    float a0 = rot + q * Mathf.Pi * 0.5f;
+                    var p0 = c + new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * sy;
+                    var p1 = c + new Vector2(Mathf.Cos(a0 + Mathf.Pi * 0.5f), Mathf.Sin(a0 + Mathf.Pi * 0.5f)) * (s * 0.4f);
+                    var p2 = c - new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * sy;
+                    var p3 = c - new Vector2(Mathf.Cos(a0 + Mathf.Pi * 0.5f), Mathf.Sin(a0 + Mathf.Pi * 0.5f)) * (s * 0.4f);
+                    SafePoly(new[] { p0, p1, p2, p3 }, new Color(rc.R, rc.G, rc.B, alpha));
+                }
+                DrawCircle(c, s * 0.22f, new Color(bright.R, bright.G, bright.B, alpha));
+                break;
+        }
+    }
+
     private void DrawCardPanel(Rect2 r, Rarity rar, string title, string typeLine, Color typeCol, string desc, string badge, bool hover, float u)
     {
         int tier = (int)rar;
@@ -1609,13 +2462,14 @@ public partial class Hud : Control
             DrawRect(new Rect2(bx - 3 * u, by + 78 * u, ts.X + 10 * u, 16 * u), new Color(typeCol.R, typeCol.G, typeCol.B, 0.9f));
             T(_body, new Vector2(bx + 2 * u, by + 90 * u), typeLine, 11 * u, new Color(0.06f, 0.04f, 0.09f), HorizontalAlignment.Left, -1, 0);
         }
-        TM(_body, new Vector2(bx, by + 110 * u), desc, 10.5f * u, new Color(0.88f, 0.86f, 0.94f), r.Size.X - 28 * u);
+        float descY = by + 110 * u;
+        TMFit(_body, new Vector2(bx, descY), desc, 10.5f * u, new Color(0.88f, 0.86f, 0.94f), r.Size.X - 28 * u, rb - descY - 8 * u);   // (NEW) auto-fit so long descriptions never clip off the card
     }
 
     public Rect2 CardRect(int i)
     {
         var vp = GetViewportRect().Size; float u = U;
-        int n = 3; float cw = 250 * u, chh = 172 * u, gap = 26 * u;
+        int n = 3; float cw = 250 * u, chh = 188 * u, gap = 26 * u;   // (NEW) taller so descriptions fit (TMFit shrinks only if still needed)
         float total = n * cw + (n - 1) * gap, sx0 = vp.X / 2f - total / 2f, cy = vp.Y * 0.34f;
         return new Rect2(sx0 + i * (cw + gap), cy, cw, chh);
     }
@@ -1625,6 +2479,11 @@ public partial class Hud : Control
         for (int i = 0; i < g.Choices.Count; i++) if (CardRect(i).HasPoint(pos)) return i;
         return -1;
     }
+
+    // (ATTRIBUTE pop-up) clickable node circles in the live perk-tree pop-up; returns the perk id clicked, or -1
+    private readonly System.Collections.Generic.List<(Vector2 c, float r, int id)> _attuneNodes = new();
+    public Rect2 AttuneDoneRect;
+    public int AttuneNodeAt(Vector2 pos) { foreach (var f in _attuneNodes) if (f.c.DistanceTo(pos) <= f.r + 3f) return f.id; return -1; }
 
     // level-up action buttons: a DISABLE button under each card, and REROLL / LUCKY REROLL below the row
     public Rect2 BanBtnRect(int i) { var r = CardRect(i); float u = U; return new Rect2(r.Position.X + r.Size.X * 0.12f, r.Position.Y + r.Size.Y + 5 * u, r.Size.X * 0.76f, 24 * u); }
@@ -1650,6 +2509,77 @@ public partial class Hud : Control
         return ("BLESSING", GoldDim);
     }
 
+    // (ATTRIBUTE pop-up) the live perk-tree: light owned nodes with attribute points; nodes glow as you buy them.
+    private void DrawAttune(Game g, Player p, Vector2 vp, float u)
+    {
+        DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0.02f, 0.02f, 0.04f, 0.82f));
+        var wcol = WitchModel.WitchColor(p.WitchIndex);
+        T(_head, new Vector2(0f, vp.Y * 0.045f), "ATTRIBUTE PERKS", 32 * u, wcol.Lerp(Gold, 0.3f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
+        T(_body, new Vector2(0f, vp.Y * 0.045f + 32 * u), $"{p.AttunePoints} point{(p.AttunePoints == 1 ? "" : "s")} to spend  —  light a glowing node (hover for detail)", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+
+        float gx0 = vp.X * 0.5f, gy0 = vp.Y * 0.52f;
+        float colStride = vp.X * 0.72f / 11f, rowStride = vp.Y * 0.62f / 6f;
+        Vector2 NP(int id) { var (cc, rr) = Perks.PosOf(id); return new Vector2(gx0 + (cc - 5.5f) * colStride, gy0 + (rr - 3f) * rowStride); }
+        var nodes = Perks.Nodes(p.WitchIndex);
+        var avail = new System.Collections.Generic.HashSet<int>(p.PerkAvailable());
+        var mouse = GetGlobalMousePosition();
+        float pulse = 0.6f + 0.4f * Mathf.Sin(Time.GetTicksMsec() * 0.006f);
+
+        // edges (curved), lit when both ends are activated
+        var bez = new Vector2[14];
+        foreach (var nd in nodes)
+        {
+            var a = NP(nd.Id);
+            foreach (int t in Perks.EdgesOf(nd.Id))
+            {
+                if (t < nd.Id) continue;
+                var b = NP(t);
+                bool live = p.PerkLit(nd.Id) && p.PerkLit(t);
+                var lc = live ? new Color(wcol.R, wcol.G, wcol.B, 0.85f) : new Color(0.28f, 0.26f, 0.34f, 0.5f);
+                var ctrl = new Vector2(b.X + (b.X - a.X) * 0.14f, a.Y * 0.4f + b.Y * 0.6f);
+                for (int k = 0; k < bez.Length; k++) { float s = k / (float)(bez.Length - 1), it = 1f - s; bez[k] = it * it * a + 2f * it * s * ctrl + s * s * b; }
+                DrawPolyline(bez, lc, (live ? 3f : 1.3f) * u, true);
+            }
+        }
+
+        // nodes
+        _attuneNodes.Clear();
+        PerkNode hover = null; Vector2 hoverAt = Vector2.Zero;
+        foreach (var nd in nodes)
+        {
+            var ctr = NP(nd.Id); float rad = (nd.Keystone ? 22f : 16f) * u;
+            bool lit = p.PerkLit(nd.Id), can = avail.Contains(nd.Id), owned = Perks.Owned(p.WitchIndex, nd.Id);
+            bool over = ctr.DistanceTo(mouse) <= rad + 3 * u;
+            if (over) { hover = nd; hoverAt = ctr; }
+            var ring = nd.Keystone ? Gold : wcol;
+            DrawCircle(ctr, rad + 2 * u, new Color(0, 0, 0, 0.5f));
+            if (lit) { DrawCircle(ctr, rad, new Color(ring.R * 0.4f, ring.G * 0.4f, ring.B * 0.4f, 1f)); DrawArc(ctr, rad, 0, Mathf.Tau, 30, ring, 3f * u, true); }
+            else if (can) { DrawCircle(ctr, rad, new Color(0.12f, 0.11f, 0.17f, 1f)); DrawArc(ctr, rad, 0, Mathf.Tau, 30, new Color(ring.R, ring.G, ring.B, over ? 1f : pulse), (over ? 3f : 2.4f) * u, true); DrawArc(ctr, rad + 4 * u, 0, Mathf.Tau, 30, new Color(ring.R, ring.G, ring.B, 0.35f * pulse), 1.4f * u, true); _attuneNodes.Add((ctr, rad, nd.Id)); }
+            else { DrawCircle(ctr, rad, new Color(0.07f, 0.065f, 0.1f, owned ? 1f : 0.75f)); DrawArc(ctr, rad, 0, Mathf.Tau, 24, new Color(ring.R, ring.G, ring.B, owned ? 0.4f : 0.16f), 1.4f * u, true); }
+            if (nd.Keystone) DrawCircle(ctr, rad * 0.28f, new Color(Gold.R, Gold.G, Gold.B, lit ? 1f : (can ? 0.7f : 0.35f)));
+            T(_body, new Vector2(ctr.X - 60 * u, ctr.Y + rad + 10 * u), nd.Name, 9.5f * u, lit ? Colors.White : (can ? new Color(0.88f, 0.84f, 0.7f) : new Color(0.5f, 0.48f, 0.56f)), HorizontalAlignment.Center, 120 * u, Mathf.RoundToInt(1 * u));
+        }
+
+        if (hover != null)
+        {
+            bool owned2 = Perks.Owned(p.WitchIndex, hover.Id);
+            float tw = 262 * u, th = 44 * u, tx = Mathf.Clamp(hoverAt.X + 16 * u, 6 * u, vp.X - tw - 6 * u), ty = Mathf.Clamp(hoverAt.Y - th / 2f, 6 * u, vp.Y - th - 6 * u);
+            var ring = hover.Keystone ? Gold : wcol;
+            DrawRect(new Rect2(tx - 2 * u, ty - 2 * u, tw + 4 * u, th + 4 * u), new Color(0, 0, 0, 0.9f));
+            DrawRect(new Rect2(tx, ty, tw, th), new Color(0.09f, 0.085f, 0.13f, 1f)); Frame(new Rect2(tx, ty, tw, th), ring, 1.5f * u);
+            T(_body, new Vector2(tx + 9 * u, ty + 8 * u), (hover.Keystone ? "★ " : "") + hover.Name, 12.5f * u, ring.Lerp(Colors.White, 0.3f), HorizontalAlignment.Left, tw - 14 * u, Mathf.RoundToInt(1 * u));
+            T(_body, new Vector2(tx + 9 * u, ty + 24 * u), owned2 ? hover.Desc : "not unlocked — buy it with gold on the coven page", 10.5f * u, owned2 ? new Color(0.88f, 0.84f, 0.7f) : GoldDim, HorizontalAlignment.Left, tw - 14 * u, Mathf.RoundToInt(1 * u));
+        }
+
+        // Done button
+        float bw = 220 * u, bh = 40 * u;
+        AttuneDoneRect = new Rect2(vp.X / 2f - bw / 2f, vp.Y - 62 * u, bw, bh);
+        bool dOver = AttuneDoneRect.HasPoint(mouse);
+        DrawRect(AttuneDoneRect, new Color(wcol.R * 0.25f, wcol.G * 0.25f, wcol.B * 0.25f, 0.95f));
+        Frame(AttuneDoneRect, new Color(wcol.R, wcol.G, wcol.B, dOver ? 1f : 0.8f), 1.8f * u);
+        T(_body, new Vector2(AttuneDoneRect.Position.X, AttuneDoneRect.Position.Y + 11 * u), "DONE  (Esc)", 16 * u, Colors.White, HorizontalAlignment.Center, bw, Mathf.RoundToInt(1 * u));
+    }
+
     private void DrawLevelUp(Game g, Vector2 c, Vector2 vp, float u)
     {
         DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.6f));
@@ -1672,18 +2602,41 @@ public partial class Hud : Control
         }
         T(_head, new Vector2(0f, vp.Y * 0.2f), title, 40 * u, titleCol, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
         T(_body, new Vector2(0f, vp.Y * 0.2f + 30 * u), sub, 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+
         var mouse = GetGlobalMousePosition();
         for (int i = 0; i < g.Choices.Count; i++)
         {
             var card = g.Choices[i]; var r = CardRect(i);
+            bool spinning = _rollActive && _panelT < RollLockAt(i);
+            if (spinning) { DrawSpinningCard(r, i, (int)card.Rarity, u); continue; }   // still whirling — no face, no buttons yet
+            // (NEW) lock PUNCH: a brief scale overshoot the instant this card slams to rest
+            float sinceLock = _panelT - RollLockAt(i);
+            if (_rollActive && sinceLock < 0.24f)
+            {
+                float k = Mathf.Sin(sinceLock / 0.24f * Mathf.Pi) * 0.07f;   // grow-then-settle
+                float ex = r.Size.X * k, ey = r.Size.Y * k;
+                r = new Rect2(r.Position.X - ex * 0.5f, r.Position.Y - ey * 0.5f, r.Size.X + ex, r.Size.Y + ey);
+            }
             var (typeLine, typeCol) = CategoryOf(card);
             DrawCardPanel(r, card.Rarity, card.Title, typeLine, typeCol, card.Desc, (i + 1).ToString(), r.HasPoint(mouse), u);
+            // (NEW) lock FLASH — a bright ring + wash bursts out the instant the reel stops, scaled by rarity
+            if (_rollActive && sinceLock < 0.30f)
+            {
+                float fk = sinceLock / 0.30f;
+                var fc = Rarities.Col(card.Rarity);
+                var ctr = new Vector2(r.Position.X + r.Size.X * 0.5f, r.Position.Y + r.Size.Y * 0.5f);
+                float ringR = Mathf.Lerp(r.Size.X * 0.2f, r.Size.X * (0.62f + 0.1f * (int)card.Rarity), fk);
+                DrawArc(ctr, ringR, 0f, Mathf.Tau, 28, new Color(fc.R, fc.G, fc.B, (1f - fk) * 0.8f), (3.5f - 3f * fk) * u, true);
+                DrawRect(r, new Color(1f, 0.97f, 0.85f, (1f - fk) * (0.10f + 0.06f * (int)card.Rarity)));   // white pop, brighter for rarer
+            }
+            if (RollBusy) continue;   // don't show the DISABLE button until the whole roll has settled
             // DISABLE button under each card (bans the whole rarity family for this run; not for uniques)
             var br = BanBtnRect(i); bool bcan = !card.Unique && g.Gold >= g.BanCost; bool bhov = br.HasPoint(mouse);
             var bcol = card.Unique ? new Color(0.25f, 0.25f, 0.28f, 0.7f) : (bhov && bcan ? new Color(0.72f, 0.2f, 0.2f, 0.96f) : (bcan ? new Color(0.5f, 0.16f, 0.16f, 0.85f) : new Color(0.32f, 0.14f, 0.14f, 0.7f)));
             DrawRect(br, bcol);
             T(_body, new Vector2(br.Position.X, br.Position.Y + 4 * u), card.Unique ? "UNIQUE" : $"DISABLE  {g.BanCost}g", 11 * u, Colors.White, HorizontalAlignment.Center, br.Size.X, Mathf.RoundToInt(1 * u));
         }
+        if (!RollBusy)
         {
             var rr = RerollBtnRect(); bool rcan = g.Gold >= g.RerollCost; bool rhov = rr.HasPoint(mouse);
             DrawRect(rr, rhov && rcan ? new Color(0.22f, 0.42f, 0.26f, 0.96f) : (rcan ? new Color(0.16f, 0.32f, 0.2f, 0.85f) : new Color(0.22f, 0.22f, 0.24f, 0.7f)));
@@ -1782,9 +2735,12 @@ public partial class Hud : Control
         DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0.02f, 0.01f, 0.05f, 0.86f));
         bool prim = g.PendingAttune == 0;
         bool brand = g.PendingAttune == 2;
-        T(_head, new Vector2(0f, vp.Y * 0.22f), brand ? "CURSEBRAND — 2ND CURSE TYPE" : (prim ? "ATTUNE — PRIMARY" : "ATTUNE — SECONDARY"), 34 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
-        T(_body, new Vector2(0f, vp.Y * 0.22f + 30 * u), brand ? "cursed foes will take your bonus damage from this type too" : (prim ? "choose a new element for your left-click" : "choose a new element for your charged right-click"), 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        var current = brand ? (p.CurseBonusType2 >= 0 ? (DamageType)p.CurseBonusType2 : DamageType.Curse) : (prim ? p.PrimaryType : p.SecondaryType);
+        bool graft = g.PendingAttune == 3;
+        string head = graft ? "GRAFTED ELEMENT — TREE-ENTS" : brand ? "CURSEBRAND — 2ND CURSE TYPE" : (prim ? "ATTUNE — PRIMARY" : "ATTUNE — SECONDARY");
+        string sub  = graft ? "your tree-ents' explosions will deal this element (and take on its look)" : brand ? "cursed foes will take your bonus damage from this type too" : (prim ? "choose a new element for your left-click" : "choose a new element for your charged right-click");
+        T(_head, new Vector2(0f, vp.Y * 0.22f), head, 34 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
+        T(_body, new Vector2(0f, vp.Y * 0.22f + 30 * u), sub, 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        var current = graft ? p.EntElement : brand ? (p.CurseBonusType2 >= 0 ? (DamageType)p.CurseBonusType2 : DamageType.Curse) : (prim ? p.PrimaryType : p.SecondaryType);
 
         var mouse = GetGlobalMousePosition();
         for (int i = 0; i < Game.Elements.Length; i++)
@@ -1878,7 +2834,7 @@ public partial class Hud : Control
         yR = Sec(rx, yR, "JOURNEY");
         yR = St(rx, yR, "Level", $"{p.Level}");
         yR = St(rx, yR, "Wave", $"{g.Wave}");
-        yR = St(rx, yR, "Banished", $"{g.Score}");
+        yR = St(rx, yR, "Score", $"{g.Score}");
 
         if (ttTitle != null) DrawTooltip(mouse, vp, ttTitle, ttBody, ttCol, u);
         T(_body, new Vector2(0f, vp.Y - 36 * u), "Tab to close", 15 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));

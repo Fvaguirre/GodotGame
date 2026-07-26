@@ -11,7 +11,9 @@ public static class EnemyKinds
 {
     public static readonly string[] Types =
         { "shade", "wisp", "brute", "caster", "flyer", "sieger", "healer", "zapper", "bomber", "goblin", "miniboss", "boss",
-          "sentinel", "diver", "hexer", "splitter", "totem", "spawnling", "wardbane", "swarmer", "taker" };
+          "sentinel", "diver", "hexer", "splitter", "totem", "spawnling", "wardbane", "swarmer", "taker",
+          "jtroll", "pigmy", "pigmydart", "ptero", "bat", "croc", "snake",   // (NEW) Rainforest jungle enemies, indices 21..27
+          "phalanx", "archer" };   // (NEW) the Warded Phalanx compound miniboss, indices 28..29 — APPEND ONLY; these indices go over the wire
 
     public static int Index(string t)
     {
@@ -39,18 +41,31 @@ public static class EnemyKinds
         16 => new Color(1f, 0.8f, 0.35f),        // totem
         17 => new Color(0.5f, 0.85f, 0.4f),      // spawnling
         18 => new Color(0.6f, 0.3f, 0.85f),      // wardbane
+        21 => new Color(0.28f, 0.42f, 0.24f),    // jungle troll
+        22 => new Color(0.75f, 0.6f, 0.35f),     // pigmy
+        23 => new Color(0.7f, 0.55f, 0.3f),      // pigmy dartblower
+        24 => new Color(0.55f, 0.75f, 0.85f),    // pteradactyl
+        25 => new Color(0.3f, 0.24f, 0.3f),      // bat
+        26 => new Color(0.4f, 0.55f, 0.3f),      // crocodile bomber
+        27 => new Color(0.5f, 0.8f, 0.35f),      // snake
+        28 => new Color(0.55f, 0.42f, 0.95f),    // phalanx ward-bearer
+        29 => new Color(0.70f, 0.58f, 1.0f),     // phalanx archer
         _ => new Color(0.54f, 0.47f, 0.84f),
     };
 
     public static float Radius(int idx) => idx switch
     {
         1 => 0.9f, 2 => 2.2f, 3 => 1.0f, 4 => 0.75f, 5 => 2.0f, 6 => 1.1f,
-        7 => 1.0f, 8 => 0.85f, 9 => 1.0f, 10 => 3.0f, 11 => 4.0f, _ => 1.3f,
+        7 => 1.0f, 8 => 0.85f, 9 => 1.0f, 10 => 3.0f, 11 => 4.0f,
+        21 => 2.2f, 22 => 0.8f, 23 => 0.85f, 24 => 1.0f, 25 => 0.7f, 26 => 1.6f, 27 => 0.7f,
+        28 => 2.8f, 29 => 1.05f,
+        _ => 1.3f,
     };
 
     public static string Label(int idx) => idx switch
     {
-        9 => "LOOT GOBLIN", 10 => "MINI-BOSS", 11 => "THE HOLLOW MOON", _ => "",
+        9 => "LOOT GOBLIN", 10 => "MINI-BOSS", 11 => "THE HOLLOW MOON",
+        28 => "WARD BEARER", 29 => "PHALANX ARCHER", _ => "",
     };
 }
 

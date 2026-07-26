@@ -47,27 +47,98 @@ public partial class Thornling : Node3D
     private const float Reach = 2.2f;
     private const float SightR = 30f;
 
-    public override void _Ready()
+    // Shared cute tree-ent visual — built by the live Thornling AND the Wild Swarm stampede critters so they always
+    // match. Constructs all meshes under `body`; hands back the sub-nodes that get animated (feet, arms, tuft, eyes,
+    // motes). Callers that don't animate can pass discards (out _). A round BARK body so it reads brown, not green.
+    public static void BuildEntBody(Node3D body, out Node3D footL, out Node3D footR, out Node3D armL, out Node3D armR, out Node3D tuft, out Node3D eyeL, out Node3D eyeR, out Node3D motes, bool detailed = true)
     {
-        var bark = Game.ToonEmissive(new Color(0.42f, 0.30f, 0.18f), 0.4f, 0.03f);
-        var leaf = Game.ToonEmissive(new Color(0.30f, 0.72f, 0.34f), 0.7f, 0.04f);
-        var glow = Game.ToonEmissive(new Color(0.55f, 1f, 0.5f), 1.6f, 0.02f);
-        _body = new Node3D();
-        AddChild(_body);
+        var bark = Game.ToonEmissive(new Color(0.44f, 0.30f, 0.17f), 0.28f, 0.03f);   // mid brown bark
+        var barkDark = Game.ToonEmissive(new Color(0.30f, 0.20f, 0.11f), 0.22f, 0.03f);   // knots / feet
+        var barkWarm = Game.ToonEmissive(new Color(0.57f, 0.41f, 0.24f), 0.30f, 0.03f);   // lighter belly / muzzle
+        var leaf = Game.ToonEmissive(new Color(0.30f, 0.70f, 0.34f), 0.6f, 0.04f);
+        var leafDk = Game.ToonEmissive(new Color(0.20f, 0.50f, 0.24f), 0.5f, 0.04f);
+        var glow = Game.ToonEmissive(new Color(0.65f, 1f, 0.55f), 2.2f, 0.02f);   // eye pupils
+        var white = Game.ToonEmissive(new Color(0.96f, 1f, 0.93f), 0.6f, 0f);     // sclera + eye highlight
+        var cheek = Game.ToonEmissive(new Color(1f, 0.55f, 0.45f), 0.5f, 0f);     // rosy cheeks
+        var flower = Game.ToonEmissive(new Color(1f, 0.82f, 0.35f), 1.4f, 0f);    // little bloom accent
         void Add(Node3D p, Mesh m, Material mat, Vector3 pos, Vector3 rotDeg = default)
         { var mi = new MeshInstance3D { Mesh = m, MaterialOverride = mat }; mi.Position = pos; mi.RotationDegrees = rotDeg; p.AddChild(mi); }
-        Add(_body, new CylinderMesh { TopRadius = 0.22f, BottomRadius = 0.3f, Height = 1.0f }, bark, new Vector3(0, 0.5f, 0));   // trunk
-        Add(_body, new SphereMesh { Radius = 0.55f, Height = 1.1f }, leaf, new Vector3(0, 1.25f, 0));                            // canopy
-        Add(_body, new SphereMesh { Radius = 0.36f, Height = 0.72f }, leaf, new Vector3(0.32f, 1.5f, 0.1f));
-        Add(_body, new SphereMesh { Radius = 0.32f, Height = 0.64f }, leaf, new Vector3(-0.3f, 1.45f, -0.1f));
-        Add(_body, new SphereMesh { Radius = 0.06f, Height = 0.12f }, glow, new Vector3(0.12f, 0.95f, 0.28f));                   // eyes
-        Add(_body, new SphereMesh { Radius = 0.06f, Height = 0.12f }, glow, new Vector3(-0.12f, 0.95f, 0.28f));
-        // stubby branch arms
-        _armL = new Node3D { Position = new Vector3(-0.28f, 0.75f, 0) }; _body.AddChild(_armL);
-        Add(_armL, new CylinderMesh { TopRadius = 0.06f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(0, -0.2f, 0), new Vector3(0, 0, 35));
-        _armR = new Node3D { Position = new Vector3(0.28f, 0.75f, 0) }; _body.AddChild(_armR);
-        Add(_armR, new CylinderMesh { TopRadius = 0.06f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(0, -0.2f, 0), new Vector3(0, 0, -35));
-        AddChild(new OmniLight3D { Position = new Vector3(0, 1.2f, 0), OmniRange = 4f, LightColor = new Color(0.4f, 0.9f, 0.4f), LightEnergy = 0.7f });
+        MeshInstance3D M(Node3D p, Mesh m, Material mat, Vector3 pos)
+        { var mi = new MeshInstance3D { Mesh = m, MaterialOverride = mat }; mi.Position = pos; p.AddChild(mi); return mi; }
+
+        // two stubby root-feet — animated for a little waddle
+        footL = new Node3D { Position = new Vector3(-0.2f, 0.14f, 0.02f) }; body.AddChild(footL);
+        Add(footL, new SphereMesh { Radius = 0.17f, Height = 0.3f }, barkDark, Vector3.Zero);
+        footR = new Node3D { Position = new Vector3(0.2f, 0.14f, 0.02f) }; body.AddChild(footR);
+        Add(footR, new SphereMesh { Radius = 0.17f, Height = 0.3f }, barkDark, Vector3.Zero);
+
+        // round bark body (torso + head in one lump) — this is the brown mass that fixes "too green"
+        M(body, new SphereMesh { Radius = 0.52f, Height = 1.04f }, bark, new Vector3(0, 0.74f, 0)).Scale = new Vector3(1f, 1.12f, 0.96f);
+        Add(body, new SphereMesh { Radius = 0.34f, Height = 0.6f }, barkWarm, new Vector3(0, 0.6f, 0.3f));      // lighter belly patch (two-tone)
+        if (detailed)
+        {
+            Add(body, new SphereMesh { Radius = 0.12f, Height = 0.24f }, barkDark, new Vector3(-0.35f, 0.98f, 0.12f));   // bark knots / grain
+            Add(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, barkDark, new Vector3(0.34f, 0.5f, 0.2f));
+        }
+
+        // cute face: big eyes (sclera + glowing pupil + highlight), rosy cheeks, a tiny mouth
+        eyeL = new Node3D { Position = new Vector3(-0.19f, 0.93f, 0.36f) }; body.AddChild(eyeL);
+        M(eyeL, new SphereMesh { Radius = 0.13f, Height = 0.26f }, white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
+        M(eyeL, new SphereMesh { Radius = 0.08f, Height = 0.16f }, glow, new Vector3(0.01f, -0.01f, 0.08f));
+        eyeR = new Node3D { Position = new Vector3(0.19f, 0.93f, 0.36f) }; body.AddChild(eyeR);
+        M(eyeR, new SphereMesh { Radius = 0.13f, Height = 0.26f }, white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
+        M(eyeR, new SphereMesh { Radius = 0.08f, Height = 0.16f }, glow, new Vector3(-0.01f, -0.01f, 0.08f));
+        if (detailed)
+        {
+            M(eyeL, new SphereMesh { Radius = 0.03f, Height = 0.06f }, white, new Vector3(0.045f, 0.05f, 0.13f));       // eye highlights
+            M(eyeR, new SphereMesh { Radius = 0.03f, Height = 0.06f }, white, new Vector3(-0.045f, 0.05f, 0.13f));
+            M(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, cheek, new Vector3(-0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
+            M(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, cheek, new Vector3(0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
+            M(body, new SphereMesh { Radius = 0.05f, Height = 0.1f }, barkDark, new Vector3(0, 0.75f, 0.44f)).Scale = new Vector3(1.5f, 0.7f, 0.6f);   // mouth
+        }
+
+        // leafy tuft "hair" — small so plenty of bark still shows; a sprig + bloom for cuteness
+        tuft = new Node3D { Position = new Vector3(0, 1.2f, 0) }; body.AddChild(tuft);
+        Add(tuft, new SphereMesh { Radius = 0.26f, Height = 0.5f }, leaf, new Vector3(0, 0.06f, 0));
+        Add(tuft, new SphereMesh { Radius = 0.2f, Height = 0.4f }, leafDk, new Vector3(0.2f, 0f, 0.06f));
+        if (detailed)
+        {
+            Add(tuft, new SphereMesh { Radius = 0.18f, Height = 0.36f }, leaf, new Vector3(-0.19f, 0.02f, -0.05f));
+            Add(tuft, new SphereMesh { Radius = 0.15f, Height = 0.3f }, leafDk, new Vector3(0.02f, 0.14f, -0.14f));
+            Add(tuft, new CylinderMesh { TopRadius = 0.015f, BottomRadius = 0.03f, Height = 0.28f }, barkWarm, new Vector3(0.06f, 0.28f, 0.02f), new Vector3(0, 0, -12));
+            Add(tuft, new SphereMesh { Radius = 0.07f, Height = 0.14f }, flower, new Vector3(0.03f, 0.42f, 0.03f));
+        }
+
+        // stubby branch arms with little leaf hands
+        armL = new Node3D { Position = new Vector3(-0.42f, 0.85f, 0) }; body.AddChild(armL);
+        Add(armL, new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(-0.1f, -0.18f, 0), new Vector3(0, 0, 32));
+        Add(armL, new SphereMesh { Radius = 0.13f, Height = 0.26f }, leaf, new Vector3(-0.22f, -0.36f, 0));
+        armR = new Node3D { Position = new Vector3(0.42f, 0.85f, 0) }; body.AddChild(armR);
+        Add(armR, new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(0.1f, -0.18f, 0), new Vector3(0, 0, -32));
+        Add(armR, new SphereMesh { Radius = 0.13f, Height = 0.26f }, leaf, new Vector3(0.22f, -0.36f, 0));
+
+        // a few drifting spore motes around its head (detail only)
+        motes = new Node3D { Position = new Vector3(0, 1.3f, 0) }; body.AddChild(motes);
+        if (detailed)
+            for (int i = 0; i < 3; i++) M(motes, new SphereMesh { Radius = 0.035f, Height = 0.07f }, glow, new Vector3(Mathf.Cos(i * 2.09f) * 0.4f, 0, Mathf.Sin(i * 2.09f) * 0.4f));
+    }
+
+    public override void _Ready()
+    {
+        _body = new Node3D();
+        AddChild(_body);
+        BuildEntBody(_body, out _footL, out _footR, out _armL, out _armR, out _tuft, out _eyeL, out _eyeR, out _motes);
+        AddChild(new OmniLight3D { Position = new Vector3(0, 1.0f, 0), OmniRange = 3.4f, LightColor = new Color(0.4f, 0.9f, 0.45f), LightEnergy = 0.5f });
+
+        // a persistent floating nameplate so allies (and you) can spot ents in a crowd
+        var plate = new Label3D {
+            Text = "Ent",
+            Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+            Modulate = new Color(0.62f, 1f, 0.62f),
+            OutlineModulate = new Color(0, 0, 0, 0.92f), OutlineSize = 8, FontSize = 30, PixelSize = 0.0058f,
+            NoDepthTest = true, RenderPriority = 9, Position = new Vector3(0, 2.75f, 0)
+        };
+        AddChild(plate);
 
         // Barkskin thorn shell (matches the player/avatar version, scaled to the ent). Hidden until the owner barks.
         _thorns = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.85f, Height = 1.7f } };
@@ -99,10 +170,12 @@ public partial class Thornling : Node3D
         }
         _thorns.Visible = false;
         AddChild(_thorns);
-        Game.AddFriendlySilhouette(this, new Color(0.4f, 0.95f, 0.45f), 0.5f, 1.5f, 0.95f);   // readable through walls like allies
+        // (was an x-ray silhouette here — removed: its green translucent shell washed out the new brown-bark body.
+        //  the floating "Ent" nameplate above now handles find-in-a-crowd instead.)
         if (!Ghost && Caster != null && GodotObject.IsInstanceValid(Caster))
         { MaxHp = Caster.S.MaxHp * 0.28f; Hp = MaxHp; }   // a fraction of the witch's HP — re-summoned ents scale as she levels
         BuildHpBar();
+        if (!Ghost && Caster != null && GodotObject.IsInstanceValid(Caster) && Caster.EntElementChosen) SetElement(Caster.EntElement);   // (NEW) inherit the witch's Grafted Element look
         if (!Ghost && Game.I != null && GD.Randf() < 0.12f) Say("LEEEEROOOOY JENKINS!", 3, new Color(1f, 0.85f, 0.4f));   // rare spawn warcry
     }
 
@@ -136,13 +209,61 @@ public partial class Thornling : Node3D
         var mat = (StandardMaterial3D)_hpFill.MaterialOverride;
         mat.AlbedoColor = new Color(Mathf.Lerp(0.95f, 0.45f, frac), Mathf.Lerp(0.25f, 0.9f, frac), 0.35f, 0.95f);
     }
-    private Node3D _armL, _armR;
+    private Node3D _armL, _armR, _footL, _footR, _tuft, _eyeL, _eyeR, _motes;
+    private float _moveAmt = 0f, _targetMove = 0f, _motePhase = 0f, _blink = 2f, _blinkPhase = 0f, _leafT = 3f;
 
     public void SetThorns(bool on) { if (_thorns != null && _thorns.Visible != on) _thorns.Visible = on; }
 
+    // (NEW) Grafted Element: give the ent a themed adornment on its head for the chosen damage type. Nature = the default
+    // look (no adornment). Rebuilt each call; rides the body so it turns with the ent.
+    private DamageType _element = DamageType.Nature; private bool _hasElement = false;
+    private Node3D _elemNode; private float _elemPhase = 0f;
+    public void SetElement(DamageType e)
+    {
+        _element = e; _hasElement = e != DamageType.Nature;
+        if (_elemNode != null && GodotObject.IsInstanceValid(_elemNode)) { _elemNode.QueueFree(); _elemNode = null; }
+        if (!_hasElement || _body == null) return;
+        var col = DamageTypes.Col(e);
+        var mat = Game.ToonEmissive(col, 2.6f, 0f);
+        _elemNode = new Node3D { Position = new Vector3(0, 1.75f, 0.05f) };
+        _body.AddChild(_elemNode);
+        if (e == DamageType.Ember)   // a flickering flame crest
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                float s = 0.22f - i * 0.05f;
+                var f = new MeshInstance3D { Mesh = new SphereMesh { Radius = s, Height = s * 2f }, MaterialOverride = mat };
+                f.Position = new Vector3(0, 0.18f + i * 0.16f, 0);
+                _elemNode.AddChild(f);
+            }
+        }
+        else if (e == DamageType.Frost)   // a crown of ice shards
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                float a = i / 4f * Mathf.Tau;
+                var c = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.08f, Height = 0.34f }, MaterialOverride = mat };
+                c.Position = new Vector3(Mathf.Cos(a) * 0.18f, 0.14f, Mathf.Sin(a) * 0.18f);
+                c.RotationDegrees = new Vector3(0, 0, Mathf.Cos(a) * 18f);
+                _elemNode.AddChild(c);
+            }
+        }
+        else   // a glowing orb + two orbiting motes (arcane / curse / holy / lunar / wind / blood)
+        {
+            var core = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.15f, Height = 0.3f }, MaterialOverride = mat };
+            core.Position = new Vector3(0, 0.2f, 0); _elemNode.AddChild(core);
+            for (int i = 0; i < 2; i++)
+            {
+                var b = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.07f, Height = 0.14f }, MaterialOverride = mat };
+                b.Position = new Vector3(i == 0 ? 0.22f : -0.22f, 0.24f, 0); _elemNode.AddChild(b);
+            }
+        }
+        _elemNode.AddChild(new OmniLight3D { OmniRange = 2.5f, LightColor = col, LightEnergy = 1.2f, Position = new Vector3(0, 0.2f, 0) });
+    }
+
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused (NEW)
         float dt = (float)delta;
         if (!Ghost && Fuse > 0f)   // Wild Swarm: count down and blow up on its own (unless detonated sooner)
         {
@@ -154,10 +275,11 @@ public partial class Thornling : Node3D
 
         if (Ghost)   // network copy: follow synced transform, play lunge from synced attacks
         {
+            _targetMove = GlobalPosition.DistanceTo(_gpos) > 0.06f ? 1f : 0f;
             GlobalPosition = GlobalPosition.Lerp(_gpos, Mathf.Clamp(dt * 12f, 0f, 1f));
             _phase += dt * 6f;
             _body.Rotation = new Vector3(0, Mathf.LerpAngle(_body.Rotation.Y, _gyaw, dt * 10f), 0);
-            AnimateBody();
+            AnimateBody(dt);
             UpdateHpBar(GhostHpFrac);
             return;
         }
@@ -173,7 +295,7 @@ public partial class Thornling : Node3D
             Say(GD.Randf() < 0.5f ? "For Motherrr!" : "Kill kill!", 1, new Color(0.6f, 0.95f, 0.5f));
 
         Vector3 goal;
-        bool combat = _tgt != null && GodotObject.IsInstanceValid(_tgt) && !_tgt.Dead;
+        bool combat = _tgt != null && GodotObject.IsInstanceValid(_tgt) && !_tgt.Dead && Game.I.MazeHasLoS(GlobalPosition, _tgt.GlobalPosition);   // drop the chase if it loses sight (maze hedges)
         if (combat) goal = _tgt.GlobalPosition;
         else
         {
@@ -200,11 +322,13 @@ public partial class Thornling : Node3D
         }
         else _phase += dt * 2f;
 
+        GlobalPosition = PushOutSolids(GlobalPosition);   // (NEW) minions collide with trees + structure walls too
         // follow the ground
         float gy = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y);
         GlobalPosition = new Vector3(GlobalPosition.X, Mathf.MoveToward(GlobalPosition.Y, gy, 12f * dt), GlobalPosition.Z);
 
-        AnimateBody();
+        _targetMove = dist > stop ? 1f : 0f;
+        AnimateBody(dt);
 
         if (combat && dist <= stop + _tgt.Radius && _atkCd <= 0f)
         {
@@ -241,14 +365,115 @@ public partial class Thornling : Node3D
         UpdateHpBar(HpFrac);
     }
 
-    // shared bob + attack-lunge animation (used by owner and ghost copies)
-    private void AnimateBody()
+    // shared cute animation set (used by owner and ghost copies): waddle walk, breathing, attack lunge, hurt squash,
+    // eye blinks, a swaying leaf tuft, drifting spore motes, and the occasional falling leaf.
+    private void AnimateBody(float dt)
     {
-        float bob = Mathf.Abs(Mathf.Sin(_phase)) * 0.12f;
+        if (_body == null) return;
+        _moveAmt = Mathf.MoveToward(_moveAmt, _targetMove, dt * 6f);
+        float walk = _moveAmt;
+        float bob = Mathf.Abs(Mathf.Sin(_phase)) * (0.05f + 0.08f * walk);
         float lunge = _atkAnim > 0f ? Mathf.Sin((1f - _atkAnim / 0.32f) * Mathf.Pi) : 0f;   // 0→1→0 thrust
-        if (_body != null) _body.Position = new Vector3(0, bob, -lunge * 0.55f);             // lunge forward (-Z)
-        if (_armL != null) _armL.Rotation = new Vector3(Mathf.Sin(_phase) * 0.5f - lunge * 1.3f, 0, 0.3f);
-        if (_armR != null) _armR.Rotation = new Vector3(-Mathf.Sin(_phase) * 0.5f - lunge * 1.3f, 0, -0.3f);
+        float hurt = _hurtPunch > 0f ? _hurtPunch / 0.15f : 0f;                              // 1→0 squash on a hit
+
+        // body: bob + forward lunge + gentle breathing + hurt squash + a little waddle roll
+        float breathe = 1f + 0.03f * Mathf.Sin(_phase * 0.9f);
+        float sqX = 1f + hurt * 0.22f, sqY = (1f - hurt * 0.28f) * breathe;
+        _body.Position = new Vector3(0, bob, -lunge * 0.5f);
+        _body.Scale = new Vector3(sqX, sqY, sqX);
+        _body.Rotation = new Vector3(lunge * 0.35f, _body.Rotation.Y, Mathf.Sin(_phase) * 0.06f * walk);
+
+        // feet: alternate step-lift while walking
+        if (_footL != null) _footL.Position = new Vector3(-0.2f, 0.14f + Mathf.Max(0f, Mathf.Sin(_phase)) * 0.12f * walk, 0.02f + Mathf.Cos(_phase) * 0.05f * walk);
+        if (_footR != null) _footR.Position = new Vector3(0.2f, 0.14f + Mathf.Max(0f, Mathf.Sin(_phase + Mathf.Pi)) * 0.12f * walk, 0.02f + Mathf.Cos(_phase + Mathf.Pi) * 0.05f * walk);
+
+        // arms swing while moving, then thrust on the attack lunge
+        float swing = Mathf.Sin(_phase) * 0.5f * (0.35f + walk);
+        if (_armL != null) _armL.Rotation = new Vector3(swing - lunge * 1.4f, 0, 0.3f);
+        if (_armR != null) _armR.Rotation = new Vector3(-swing - lunge * 1.4f, 0, -0.3f);
+
+        // leafy tuft sway
+        if (_tuft != null) _tuft.Rotation = new Vector3(Mathf.Sin(_phase * 0.8f) * 0.12f, 0, Mathf.Cos(_phase * 0.7f) * 0.12f);
+
+        // eye blink
+        _blink -= dt;
+        if (_blink <= 0f) { _blink = 2.5f + GD.Randf() * 3f; _blinkPhase = 0.16f; }
+        float eyeY = 1f;
+        if (_blinkPhase > 0f) { _blinkPhase -= dt; eyeY = Mathf.Lerp(1f, 0.12f, Mathf.Sin(Mathf.Clamp(_blinkPhase / 0.16f, 0f, 1f) * Mathf.Pi)); }
+        if (_eyeL != null) _eyeL.Scale = new Vector3(1f, eyeY, 1f);
+        if (_eyeR != null) _eyeR.Scale = new Vector3(1f, eyeY, 1f);
+
+        // drifting spore motes around the head
+        _motePhase += dt;
+        if (_motes != null) { int i = 0; foreach (var c in _motes.GetChildren()) if (c is MeshInstance3D mi) { float a = _motePhase * 1.3f + i * 2.1f; mi.Position = new Vector3(Mathf.Cos(a) * 0.42f, 0.05f + Mathf.Sin(a * 1.7f) * 0.08f, Mathf.Sin(a) * 0.42f); i++; } }
+
+        // an occasional leaf flutters off it
+        _leafT -= dt;
+        if (_leafT <= 0f) { _leafT = 2.5f + GD.Randf() * 3.5f; DropLeaf(); }
+
+        if (_elemNode != null && _hasElement)   // animate the Grafted-Element crest
+        {
+            _elemPhase += dt * 3.6f;
+            if (_element == DamageType.Ember)   // flicker the flame
+            {
+                int i = 0;
+                foreach (var c in _elemNode.GetChildren())
+                    if (c is MeshInstance3D mi) { float f = 0.85f + 0.28f * Mathf.Sin(_elemPhase * 9f + i * 1.3f); mi.Scale = new Vector3(f, 1.15f + 0.3f * Mathf.Sin(_elemPhase * 13f + i), f); i++; }
+            }
+            else _elemNode.Rotation = new Vector3(0, _elemPhase * 1.6f, 0);   // slow orbit for the others
+        }
+    }
+
+    // a small leaf flutters off and settles — purely cosmetic, runs locally on owner + ghosts
+    private void DropLeaf()
+    {
+        if (Game.I == null) return;
+        var mat = Game.ToonEmissive(GD.Randf() < 0.5f ? new Color(0.30f, 0.70f, 0.34f) : new Color(0.20f, 0.50f, 0.24f), 0.5f, 0.04f);
+        var leaf = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.06f, Height = 0.12f }, MaterialOverride = mat };
+        leaf.Scale = new Vector3(1.6f, 0.25f, 1f);
+        Game.I.AddChild(leaf);
+        var start = GlobalPosition + new Vector3((GD.Randf() - 0.5f) * 0.5f, 1.5f, (GD.Randf() - 0.5f) * 0.5f);
+        leaf.GlobalPosition = start;
+        leaf.Rotation = new Vector3(GD.Randf() * 3f, GD.Randf() * 6f, GD.Randf() * 3f);
+        var end = start + new Vector3((GD.Randf() - 0.5f) * 1.3f, -1.5f, (GD.Randf() - 0.5f) * 1.3f);   // flutter down + drift
+        var tw = leaf.CreateTween(); tw.SetParallel(true);
+        tw.TweenProperty(leaf, "global_position", end, 1.7f).SetEase(Tween.EaseType.InOut);
+        tw.TweenProperty(leaf, "rotation", leaf.Rotation + new Vector3(2f, 4f, 2f), 1.7f);
+        tw.TweenProperty(leaf, "scale", new Vector3(0.01f, 0.01f, 0.01f), 0.35f).SetDelay(1.35f);
+        tw.SetParallel(false);
+        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(leaf)) leaf.QueueFree(); }));
+    }
+
+    // (NEW) push the ent out of trees/pillars (Blockers) and structure walls (Decks) so minions can't ghost through
+    // them. Mirrors the enemy solid-collision; ~0.5 body radius. Ghost copies follow the synced (already-collided)
+    // position, so only the owner runs this.
+    private Vector3 PushOutSolids(Vector3 p)
+    {
+        var g = Game.I; if (g == null) return p;
+        const float r = 0.5f;
+        var bl = g.Blockers;
+        for (int i = 0; i < bl.Count; i++)
+        {
+            var b = bl[i];
+            float ox = p.X - b.Pos.X, oz = p.Z - b.Pos.Z;
+            float dd = Mathf.Sqrt(ox * ox + oz * oz);
+            float minD = b.Radius + r;
+            if (dd < minD) { float k = minD / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + ox * k; p.Z = b.Pos.Z + oz * k; }
+        }
+        var dk = g.Decks;
+        for (int i = 0; i < dk.Count; i++)
+        {
+            var d = dk[i];
+            if (d.TopY < 1.8f || p.Y >= d.TopY - 0.6f) continue;
+            float ex = d.Half.X + r, ez = d.Half.Y + r;
+            float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
+            if (Mathf.Abs(dx) < ex && Mathf.Abs(dz) < ez)
+            {
+                if (ex - Mathf.Abs(dx) < ez - Mathf.Abs(dz)) p.X = d.Center.X + Mathf.Sign(dx) * ex;
+                else p.Z = d.Center.Z + Mathf.Sign(dz) * ez;
+            }
+        }
+        return p;
     }
 
     private Enemy PickTarget()
@@ -257,6 +482,7 @@ public partial class Thornling : Node3D
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (!Game.I.MazeHasLoS(GlobalPosition, e.GlobalPosition)) continue;   // don't hunt what it can't see (grid LOS; no-ops outside the maze) — stops ents jamming into hedges
             float d = (e.GlobalPosition - GlobalPosition).LengthSquared();
             if (e.IsPoisoned && d < pd) { pd = d; poisoned = e; }
             if (d < nd) { nd = d; nearest = e; }
@@ -275,7 +501,8 @@ public partial class Thornling : Node3D
         if (!Ghost && Game.I != null && GD.Randf() < 0.4f) Say(GD.Randf() < 0.5f ? "Booomm!" : "Oooowww!", 2, new Color(0.5f, 0.9f, 0.5f));
         float dmg = Caster != null ? Caster.MinionBurst() : 60f;
         float rad = 5.5f * (Caster != null ? Caster.S.SpellArea : 1f);   // minion blast grows with spell area
-        var col = new Color(0.4f, 0.85f, 0.4f);
+        var dtype = Caster != null ? Caster.EntElement : DamageType.Nature;   // (NEW) Grafted Element — the blast's damage type
+        var col = DamageTypes.Col(dtype);
         int kills = 0;
         foreach (var e in Game.I.Enemies.ToArray())
         {
@@ -284,7 +511,8 @@ public partial class Thornling : Node3D
             {
                 float hit = dmg; bool dcrit = false;
                 if (Caster != null && GodotObject.IsInstanceValid(Caster)) hit = Caster.MinionStrike(dmg, out dcrit);   // crit + lifesteal per foe caught
-                e.Hurt(hit, DamageType.Nature, true, dcrit); e.HitFrom(GlobalPosition); e.Poison(Caster != null ? Caster.PoisonDps() : 4f, 4f); e.Root(1.6f); Caster?.ComboFromSource();
+                e.Hurt(hit, dtype, true, dcrit); e.HitFrom(GlobalPosition); e.Poison(Caster != null ? Caster.PoisonDps() : 4f, 4f); e.Root(1.6f); Caster?.ComboFromSource();
+                if (Caster != null && GodotObject.IsInstanceValid(Caster) && Caster.EntElementChosen) Caster.ApplyEntStatus(e, GlobalPosition);   // (NEW) element rider (burn/freeze/etc.)
                 if (e.Remote ? e.Hp <= hit : e.Dead) kills++;   // host: real death; client: estimate from the synced HP (so a client-Verdant's charged detonation also refunds)
             }   // the blast roots + feeds combo
         }
@@ -318,7 +546,8 @@ public partial class Thornling : Node3D
     private void Die()
     {
         if (_dead) return; _dead = true;
-        var col = new Color(0.5f, 0.78f, 0.42f);
+        var dtype = Caster != null ? Caster.EntElement : DamageType.Nature;   // (NEW) death pop also takes the Grafted Element
+        var col = DamageTypes.Col(dtype);
         float drad = 3.0f * (Caster != null ? Caster.S.SpellArea : 1f);
         // death throes: a WEAK pop on its own, deliberately a fraction of a charged detonation and with
         // no root/chain/crit/lifesteal — so actively detonating ents (full-charge right-click) stays the
@@ -330,7 +559,7 @@ public partial class Thornling : Node3D
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                 if (new Vector2(e.GlobalPosition.X - GlobalPosition.X, e.GlobalPosition.Z - GlobalPosition.Z).Length() < drad + e.Radius)
-                { e.Hurt(dpop, DamageType.Nature, true); e.HitFrom(GlobalPosition); e.Poison(Caster != null ? Caster.PoisonDps() * 0.5f : 2f, 3f); }
+                { e.Hurt(dpop, dtype, true); e.HitFrom(GlobalPosition); e.Poison(Caster != null ? Caster.PoisonDps() * 0.5f : 2f, 3f); if (Caster != null && Caster.EntElementChosen) Caster.ApplyEntStatus(e, GlobalPosition); }
             }
         }
         Game.I?.VfxRing(GlobalPosition, col, drad - 0.6f, 0.3f);            // smaller, dimmer than a detonation nova

@@ -12,6 +12,8 @@ public partial class SeedMine : Node3D
     public float Blast = 4.5f;       // explosion radius
     public bool Chain = false;       // legendary: detonating sets off nearby mines
     public float Poison = 0f;        // poison dps applied to foes in the blast
+    public float CloudPoison = 0f;   // (OVERHAUL) Spore Mines: poison cloud left where it detonates
+    public float CloudRadius = 0f;   // (OVERHAUL) raw radius — GroundField._Ready scales by SpellArea
     public float Life = 16f;         // mines linger a while, then wither
     public bool Remote = false;      // (NEW) visual-only copy on allies: shows + pops visually, deals no damage
     private float _arm = 0.45f;
@@ -40,7 +42,7 @@ public partial class SeedMine : Node3D
 
     public override void _Process(double delta)
     {
-        if (_done || Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (_done || Game.I == null || !Game.I.SimActive) return;   // freeze while paused (NEW)
         if (!Remote && (Caster == null || !GodotObject.IsInstanceValid(Caster))) return;   // the real (damaging) mine needs its caster
         if (!Game.I.WorldRunning) return;
         float dt = (float)delta;
@@ -86,6 +88,11 @@ public partial class SeedMine : Node3D
             { e.Hurt(Damage, DamageType.Nature, true); e.HitFrom(GlobalPosition); if (Poison > 0f) e.Poison(Poison, 3f); }
         }
         Game.I.DamageWorld(GlobalPosition, Blast, Damage);   // (NEW) the blast breaks props too
+        if (CloudPoison > 0f)   // (OVERHAUL) Spore Mines: leave a lingering poison cloud
+        {
+            var cloud = new GroundField { Type = FieldType.Hex, Radius = CloudRadius, Dur = 3.5f, Power = CloudPoison * 0.4f, PoisonAdd = CloudPoison, DType = DamageType.Nature, TintColor = DamageTypes.Col(DamageType.Nature), Src = Caster };
+            Game.I.AddChild(cloud); cloud.GlobalPosition = new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z);
+        }
         if (Chain)   // legendary: set off nearby mines too
             foreach (var n in Game.I.GetChildren())
                 if (n is SeedMine sm && sm != this && GodotObject.IsInstanceValid(sm) && !sm._done && GlobalPosition.DistanceTo(sm.GlobalPosition) < Blast + 2f) sm.Detonate();

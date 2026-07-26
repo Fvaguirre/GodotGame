@@ -28,7 +28,7 @@ public partial class BossRock : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta;
         _life -= dt; if (_life <= 0f) { QueueFree(); return; }
         Vel += new Vector3(0f, -22f, 0f) * dt;

@@ -5,7 +5,7 @@ using Godot;
 // Granted by a FinCard (Upgrade.cs), equipped via Player.EquipFinisher, and EXECUTED in the big
 // switch in Player.ExecuteFinisher (each case calls a Fin* method + an arm pose). To add one:
 // extend this enum + FinMeta, add the execution case in Player, add a FinCard Def in UpgradePool.
-public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls, SoulReap, HexChains, DoomSigil, FireWall, Fireball, EmberFervor }   // FireWall/Fireball/EmberFervor = Ember (NEW)
+public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls, SoulReap, HexChains, DoomSigil, FireWall, Fireball, EmberFervor, LunarNova, CrescentStorm, ArcaneBlink, ArcaneBlast }   // ArcaneBlink/ArcaneBlast = Arcane (NEW)
 
 public static class FinMeta
 {
@@ -39,6 +39,10 @@ public static class FinMeta
         FinType.FireWall => "Ring of Fire",
         FinType.Fireball => "Fireball",
         FinType.EmberFervor => "Ember Fervor",
+        FinType.LunarNova => "Lunar Nova",
+        FinType.CrescentStorm => "Crescent Storm",
+        FinType.ArcaneBlink => "Arcane Blink",
+        FinType.ArcaneBlast => "Arcane Torrent",
         _ => "?" };
 
     public static bool Passive(FinType t) => t == FinType.Crescendo;   // no key-press, but still occupies a slot
@@ -74,6 +78,10 @@ public static class FinMeta
         FinType.FireWall => "Raise a ring of fire around you for a few seconds — it eats incoming enemy projectiles (puff + crackle) and burns anything standing in it.",
         FinType.Fireball => "Hurl a fireball at your cursor — a heavy direct hit, plus a medium blast where it lands.",
         FinType.EmberFervor => "Ignite yourself: a burst of crit chance and move speed for a few seconds (both scale with rarity). Fists and feet blaze while it lasts; can't recharge until it fades.",
+        FinType.LunarNova => "A nova of moonlight erupts around you — heavy Lunar damage and a slow to everything nearby.",
+        FinType.CrescentStorm => "Looses a storm of homing crescent blades that arc out and scythe through nearby foes.",
+        FinType.ArcaneBlink => "Blink the way you're moving in a flash of raw arcane (reach grows with rarity, ~9→23u). An arcane rift erupts where you left AND where you land, detonating a moment later for area damage.",
+        FinType.ArcaneBlast => "Unleash a wide torrent of raw arcane straight ahead — hits everything in a broad line and hurls them back.",
         _ => "" };
 
     public static DamageType DType(FinType t) => t switch {
@@ -106,6 +114,10 @@ public static class FinMeta
         FinType.FireWall => DamageType.Ember,
         FinType.Fireball => DamageType.Ember,
         FinType.EmberFervor => DamageType.Ember,
+        FinType.LunarNova => DamageType.Lunar,
+        FinType.CrescentStorm => DamageType.Lunar,
+        FinType.ArcaneBlink => DamageType.Arcane,
+        FinType.ArcaneBlast => DamageType.Arcane,
         _ => DamageType.Arcane };
 
     public static Color Col(FinType t) => DamageTypes.Col(DType(t));
@@ -123,4 +135,6 @@ public class FinisherSlot
     public float Window = 0f;
     public Key Bind = Key.None;   // key bound to fire this finisher
     public float NotReadyFlash = 0f;   // >0 briefly when you press its key while it's still charging
+    public int[] Stat = new int[3];   // (OVERHAUL) per-ability upgrade tree: 3 stat paths, each stacks 0-4
+    public int[] Evo = new int[2];    // 2 evolutions, each stacks 0-4 (unlock → amplify)
 }

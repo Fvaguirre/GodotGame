@@ -46,6 +46,14 @@ public partial class Net : Node
         Game.I?.SpawnPing(new Vector3(x, y, z), name, new Color(r, g, b), net: false);
     }
 
+    // a player cast — fire the sender's ally avatar's upper-body cast animation (arms cast while legs keep moving)
+    public void BroadcastCast() { if (!Active) return; Rpc(nameof(ReceiveCast)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReceiveCast()
+    {
+        if (_remotes.TryGetValue(Multiplayer.GetRemoteSenderId(), out var av)) av.Cast();
+    }
+
     // move a caster's hurricane funnel each frame so allies see it track (not sit static at the cast spot)
     public void BroadcastHurriMove(Vector3 pos) { if (!Active) return; Rpc(nameof(ReceiveHurriMove), pos.X, pos.Y, pos.Z); }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
@@ -74,6 +82,22 @@ public partial class Net : Node
     private float _stateT = 0f;
     private const float SendHz = 20f;
     private const float EnemyHz = 15f;
+    public static float NetHz => EnemyHz;
+
+    // --- perf overlay telemetry (last snapshot tick), read by the HUD's dev overlay ---
+    public int NetEnemiesSynced, NetOrbsSynced, NetEnemyBytes, NetPickupBytes;
+
+    // toggle the dev perf overlay for the WHOLE lobby — server relay fans this out to every peer
+    public void BroadcastPerfOverlay(bool on)
+    {
+        if (Game.I != null) Game.I.PerfOverlay = on;
+        bool connected = Multiplayer.MultiplayerPeer != null
+            && Multiplayer.MultiplayerPeer.GetConnectionStatus() == MultiplayerPeer.ConnectionStatus.Connected
+            && Multiplayer.GetPeers().Length > 0;
+        if (connected) Rpc(nameof(ReceivePerfOverlay), on);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceivePerfOverlay(bool on) { if (Game.I != null) Game.I.PerfOverlay = on; }
 
     public void ForEachPeerCat(System.Action<int> act) { foreach (var c in _peerCat.Values) act(c); }
 
@@ -163,6 +187,57 @@ public partial class Net : Node
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveXp(float amt) { if (!IsHost) Game.I?.LocalPlayer?.AddXp(amt); }
 
+    // host -> all: award the same gold to EVERY warden (portal chest = 150, maze ritual = 300). Host applies locally too.
+    public void BroadcastGoldAll(int amt)
+    {
+        if (Game.I != null) Game.I.AddGold(amt);
+        if (Active && IsHost) Rpc(nameof(ReceiveGoldAll), amt);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveGoldAll(int amt) { if (!IsHost && Game.I != null) Game.I.AddGold(amt); }
+
+    // host -> all: the Grove's garden portals + maze gate (one-shot, reliable). Clients build synced ghosts.
+    public void BroadcastGarden(int[] ids, int[] pairs, float[] px, float[] py, float[] pz, float[] lx, float[] ly, float[] lz, int[] kinds, int[] entr, int[] cols, float gx, float gy, float gz, int gcol)
+    {
+        if (Active && IsHost) Rpc(nameof(ReceiveGarden), ids, pairs, px, py, pz, lx, ly, lz, kinds, entr, cols, gx, gy, gz, gcol);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveGarden(int[] ids, int[] pairs, float[] px, float[] py, float[] pz, float[] lx, float[] ly, float[] lz, int[] kinds, int[] entr, int[] cols, float gx, float gy, float gz, int gcol)
+    {
+        if (IsHost) return;
+        Game.I?.ApplyGardenSync(ids, pairs, px, py, pz, lx, ly, lz, kinds, entr, cols, gx, gy, gz, gcol);
+    }
+
+    // client -> host: I stepped through an ambush portal / into the maze gate — host resolves it for everyone.
+    public void RequestGardenAmbush(int pair, Vector3 at)
+    {
+        if (!Active || IsHost) return;
+        RpcId(1, nameof(ReceiveGardenAmbush), pair, at.X, at.Y, at.Z);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveGardenAmbush(int pair, float x, float y, float z) { if (IsHost) Game.I?.HostGardenAmbush(pair, new Vector3(x, y, z)); }
+    public void RequestEnterMaze()
+    {
+        if (!Active || IsHost) return;
+        RpcId(1, nameof(ReceiveReqEnterMaze));
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveReqEnterMaze() { if (IsHost) Game.I?.EnterGardenMaze(); }
+
+    // maze ritual: host -> all start / end / per-tick (timer + veil), and client -> host statue interaction
+    public void BroadcastRitualStart(int cellX, int cellY) { if (Active && IsHost) Rpc(nameof(ReceiveRitualStart), cellX, cellY); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveRitualStart(int cellX, int cellY) { if (!IsHost) Game.I?.ApplyRitualStart(cellX, cellY); }
+    public void BroadcastRitualEnd(int reason) { if (Active && IsHost) Rpc(nameof(ReceiveRitualEnd), reason); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveRitualEnd(int reason) { if (!IsHost) Game.I?.ApplyRitualEnd(reason); }
+    public void BroadcastRitualTick(float timeLeft, float veilR) { if (Active && IsHost) Rpc(nameof(ReceiveRitualTick), timeLeft, veilR); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReceiveRitualTick(float timeLeft, float veilR) { if (!IsHost) Game.I?.ApplyRitualTick(timeLeft, veilR); }
+    public void RequestStatue() { if (!Active || IsHost) return; RpcId(1, nameof(ReceiveStatue)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveStatue() { if (IsHost) Game.I?.CompleteRitual(); }
+
     // host -> a specific ally: a chest reward they earned (0 gold, 1 ult charge, 2 a card)
     public void GiveReward(long peer, int kind, float amt)
     {
@@ -181,8 +256,163 @@ public partial class Net : Node
             else { Game.I.AddGold((int)((10 + Game.I.Wave * 4) * 0.7f)); Game.I.Hud?.Banner("gold!"); }
         }
         else if (kind == 2) { Game.I.OpenChestCard(); }
-        else if (kind == 3) { pl?.GrantRandomArmor(); Game.I.Hud?.Banner("an armor charge"); }
+        else if (kind == 3) { pl?.FillArmorRandom(); Game.I.Hud?.Banner("armor charges — fully warded!"); }
     }
+
+    // host -> a specific ally: you dealt damage to a slain enemy, so you earn `count` soul(s). Souls are per-player
+    // (each machine tracks its own), so the host awards its own locally and RPCs every OTHER contributor theirs.
+    public void GrantSoul(long peer, int count)
+    {
+        if (!Active || !IsHost || count <= 0) return;
+        RpcId(peer, nameof(ReceiveSoul), count);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveSoul(int count)
+    {
+        if (IsHost || Game.I == null) return;
+        Game.I.Souls += count;
+    }
+
+    // client -> host: I held E on this ritual circle (I've checked my own souls). Host begins the rite + bills me.
+    public void RequestRitual(int netId)
+    {
+        if (!Active || IsHost) return;
+        RpcId(1, nameof(ReceiveRitualRequest), netId);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveRitualRequest(int netId)
+    {
+        if (!IsHost || Game.I == null) return;
+        Game.I.HostBeginRitual(netId, Multiplayer.GetRemoteSenderId());
+    }
+    // host -> the activating ally: your rite has begun, pay the quoted souls
+    public void GrantRitual(long peer, int cost)
+    {
+        if (!Active || !IsHost) return;
+        RpcId(peer, nameof(ReceiveRitualCharged), cost);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveRitualCharged(int cost)
+    {
+        if (IsHost || Game.I == null) return;
+        Game.I.ClientRitualCharged(cost);
+    }
+
+    // ---- (BOSS LAIR) sync: host → all for the lair's placement + state; client → host to challenge it ----
+    public void BroadcastBossLair(Vector3 pos, int netId) { if (Active && IsHost) Rpc(nameof(ReceiveBossLair), pos.X, pos.Y, pos.Z, netId); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveBossLair(float x, float y, float z, int netId) { if (!IsHost) Game.I?.SetRemoteBossLair(new Vector3(x, y, z), netId); }
+
+    public void BroadcastBossLairState(int state) { if (Active && IsHost) Rpc(nameof(ReceiveBossLairState), state); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveBossLairState(int state) { if (!IsHost) Game.I?.SetRemoteBossLairState(state); }
+
+    public void RequestChallengeBoss() { if (!Active || IsHost) return; RpcId(1, nameof(ReceiveChallengeBoss)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveChallengeBoss() { if (IsHost) Game.I?.HostSummonBoss(); }
+
+    public void BroadcastBossSummon() { if (Active && IsHost) Rpc(nameof(ReceiveBossSummon)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveBossSummon() { if (!IsHost) { Game.I?.Hud?.Banner("THE LAIR AWAKENS — the boss emerges!"); Game.I?.Sfx?.Thunder(); } }
+
+    // ---- (NERFER SHRINES) sync ----
+    public void BroadcastNerfers(System.Collections.Generic.List<NerfShrine> list)
+    {
+        if (!Active || !IsHost) return;
+        var k = new System.Collections.Generic.List<int>(); var id = new System.Collections.Generic.List<int>();
+        var px = new System.Collections.Generic.List<float>(); var py = new System.Collections.Generic.List<float>(); var pz = new System.Collections.Generic.List<float>();
+        foreach (var s in list) if (s != null && GodotObject.IsInstanceValid(s)) { k.Add((int)s.Kind); id.Add(s.NetId); px.Add(s.GlobalPosition.X); py.Add(s.GlobalPosition.Y); pz.Add(s.GlobalPosition.Z); }
+        Rpc(nameof(ReceiveNerfers), k.ToArray(), id.ToArray(), px.ToArray(), py.ToArray(), pz.ToArray());
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveNerfers(int[] kinds, int[] ids, float[] px, float[] py, float[] pz) { if (!IsHost) Game.I?.SetRemoteNerfers(kinds, ids, px, py, pz); }
+
+    // ---- (GALE PADS) sync: host → all, positions + aimed yaws ----
+    public void BroadcastGalePads(int[] ids, float[] px, float[] pz, float[] yaw) { if (Active && IsHost) Rpc(nameof(ReceiveGalePads), ids, px, pz, yaw); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveGalePads(int[] ids, float[] px, float[] pz, float[] yaw) { if (!IsHost) Game.I?.SetRemoteGalePads(ids, px, pz, yaw); }
+
+    // ---- (PEDESTALS) sync: host → all, positions (Y is re-grounded client-side) ----
+    public void BroadcastPedestals(int[] ids, float[] px, float[] pz) { if (Active && IsHost) Rpc(nameof(ReceivePedestals), ids, px, pz); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceivePedestals(int[] ids, float[] px, float[] pz) { if (!IsHost) Game.I?.SetRemotePedestals(ids, px, pz); }
+
+    // ---- (MAGNET DROPS) sync: host → all on spawn + on pickup ----
+    public void BroadcastMagnetSpawn(int netId, float x, float z) { if (Active && IsHost) Rpc(nameof(ReceiveMagnetSpawn), netId, x, z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveMagnetSpawn(int netId, float x, float z) { if (!IsHost) Game.I?.SetRemoteMagnetSpawn(netId, x, z); }
+    public void BroadcastMagnetTaken(int netId, float x, float y, float z) { if (Active && IsHost) Rpc(nameof(ReceiveMagnetTaken), netId, x, y, z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveMagnetTaken(int netId, float x, float y, float z) { if (!IsHost) Game.I?.ClientMagnetTaken(netId, new Vector3(x, y, z)); }
+
+    // (NEW) ward plating — same one-shot pattern as the lodestone, plus a targeted grant so ONLY the warden who
+    // stepped on it gets their armor filled
+    public void BroadcastWardArmorSpawn(int netId, float x, float z) { if (Active && IsHost) Rpc(nameof(ReceiveWardArmorSpawn), netId, x, z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveWardArmorSpawn(int netId, float x, float z) { if (!IsHost) Game.I?.SetRemoteWardArmorSpawn(netId, x, z); }
+    public void BroadcastWardArmorTaken(int netId, float x, float y, float z) { if (Active && IsHost) Rpc(nameof(ReceiveWardArmorTaken), netId, x, y, z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveWardArmorTaken(int netId, float x, float y, float z) { if (!IsHost) Game.I?.ClientWardArmorTaken(netId, new Vector3(x, y, z)); }
+    public void GrantArmorFill(long peer) { if (Active && IsHost && peer != 0) RpcId(peer, nameof(ReceiveArmorFill)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveArmorFill() { Game.I?.LocalPlayer?.FillArmorRandom(); Game.I?.Hud?.Banner("ward plating — armor restored"); }
+
+    // (HAUNT) the roaming hot-zone — host announces spawn / break / fill so clients render the zone, meter and payout
+    public void BroadcastHaunt(Vector3 c, float radius) { if (Active && IsHost) Rpc(nameof(ReceiveHaunt), c, radius); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveHaunt(Vector3 c, float radius) { if (!IsHost) Game.I?.SetRemoteHaunt(c, radius); }
+    public void BroadcastHauntBreak(Vector3 c) { if (Active && IsHost) Rpc(nameof(ReceiveHauntBreak), c); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveHauntBreak(Vector3 c) { if (!IsHost) Game.I?.ClientHauntBreak(c); }
+    // (FIX) the break payout goes to EVERY player, not just the host — host grants each client the same souls + gold
+    public void GrantAllHauntBreak(int souls, int gold) { if (Active && IsHost) Rpc(nameof(ReceiveHauntBreakReward), souls, gold); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveHauntBreakReward(int souls, int gold) { if (!IsHost) Game.I?.GrantHauntBreakReward(souls, gold); }
+    public void BroadcastHauntFill(float f) { if (Active && IsHost) Rpc(nameof(ReceiveHauntFill), f); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReceiveHauntFill(float f) { if (!IsHost) Game.I?.SetRemoteHauntFill(f); }
+
+    public void BroadcastNerferState(int netId, int state) { if (Active && IsHost) Rpc(nameof(ReceiveNerferState), netId, state); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveNerferState(int netId, int state) { if (!IsHost) Game.I?.SetRemoteNerferState(netId, state); }
+
+    public void RequestNerfer(int netId) { if (!Active || IsHost) return; RpcId(1, nameof(ReceiveNerferReq), netId); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveNerferReq(int netId)
+    {
+        if (!IsHost || Game.I == null) return;
+        foreach (var s in Game.I.Nerfers) if (s != null && s.NetId == netId)
+        { if (s.Kind == NerfKind.Summoner) Game.I.HostStartSummoner(s); else if (s.Kind == NerfKind.Sacrifice) Game.I.HostBeginSacrifice(s); break; }
+    }
+
+    public void BroadcastSacrificeCost() { if (Active && IsHost) Rpc(nameof(ReceiveSacrificeCost)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveSacrificeCost() { if (!IsHost) Game.I?.ClientSacrificeCost(); }
+
+    public void RequestSanctuaryPay(int netId) { if (!Active || IsHost) return; RpcId(1, nameof(ReceiveSanctuaryPay), netId); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveSanctuaryPay(int netId) { if (IsHost) Game.I?.HostSanctuaryPaid(netId, Multiplayer.GetRemoteSenderId()); }
+
+    public void BroadcastSanctuaryArmed() { if (Active && IsHost) Rpc(nameof(ReceiveSanctuaryArmed)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveSanctuaryArmed() { if (!IsHost) Game.I?.ClientSanctuaryArmed(); }
+
+    public void BroadcastDrainSigil(Vector3 pos) { if (Active && IsHost) Rpc(nameof(ReceiveDrainSigil), pos.X, pos.Y, pos.Z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveDrainSigil(float x, float y, float z) { if (!IsHost) Game.I?.SetRemoteDrainSigil(new Vector3(x, y, z)); }
+
+    // ---- (NERFER Summoner) arcane-unicorn stream ----
+    public void BroadcastUnicorn(Vector3 pos, bool charging) { if (Active && IsHost) Rpc(nameof(ReceiveUnicorn), pos.X, pos.Y, pos.Z, charging); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReceiveUnicorn(float x, float y, float z, bool charging) { if (!IsHost) Game.I?.SetRemoteUnicorn(new Vector3(x, y, z), charging); }
+
+    public void BroadcastUnicornGone(Vector3 pos, float bossRadius) { if (Active && IsHost) Rpc(nameof(ReceiveUnicornGone), pos.X, pos.Y, pos.Z, bossRadius); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveUnicornGone(float x, float y, float z, float bossRadius) { if (!IsHost) Game.I?.SetRemoteUnicornGone(new Vector3(x, y, z), bossRadius); }
+
+    public void RequestUnicornRecall() { if (!Active || IsHost) return; RpcId(1, nameof(ReceiveUnicornRecall)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveUnicornRecall() { if (IsHost) Game.I?.RecallUnicorn(Multiplayer.GetRemoteSenderId()); }
 
     public bool NearestPickupChest(Vector3 pos, float range, out int netId, out float distSq)
     {
@@ -206,6 +436,65 @@ public partial class Net : Node
         if (!IsHost || Game.I == null) return;
         long sender = Multiplayer.GetRemoteSenderId();
         Game.I.HostOpenChest(netId, sender);
+    }
+
+    // ---- (EFFIGY) blessing-shrine sync ----
+    // host -> all: the scattered effigies (one-shot, on spawn). Clients build ghost copies they can interact with.
+    public void BroadcastEffigies(int[] ids, int[] kinds, float[] px, float[] py, float[] pz)
+    {
+        if (Active && IsHost) Rpc(nameof(ReceiveEffigies), ids, kinds, px, py, pz);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveEffigies(int[] ids, int[] kinds, float[] px, float[] py, float[] pz)
+    {
+        if (IsHost) return;
+        Game.I?.ApplyEffigySync(ids, kinds, px, py, pz);
+    }
+    // client -> host: I held E on this effigy (I've checked my own gold). Host claims it + grants me the pick.
+    public void RequestEffigy(int netId)
+    {
+        if (!Active || IsHost) return;
+        RpcId(1, nameof(ReceiveEffigyRequest), netId);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveEffigyRequest(int netId)
+    {
+        if (!IsHost || Game.I == null) return;
+        Game.I.HostActivateEffigy(netId, Multiplayer.GetRemoteSenderId());
+    }
+    // host -> the requesting ally: you may take a themed pick (kind), pay this cost
+    public void GrantEffigy(long peer, int kind, int cost)
+    {
+        if (!Active || !IsHost) return;
+        RpcId(peer, nameof(ReceiveGrantEffigy), kind, cost);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveGrantEffigy(int kind, int cost)
+    {
+        if (IsHost || Game.I == null) return;
+        Game.I.ClientEffigyGranted(kind, cost);
+    }
+    // host -> all: this effigy is spent — remove it everywhere
+    public void BroadcastEffigyClaim(int netId)
+    {
+        if (Active && IsHost) Rpc(nameof(ReceiveEffigyClaim), netId);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveEffigyClaim(int netId)
+    {
+        if (IsHost) return;
+        Game.I?.ApplyEffigyClaim(netId);
+    }
+    // host -> all: updated per-type activation counts (drives the rising cost, lobby-wide)
+    public void BroadcastEffigyTiers(int[] counts)
+    {
+        if (Active && IsHost) Rpc(nameof(ReceiveEffigyTiers), counts);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveEffigyTiers(int[] counts)
+    {
+        if (IsHost) return;
+        Game.I?.ApplyEffigyTiers(counts);
     }
 
     // ---- Expedition mode sync ----
@@ -702,6 +991,48 @@ public partial class Net : Node
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveFireRing(float x, float y, float z, float radius, float dur) { if (IsHost) Game.I.RegisterFireRing(new Vector3(x, y, z), radius, dur); }
 
+    // (NEW) Cyclone: a client asks the host to register a wind projectile-eating zone
+    public void ReqWindRing(Vector3 pos, float radius, float dur) { if (Active && !IsHost) RpcId(1, nameof(ReceiveWindRing), pos.X, pos.Y, pos.Z, radius, dur); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveWindRing(float x, float y, float z, float radius, float dur) { if (IsHost) Game.I.RegisterWindRing(new Vector3(x, y, z), radius, dur); }
+
+    // (NEW) Sky Islands ritual (jungle)
+    public void BroadcastSkyWhirl(Vector3 pos) { if (Active) Rpc(nameof(ReceiveSkyWhirl), pos.X, pos.Y, pos.Z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveSkyWhirl(float x, float y, float z) { Game.I?.ShowSkyWhirl(new Vector3(x, y, z)); }
+
+    public void RequestEnterSky() { if (Active && !IsHost) RpcId(1, nameof(ReceiveRequestEnterSky)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveRequestEnterSky() { if (IsHost) Game.I?.EnterSky(); }
+
+    public void BroadcastEnterSky(ulong seed, Vector3 origin) { if (Active) Rpc(nameof(ReceiveEnterSky), (long)seed, origin.X, origin.Y, origin.Z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveEnterSky(long seed, float x, float y, float z) { Game.I?.EnterSkyRealm((ulong)seed, new Vector3(x, y, z)); }
+
+    public void RequestSkyEffigy(int idx) { if (Active && !IsHost) RpcId(1, nameof(ReceiveRequestSkyEffigy), idx); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveRequestSkyEffigy(int idx) { if (IsHost) Game.I?.LightSkyEffigy(idx); }
+
+    public void BroadcastSkyEffigy(int idx) { if (Active) Rpc(nameof(ReceiveSkyEffigy), idx); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveSkyEffigy(int idx) { Game.I?.LightSkyEffigy(idx); }
+
+    public void RequestSkyComplete() { if (Active && !IsHost) RpcId(1, nameof(ReceiveRequestSkyComplete)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveRequestSkyComplete() { if (IsHost) Game.I?.CompleteSky(); }
+
+    public void BroadcastExitSky(bool won) { if (Active) Rpc(nameof(ReceiveExitSky), won); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveExitSky(bool won) { Game.I?.ExitSky(won); }
+
+    // (NEW) snake root: host → the touched ally (they enforce ground-only + throttle); and snake-death → free everyone rooted
+    public void SendSnakeRoot(long peer, int snakeId) { if (Active) RpcId(peer, nameof(ReceiveSnakeRoot), snakeId); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveSnakeRoot(int snakeId) { Game.I?.Player?.TrySnakeRoot(snakeId); }
+    public void BroadcastSnakeDied(int snakeId) { if (Active) Rpc(nameof(ReceiveSnakeDied), snakeId); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveSnakeDied(int snakeId) { Game.I?.Player?.ClearSnakeRoot(snakeId); }
+
     // (NEW) Wildfire Rush: a burn tick lifesteals back to its remote caster.
     public void SendBurnHeal(int peer, float amt) { if (Active) RpcId(peer, nameof(ReceiveBurnHeal), amt); }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
@@ -828,6 +1159,20 @@ public partial class Net : Node
         if (_remotes.TryGetValue(s, out var av) && GodotObject.IsInstanceValid(av)) av.PlayArm(kind, dur);
     }
 
+    // (NEW) picture-in-picture "ult cast" cutout — an ally started ulting; pop a stylized third-person window of them casting it
+    public void BroadcastUltCast(int ultKind)
+    {
+        if (!Active) return;
+        Rpc(nameof(ReceiveUltCast), ultKind);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveUltCast(int ultKind)
+    {
+        long s = Multiplayer.GetRemoteSenderId();
+        if (_remotes.TryGetValue(s, out var av) && GodotObject.IsInstanceValid(av))
+            Game.I?.UltOverlay?.Trigger(av, (Player.UltKind)ultKind);
+    }
+
     // (NEW) tell every peer to break the pumpkin at this position (shared props — destroy each other's)
     public void BroadcastSmashPumpkin(Vector3 pos)
     {
@@ -943,7 +1288,7 @@ public partial class Net : Node
             case 49: Game.I.SpawnFrostShatter(o, a); Game.I.Sfx?.IceShatter(o, false); break;     // ice-block shatter
             case 50: Game.I.SpawnFrostBeamSeg(o, dir, a); break;                                  // frost witch freezing beam
             case 51: { var bz = new Blizzard(); Game.I.AddChild(bz); bz.Init(null, o, a, b, 0f, 0f, true); break; }        // Blizzard ghost
-            case 52: { var df = new DeepFreeze(); Game.I.AddChild(df); df.Init(null, o, a, b, true); break; }               // Deep Freeze ghost
+            case 52: { var df = new DeepFreeze(); Game.I.AddChild(df); df.Init(null, o, a, b, true, false, Mathf.Clamp((int)((a / 12f) - 1f), 0, 4)); break; }   // Glacial Sunder ghost (tier eyeballed from area for visual spear count)
             case 53:                                                                               // Frost Elemental ghost (repositioned via ReceiveFrostElemMove)
             {
                 long sp53 = Multiplayer.GetRemoteSenderId();
@@ -964,12 +1309,19 @@ public partial class Net : Node
             case 64: Game.I.SpawnGroundSigil(o, a, c); Game.I.VfxRing(o, c, a, 0.5f); break;                              // Hex Chains burst (the cackle networks itself via WitchCackle)
             case 65: { var ds = new DoomSigil(); Game.I.AddChild(ds); ds.InitRemote(o, a, c); break; }                    // Doom Sigil ghost (telegraph + detonation are self-driven)
             case 66: Game.I.SpawnFlameCone(o, dir, a, c); break;                                                          // Ember flamethrower flame (a=reach)
-            case 67: Game.I.SpawnEmberMeteorGhost(o, a); break;                                                          // Ember meteor ghost (a=radius; host owns damage)
+            case 67: Game.I.SpawnEmberMeteorGhost(o, a, b > 0.1f ? b : 1.7f); break;                                     // Ember meteor ghost (a=radius, b=fall time; host owns damage)
             case 68: Game.I.SpawnEmberBurst(o, Mathf.Max(3f, a), false); Game.I.VfxRing(o, c, Mathf.Max(4f, a * 1.3f), 0.5f); break;   // Meteor Descent launch/impact (a=radius)
             case 69: Game.I.SpawnEmberBurst(o, Mathf.Max(4f, a), false); Game.I.VfxRing(o, c, a * 1.2f, 0.5f); break;    // Wildfire Rush activation tell
             case 70: Game.I.SpawnEmberBurst(o, Mathf.Max(3f, a), false); break;                                         // Phoenix aura pulse / activation / rebirth (a=radius)
             case 72: { var fw = new FireWall { Remote = true, Center = o, Radius = a, Dur = b }; Game.I.AddChild(fw); fw.GlobalPosition = o; break; }   // Ring of Fire ghost (a=radius, b=dur)
             case 73: { var fb = new Fireball { Remote = true, Dir = dir, Speed = a, BlastRadius = b }; Game.I.AddChild(fb); fb.GlobalPosition = o; break; }   // Fireball ghost (a=speed, b=blastR)
+            case 76: Game.I.SpawnCrocBombGhost(o, dir, a); break;   // croc bomb ghost (o=impact, dir=origin, a=radius)
+            case 77: Game.I.SpawnMoltenEruption(o, a, false); break;   // Eruption molten VFX ghost (a=radius)
+            case 78: Game.I.SpawnArcaneBeamSeg(o, dir, a); break;      // Arcane witch beam segment — chain legs + arcs (ally-visible ghost; a=length)
+            case 79: Game.I.SpawnArcaneRupture(o, a); break;          // Arcane rift/rupture burst (ally-visible ghost; a=radius)
+            case 80: Game.I.SpawnArcaneKamehameha(o, dir, a, b, c); break;   // Arcane Torrent finisher beam (a=length, b=width)
+            case 81: { var fw = new FrostWall(); Game.I.AddChild(fw); fw.Init(null, o, dir, a, b, 0f, a + 3f, 0, true); break; }   // Frost Wall remote copy — obstacle (host enemies avoid it) + visual, self-expires
+            case 82: FrostWall.ShatterNearestRemote(o); break;              // Frost Wall networked shatter (visual only; damage was dealt by the caster)
         }
     }
 
@@ -1033,6 +1385,19 @@ public partial class Net : Node
         if (!Active) return;
         Rpc(nameof(ReceiveField), type, at.X, at.Z, radius, dur, beam, PackColor(tint), dtype);
     }
+    // (WIND RUSH) a wind SPEED-ZONE — allies spawn a SpeedBoost field so THEY get the ×3 move boost standing in it too
+    public void BroadcastWindZone(Vector3 at, float radius, float dur)
+    {
+        if (!Active) return;
+        Rpc(nameof(ReceiveWindZone), at.X, at.Z, radius, dur);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveWindZone(float x, float z, float radius, float dur)
+    {
+        if (Game.I == null) return;
+        var f = new GroundField { Remote = true, SpeedBoost = true, Type = FieldType.Hex, Radius = radius, Dur = dur, DType = DamageType.Wind, TintColor = DamageTypes.Col(DamageType.Wind) };
+        Game.I.AddChild(f); f.GlobalPosition = new Vector3(x, 0.04f, z);
+    }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveField(int type, float x, float z, float radius, float dur, bool beam, int tint, int dtype)
     {
@@ -1060,6 +1425,11 @@ public partial class Net : Node
 
     // ---- downed / revive ----
     private readonly HashSet<long> _downed = new();
+    private readonly HashSet<long> _mazePeers = new();   // host: peers currently inside the maze (drives maze-death spit-out vs game-over)
+    public void MazeEnterAll() { if (!IsHost) return; _mazePeers.Clear(); _mazePeers.Add(Multiplayer.GetUniqueId()); foreach (var id in Multiplayer.GetPeers()) _mazePeers.Add(id); }
+    public void ReportLeftMaze() { if (!Active) return; if (IsHost) { _mazePeers.Remove(Multiplayer.GetUniqueId()); EvalGameOver(); } else RpcId(1, nameof(HostLeftMaze)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void HostLeftMaze() { if (!IsHost) return; _mazePeers.Remove(Multiplayer.GetRemoteSenderId()); EvalGameOver(); }
     public bool AnyDowned() => _downed.Count > 0;
     public float MinAllyHpFrac()   // (NEW) lowest ally HP frac — lets the director judge party-wide survival, not just the host's
     {
@@ -1068,11 +1438,40 @@ public partial class Net : Node
             if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value)) m = Mathf.Min(m, kv.Value.Downed ? 0f : kv.Value.HpFrac);
         return m;
     }
+    // (NEW) a specific ally's HP fraction (synced) — for the per-opener chest mercy-heal in MP. 1 if that peer isn't a known ally.
+    public float PeerHpFrac(long peer)
+    {
+        if (_remotes.TryGetValue(peer, out var av) && av != null && GodotObject.IsInstanceValid(av)) return av.Downed ? 0f : av.HpFrac;
+        return 1f;
+    }
+    // (MAGNET LUCK) a specific ally's synced Luck stat — 0 if that peer isn't a known ally
+    public float PeerLuck(long peer)
+    {
+        if (_remotes.TryGetValue(peer, out var av) && av != null && GodotObject.IsInstanceValid(av)) return av.Luck;
+        return 0f;
+    }
     public System.Collections.Generic.List<Vector3> AllyPositions()
     {
         var list = new System.Collections.Generic.List<Vector3>();
         foreach (var kv in _remotes) if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value)) list.Add(kv.Value.GlobalPosition);
         return list;
+    }
+    public bool AnyAllyDowned()   // (SMART DIRECTOR) is any co-op ally currently downed? (a prime moment to send a special)
+    {
+        foreach (var kv in _remotes) if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value) && kv.Value.Downed) return true;
+        return false;
+    }
+    // (NERFER Summoner) peer→position, for the unicorn's proximity-claim + T-recall follow
+    public System.Collections.Generic.List<(long, Vector3)> AllyPeerPositions()
+    {
+        var list = new System.Collections.Generic.List<(long, Vector3)>();
+        foreach (var kv in _remotes) if (kv.Value != null && GodotObject.IsInstanceValid(kv.Value)) list.Add((kv.Key, kv.Value.GlobalPosition));
+        return list;
+    }
+    public Vector3 PeerPosition(long peer)
+    {
+        if (_remotes.TryGetValue(peer, out var av) && av != null && GodotObject.IsInstanceValid(av)) return av.GlobalPosition;
+        return Vector3.Zero;
     }
     // (NEW) client-side XP-orb ghost positions, for the minimap specks (host reads Game.Orbs directly)
     public System.Collections.Generic.List<Vector3> RemoteOrbPositions()
@@ -1108,11 +1507,20 @@ public partial class Net : Node
     private void EvalGameOver()
     {
         if (!IsHost) return;
+        if (Game.I != null && Game.I.InSky) return;   // (NEW) sky ritual: game-over suspended — CheckSkyFalls ends it when everyone has fallen/died
+        if (_mazePeers.Count > 0)   // a maze event is in progress — game-over is suspended; instead spit players out
+        {
+            foreach (var pid in _mazePeers) if (!_downed.Contains(pid)) return;   // someone still IN the maze is up → keep going
+            Rpc(nameof(ReceiveMazeAllDown)); Game.I?.MazeDeathExit();   // everyone still in the maze is down → all spat out (covers "alone")
+            return;
+        }
         int total = _remotes.Count + 1;
         if (_downed.Count >= total) { Rpc(nameof(ReceiveGameOver)); Game.I?.GameOver(); }
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveGameOver() { Game.I?.GameOver(); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveMazeAllDown() { Game.I?.MazeDeathExit(); }
 
     // ---- end-of-run scoreboard sync (NEW): each warden broadcasts its RunStats block at game over ----
     public void BroadcastRunStats(RunStats s)
@@ -1285,6 +1693,14 @@ public partial class Net : Node
         { if (!GodotObject.IsInstanceValid(kv.Value)) continue; var d = kv.Value.GlobalPosition - center; d.Y = 0f; if (d.Length() < radius) DamagePlayer(kv.Key, dmg); }
     }
 
+    // host: damage every ally whose position matches a predicate (used by the maze veil — flooded corridor cells)
+    public void DamageRemotesWhere(System.Func<Vector3, bool> pred, float dmg)
+    {
+        if (!Active || !IsHost || pred == null) return;
+        foreach (var kv in _remotes)
+            if (GodotObject.IsInstanceValid(kv.Value) && pred(kv.Value.GlobalPosition)) DamagePlayer(kv.Key, dmg);
+    }
+
     // boss rock: damage + STUN everyone in range (works solo + MP)
     public void HurtStunPlayersIn(Vector3 center, float radius, float dmg, float stun)
     {
@@ -1303,6 +1719,26 @@ public partial class Net : Node
     }
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveSnare(float dur) { Game.I?.Player?.SnareMe(dur); }
+
+    // Faith Shield: every machine spawns a copy. On the host it's AUTHORITATIVE (blocks enemies + deals the shatter); on
+    // clients it's visual-only. Called by the caster; reaches all OTHER peers (the caster already spawned its own).
+    public void SpawnFaithShield(Vector3 pos, float radius, float dur, float burstDmg, float knock, bool reflect)
+    {
+        if (!Active) return;
+        Rpc(nameof(ReceiveFaithShield), pos, radius, dur, burstDmg, knock, reflect);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveFaithShield(Vector3 pos, float radius, float dur, float burstDmg, float knock, bool reflect)
+    { Game.I?.SpawnRemoteFaithShield(pos, radius, dur, burstDmg, knock, reflect); }
+
+    // troll charge: shove the targeted ally back over the network
+    public void KnockbackPlayer(long peer, Vector3 from, float power)
+    {
+        if (!Active || !IsHost) return;
+        RpcId(peer, nameof(ReceiveKnockback), from, power);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveKnockback(Vector3 from, float power) { Game.I?.Player?.Knockback(from, power); }
 
     // swarmer: slow the targeted ally over the network
     public void SlowPlayer(long peer, float dur, float mul)
@@ -1325,6 +1761,83 @@ public partial class Net : Node
     private void ReceivePlayerDamage(float dmg)
     {
         if (Game.I?.LocalPlayer != null) Game.I.LocalPlayer.Hurt(dmg);
+    }
+
+    // (NEW) phalanx arrow-venom: stamp/refresh the poison on everyone standing in the volley circle. Mirrors
+    // HurtPlayersIn — local player directly, allies over the wire — so it works solo and in co-op alike.
+    public void VenomPlayersIn(Vector3 center, float radius, float dur, float dps)
+    {
+        if (Game.I?.Player != null && !Game.I.Player.Downed)
+        { var d = Game.I.Player.GlobalPosition - center; d.Y = 0f; if (d.Length() < radius) Game.I.Player.ApplyVenom(dur, dps); }
+        if (!Active || !IsHost) return;
+        foreach (var kv in _remotes)
+        { if (!GodotObject.IsInstanceValid(kv.Value)) continue; var d = kv.Value.GlobalPosition - center; d.Y = 0f; if (d.Length() < radius) RpcId(kv.Key, nameof(ReceiveVenom), dur, dps); }
+    }
+
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveVenom(float dur, float dps)
+    {
+        Game.I?.LocalPlayer?.ApplyVenom(dur, dps);
+    }
+
+    // ===== WARDED PHALANX (NEW) — the enemy snapshot has no spare status bits, so the ward rides its own tiny RPCs =====
+
+    // host -> all, ~5Hz while a ward stands: the bearer's remaining ward fraction (drives the dome + the HUD bar)
+    public void BroadcastWard(int netId, float frac)
+    {
+        if (!Active || !IsHost) return;
+        Rpc(nameof(ReceiveWard), netId, frac);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReceiveWard(int netId, float frac) { FindRemoteEnemy(netId)?.SetRemoteWard(frac); }
+
+    // host -> all, one-shot: this archer is now (or no longer) sheltered by a ward — clients need it to suppress
+    // the local damage popup on a hit that the host is going to reject anyway
+    public void BroadcastWardGuard(int netId, bool on)
+    {
+        if (!Active || !IsHost) return;
+        Rpc(nameof(ReceiveWardGuard), netId, on);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveWardGuard(int netId, bool on) { FindRemoteEnemy(netId)?.SetRemoteGuarded(on); }
+
+    // host -> all, one-shot: paint the volley circle on every machine (ghost copies are visual-only)
+    public void BroadcastVolley(Vector3 pos, float radius, float dps, float venom)
+    {
+        if (!Active || !IsHost) return;
+        Rpc(nameof(ReceiveVolley), pos, radius, dps, venom);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveVolley(Vector3 pos, float radius, float dps, float venom)
+    {
+        if (Game.I == null) return;
+        var v = new ArrowVolley { Remote = true };
+        Game.I.AddChild(v);
+        v.Init(pos, radius, dps, venom);
+    }
+
+    // host -> all: an archer raised its bow to the sky (1, with a quip) or loosed (0). Purely cosmetic, but it IS the
+    // volley's telegraph, so allies must see the same wind-up the host does.
+    public void BroadcastArcherPose(int netId, int state)
+    {
+        if (!Active || !IsHost) return;
+        Rpc(nameof(ReceiveArcherPose), netId, state);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveArcherPose(int netId, int state)
+    {
+        var e = FindRemoteEnemy(netId);
+        if (e == null) return;
+        if (state == 1) { e.AimSky(true); e.Quip(); } else e.Loose();
+    }
+
+    private Enemy FindRemoteEnemy(int netId)
+    {
+        if (Game.I == null) return null;
+        var list = Game.I.Enemies;
+        for (int i = 0; i < list.Count; i++)
+        { var e = list[i]; if (e != null && GodotObject.IsInstanceValid(e) && e.NetId == netId) return e; }
+        return null;
     }
 
     // host -> all: an enemy was banished; everyone gets the kill credit
@@ -1379,7 +1892,12 @@ public partial class Net : Node
     {
         var p = Game.I?.Player;
         if (p == null || xs == null) return;
-        for (int i = 0; i < xs.Length; i++) p.OnBloodAuraKill(new Vector3(xs[i], ys[i], zs[i]));
+        for (int i = 0; i < xs.Length; i++)
+        {
+            var at = new Vector3(xs[i], ys[i], zs[i]);
+            p.OnBloodAuraKill(at);
+            Fx.SparkBurst(at + Vector3.Up * 0.6f, Vector3.Up, new Color(1f, 0.9f, 0.7f), 1.0f, 7);   // (MP) death-pop on clients (host shows its own in Die); no colour in the batch → neutral warm spark
+        }
     }
 
     // every player shares a slice of the damage they deal as ult charge, so the team's ult meters
@@ -1400,6 +1918,17 @@ public partial class Net : Node
     // host -> a specific client: here's the map seed, rebuild your world to match ours (NEW)
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
     private void ReceiveWorldSeed(long seed) { if (!IsHost) Game.I?.ReseedWorld(seed); }
+
+    // (NEW) level portal + advance-to-next-biome
+    public void BroadcastPortal(Vector3 pos) { if (Active) Rpc(nameof(ReceivePortalRpc), pos.X, pos.Y, pos.Z); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceivePortalRpc(float x, float y, float z) { if (!IsHost) Game.I?.ReceivePortal(new Vector3(x, y, z)); }
+    public void RequestAdvanceLevel() { if (Active && !IsHost) RpcId(1, nameof(ReqAdvanceLevel)); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReqAdvanceLevel() { if (IsHost) Game.I?.AdvanceLevel(); }
+    public void BroadcastLevelAdvance(int level, int biome, long seed) { if (Active) Rpc(nameof(ReceiveLevelAdvanceRpc), level, biome, seed); }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false)]
+    private void ReceiveLevelAdvanceRpc(int level, int biome, long seed) { if (!IsHost) Game.I?.ApplyLevelAdvance(level, (Biome)biome, seed); }
     private void OnPeerDisconnected(long id)
     {
         if (_remotes.TryGetValue(id, out var av) && GodotObject.IsInstanceValid(av)) av.QueueFree();
@@ -1456,7 +1985,7 @@ public partial class Net : Node
                     if (p.ActiveGuardian != null && GodotObject.IsInstanceValid(p.ActiveGuardian))   // sync the Ancient Guardian to allies
                     {
                         var g = p.ActiveGuardian; var ggp = g.GlobalPosition;
-                        Rpc(nameof(GuardianState), ggp.X, ggp.Y, ggp.Z, g.BodyYaw, g.TakeSlamFlag() ? 1 : 0);
+                        Rpc(nameof(GuardianState), ggp.X, ggp.Y, ggp.Z, g.BodyYaw, g.SlamPhase01());   // send the exact slam phase so ghosts replay the full wind-up + slam
                     }
                 }
                 if (++_vitalsTick >= 4)   // ~5Hz: HP/mana/shield/blessed/blood for ally HUD bars
@@ -1465,7 +1994,8 @@ public partial class Net : Node
                     float hpf = p.S.MaxHp > 0 ? Mathf.Clamp(p.Hp / p.S.MaxHp, 0f, 1f) : 0f;
                     float mnf = p.S.ManaMax > 0 ? Mathf.Clamp(p.Mana / p.S.ManaMax, 0f, 1f) : 0f;
                     float shf = p.MaxShield > 0.5f ? Mathf.Clamp(p.Shield / p.MaxShield, 0f, 1f) : 0f;
-                    Rpc(nameof(NetVitals), hpf, mnf, shf, p.BlessedT, p.BloodStacks, p.ArmorPacked | (p.StunStateNet << 8), p.WitchIndex, p.BarkFrac, p.EclipseActive01, p.StormActive ? 1f : 0f);
+                    int packed = p.ArmorPacked | (p.StunStateNet << 8) | ((Game.I != null && Game.I.MenuImmune) ? (1 << 10) : 0) | (p.SpecterActive ? (1 << 11) : 0);   // bit 10 = in a menu → bubble+meditation; bit 11 = Specter → violet projection
+                    Rpc(nameof(NetVitals), hpf, mnf, shf, p.BlessedT, p.BloodStacks, packed, p.WitchIndex, p.BarkFrac, p.EclipseActive01, p.StormActive ? 1f : 0f, p.S.Luck);
                 }
             }
         }
@@ -1528,11 +2058,16 @@ public partial class Net : Node
                 // keep the packet under the network MTU (~1392B): sync at most the nearest ~34 enemies to the host
                 var live = new System.Collections.Generic.List<Enemy>();
                 foreach (var e in es) if (e != null && GodotObject.IsInstanceValid(e) && !e.Dead) live.Add(e);
-                if (live.Count > 34)
+                if (live.Count > 30)   // cap for MTU (~1392B): 30 enemies × 11 arrays ≈ 1245B
                 {
-                    var pc = Game.I.Player != null ? Game.I.Player.GlobalPosition : Vector3.Zero;
-                    live.Sort((a, b) => a.GlobalPosition.DistanceSquaredTo(pc).CompareTo(b.GlobalPosition.DistanceSquaredTo(pc)));
-                    live.RemoveRange(34, live.Count - 34);
+                    // (MP FIX) rank by distance to the NEAREST warden (host + every ally), not just the host — so a foe
+                    // chasing a client far from the host still gets synced, instead of clients seeing only the host's swarm.
+                    var wardens = new System.Collections.Generic.List<Vector3>();
+                    if (Game.I.Player != null) wardens.Add(Game.I.Player.GlobalPosition);
+                    wardens.AddRange(AllyPositions());
+                    float NearW(Vector3 p) { float best = float.MaxValue; foreach (var w in wardens) { float d = p.DistanceSquaredTo(w); if (d < best) best = d; } return best; }
+                    live.Sort((a, b) => NearW(a.GlobalPosition).CompareTo(NearW(b.GlobalPosition)));
+                    live.RemoveRange(30, live.Count - 30);
                 }
                 var ids = new System.Collections.Generic.List<int>();
                 var tys = new System.Collections.Generic.List<int>();
@@ -1544,17 +2079,20 @@ public partial class Net : Node
                 var ys = new System.Collections.Generic.List<float>();   // (NEW) Y so clients see fling arcs / flyer height
                 var zs = new System.Collections.Generic.List<float>();
                 var brn = new System.Collections.Generic.List<int>();    // (NEW) Ember burn stacks for the client HUD
+                var siz = new System.Collections.Generic.List<int>();    // (NEW) per-enemy size multiplier ×100 → clients render matching sizes + hitboxes
                 foreach (var e in live)
                 {
                     if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead) continue;
                     ids.Add(e.NetId); tys.Add(e.TypeIdx); eli.Add(e.Elite ? 1 : 0);
                     hpf.Add(e.MaxHp > 0 ? e.Hp / e.MaxHp : 1f);
                     st.Add(e.StatusMask());
+                    siz.Add(Mathf.RoundToInt(e.SizeMul * 100f));
                     af.Add(e.Affix);
                     xs.Add(e.GlobalPosition.X); ys.Add(e.GlobalPosition.Y); zs.Add(e.GlobalPosition.Z);
                     brn.Add(Mathf.CeilToInt(e.BurnStacks));
                 }
-                Rpc(nameof(EnemySnapshot), ids.ToArray(), tys.ToArray(), eli.ToArray(), hpf.ToArray(), st.ToArray(), xs.ToArray(), ys.ToArray(), zs.ToArray(), af.ToArray(), brn.ToArray());
+                Rpc(nameof(EnemySnapshot), ids.ToArray(), tys.ToArray(), eli.ToArray(), hpf.ToArray(), st.ToArray(), xs.ToArray(), ys.ToArray(), zs.ToArray(), af.ToArray(), brn.ToArray(), siz.ToArray());
+                NetEnemiesSynced = ids.Count; NetEnemyBytes = ids.Count * 11 * 4 + 48;   // 11 arrays × 4B/elem + RPC/header overhead
 
                 // pickups: live orbs (kind 0) + unopened chests (kind 1)
                 var pid = new System.Collections.Generic.List<int>();
@@ -1563,13 +2101,33 @@ public partial class Net : Node
                 var pz = new System.Collections.Generic.List<float>();
                 var pcol = new System.Collections.Generic.List<int>();
                 Game.I.Orbs.RemoveAll(o => o == null || !GodotObject.IsInstanceValid(o));
-                foreach (var o in Game.I.Orbs) { pid.Add(o.NetId); pk.Add(0); px.Add(o.GlobalPosition.X); pz.Add(o.GlobalPosition.Z); pcol.Add(PackColor(o.Tint)); }
-                foreach (var ch in Game.I.Chests)
+                // keep this packet under the network MTU (~1392B): in heavy combat XP orbs pile up unbounded, so
+                // sync only the nearest ~48 to the local host player. Each entry is ~20B (5 arrays) → ~960B + chests,
+                // safely under MTU. Distant off-screen orbs don't need client visuals anyway. (was uncapped → packet
+                // fragmentation + loss → the "MP lag" in big fights)
+                var orbs = Game.I.Orbs;
+                if (orbs.Count > 48)
                 {
-                    if (ch == null || !GodotObject.IsInstanceValid(ch) || ch.Opened) continue;
-                    pid.Add(ch.NetId); pk.Add(1); px.Add(ch.GlobalPosition.X); pz.Add(ch.GlobalPosition.Z); pcol.Add(0);
+                    var pc = Game.I.Player != null ? Game.I.Player.GlobalPosition : Vector3.Zero;
+                    orbs = new System.Collections.Generic.List<Orb>(orbs);
+                    orbs.Sort((a, b) => a.GlobalPosition.DistanceSquaredTo(pc).CompareTo(b.GlobalPosition.DistanceSquaredTo(pc)));
+                    orbs.RemoveRange(48, orbs.Count - 48);
                 }
+                foreach (var o in orbs) { pid.Add(o.NetId); pk.Add(0); px.Add(o.GlobalPosition.X); pz.Add(o.GlobalPosition.Z); pcol.Add(PackColor(o.Tint)); }
+                // chests are now scattered map-wide at load (up to 12/warden), so this unreliable packet can blow past MTU. Sync only
+                // the nearest ~18 unopened chests to the host — plenty on-screen; the rest stream in as the party roams. (MP-only; solo
+                // has no snapshot and sees all chests locally.) TODO: a one-shot reliable chest broadcast would remove this near-host bias.
+                var chestList = new System.Collections.Generic.List<Chest>();
+                foreach (var ch in Game.I.Chests) if (ch != null && GodotObject.IsInstanceValid(ch) && !ch.Opened) chestList.Add(ch);
+                if (chestList.Count > 18)
+                {
+                    var cpc = Game.I.Player != null ? Game.I.Player.GlobalPosition : Vector3.Zero;
+                    chestList.Sort((a, b) => a.GlobalPosition.DistanceSquaredTo(cpc).CompareTo(b.GlobalPosition.DistanceSquaredTo(cpc)));
+                    chestList.RemoveRange(18, chestList.Count - 18);
+                }
+                foreach (var ch in chestList) { pid.Add(ch.NetId); pk.Add(ch.Hidden ? 2 : 1); px.Add(ch.GlobalPosition.X); pz.Add(ch.GlobalPosition.Z); pcol.Add(0); }
                 Rpc(nameof(PickupSnapshot), pid.ToArray(), pk.ToArray(), px.ToArray(), pz.ToArray(), pcol.ToArray());
+                NetOrbsSynced = orbs.Count; NetPickupBytes = pid.Count * 5 * 4 + 48;   // 5 arrays × 4B/elem + overhead (orbs + chests)
 
                 // ritual circles: id, type, x, z, active, status
                 var rid = new System.Collections.Generic.List<int>();
@@ -1638,18 +2196,70 @@ public partial class Net : Node
     // Enemies are host-owned, so a client's Cyclone/Hurricane can't move them directly. It asks the host to
     // apply a radial effect to the real enemies in an area; host/solo apply it immediately, and the motion
     // syncs to everyone via the (Y-bearing) enemy snapshot. mode: 0 pull-in, 1 fling-up, 2 area damage. (NEW)
-    public void StormForce(Vector3 center, float radius, int mode, float power)
+    public void StormForce(Vector3 center, float radius, int mode, float power, float chance = 1f, float fallMul = 1f)
     {
-        if (NetConnected() && !IsHost) { RpcId(1, nameof(ReqStormForce), center.X, center.Z, radius, mode, power); return; }
-        ApplyStormForce(center, radius, mode, power);
+        if (NetConnected() && !IsHost) { RpcId(1, nameof(ReqStormForce), center.X, center.Z, radius, mode, power, chance, fallMul); return; }
+        ApplyStormForce(center, radius, mode, power, chance, fallMul);
     }
-    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
-    private void ReqStormForce(float cx, float cz, float radius, int mode, float power)
+
+    // (PHOENIX) fire a phoenix dive. The HOST owns the enemy grab/carry/damage sim; every other machine flies a
+    // deterministic visual bird. Mirrors StormForce's host-routing (client caster → RpcId(1) → host simulates + relays).
+    public void FirePhoenixDive(Player caster, Vector3 origin, Vector3 dir, int tier, bool mod, float touchDmg, float grabDmg, float bossFrac, float baseUnit)
+    {
+        if (!NetConnected()) { Game.I.SpawnPhoenixDive(caster, origin, dir, tier, mod, true, touchDmg, grabDmg, bossFrac, baseUnit); return; }   // solo: simulate locally
+        if (IsHost)
+        {
+            Game.I.SpawnPhoenixDive(caster, origin, dir, tier, mod, true, touchDmg, grabDmg, bossFrac, baseUnit);   // host simulates
+            Rpc(nameof(ReceivePhoenixDive), origin.X, origin.Y, origin.Z, dir.X, dir.Z, tier, mod, touchDmg, grabDmg, bossFrac, baseUnit);   // clients fly the visual
+        }
+        else RpcId(1, nameof(ReqPhoenixDive), origin.X, origin.Y, origin.Z, dir.X, dir.Z, tier, mod, touchDmg, grabDmg, bossFrac, baseUnit);   // client caster asks the host to run it
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReqPhoenixDive(float ox, float oy, float oz, float dx, float dz, int tier, bool mod, float touchDmg, float grabDmg, float bossFrac, float baseUnit)
     {
         if (!IsHost) return;
-        ApplyStormForce(new Vector3(cx, 0f, cz), radius, mode, power);
+        var origin = new Vector3(ox, oy, oz); var dir = new Vector3(dx, 0f, dz);
+        Game.I.SpawnPhoenixDive(null, origin, dir, tier, mod, true, touchDmg, grabDmg, bossFrac, baseUnit);   // host simulates on behalf of the client caster
+        Rpc(nameof(ReceivePhoenixDive), ox, oy, oz, dx, dz, tier, mod, touchDmg, grabDmg, bossFrac, baseUnit);   // relay the visual to all clients (incl. the caster)
     }
-    private void ApplyStormForce(Vector3 center, float radius, int mode, float power)
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceivePhoenixDive(float ox, float oy, float oz, float dx, float dz, int tier, bool mod, float touchDmg, float grabDmg, float bossFrac, float baseUnit)
+    {
+        if (IsHost) return;   // the host already spawned the simulating instance
+        Game.I.SpawnPhoenixDive(null, new Vector3(ox, oy, oz), new Vector3(dx, 0f, dz), tier, mod, false, touchDmg, grabDmg, bossFrac, baseUnit);   // visual-only bird
+    }
+
+    // (ARCANE STORM) host owns the rain-field strikes; every other machine renders a visual-only storm. Same routing as the phoenix dive.
+    public void FireArcaneStorm(Player caster, Vector3 pos, float radius, float dur, bool mod, int tier, float baseDmg, float hpScale, float bossCapMul, float critChance, float critMul)
+    {
+        if (!NetConnected()) { Game.I.SpawnArcaneStorm(caster, pos, radius, dur, false, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul); return; }
+        if (IsHost)
+        {
+            Game.I.SpawnArcaneStorm(caster, pos, radius, dur, false, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);
+            Rpc(nameof(ReceiveArcaneStorm), pos.X, pos.Y, pos.Z, radius, dur, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);
+        }
+        else RpcId(1, nameof(ReqArcaneStorm), pos.X, pos.Y, pos.Z, radius, dur, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReqArcaneStorm(float px, float py, float pz, float radius, float dur, bool mod, int tier, float baseDmg, float hpScale, float bossCapMul, float critChance, float critMul)
+    {
+        if (!IsHost) return;
+        Game.I.SpawnArcaneStorm(null, new Vector3(px, py, pz), radius, dur, false, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);   // host simulates on behalf of the client caster
+        Rpc(nameof(ReceiveArcaneStorm), px, py, pz, radius, dur, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void ReceiveArcaneStorm(float px, float py, float pz, float radius, float dur, bool mod, int tier, float baseDmg, float hpScale, float bossCapMul, float critChance, float critMul)
+    {
+        if (IsHost) return;
+        Game.I.SpawnArcaneStorm(null, new Vector3(px, py, pz), radius, dur, true, mod, tier, baseDmg, hpScale, bossCapMul, critChance, critMul);   // visual-only storm
+    }
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
+    private void ReqStormForce(float cx, float cz, float radius, int mode, float power, float chance, float fallMul)
+    {
+        if (!IsHost) return;
+        ApplyStormForce(new Vector3(cx, 0f, cz), radius, mode, power, chance, fallMul);
+    }
+    private void ApplyStormForce(Vector3 center, float radius, int mode, float power, float chance = 1f, float fallMul = 1f)
     {
         if (Game.I == null) return;
         foreach (var e in Game.I.Enemies.ToArray())
@@ -1657,9 +2267,10 @@ public partial class Net : Node
             if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead || e.Remote) continue;   // real enemies only
             Vector3 flat = e.GlobalPosition - center; flat.Y = 0; float d = flat.Length();
             if (d > radius + e.Radius) continue;
+            if (mode == 1 && chance < 1f && GD.Randf() >= chance) continue;   // (NEW) Eruption: per-enemy fling chance (scales with rarity)
             if (mode == 0) e.PullToward(center, power);                                          // Cyclone drag-in
             else if (mode == 2) e.Hurt(power, DamageType.Wind, false);                           // area grind tick
-            else if (mode == 4) e.Fling(Vector3.Up * power);                                     // Updraft: lift straight up (mass-scaled → big foes barely rise)
+            else if (mode == 4) e.Fling(Vector3.Up * power, fallMul);                             // Updraft: lift straight up (mass-scaled → big foes barely rise); fallMul = Tempest
             else if (mode == 3)                                                                  // Wind Rush: fling outward/back + slight lift
             {
                 Vector3 outw = d > 0.1f ? flat.Normalized() : Vector3.Forward;
@@ -1716,7 +2327,7 @@ public partial class Net : Node
             if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead || e.Remote || e.NetId != netId) continue;
             switch (kind)
             {
-                case 0: e.Bleed(a, b, c > 0.5f, (int)Multiplayer.GetRemoteSenderId()); break;   // (NEW) owner = the client who cast it
+                case 0: { int fl = (int)(c + 0.01f); e.Bleed(a, b, (fl & 1) != 0, (int)Multiplayer.GetRemoteSenderId(), 1f, (fl & 2) != 0); break; }   // owner = the client who cast it; bit1 = rot, bit2 = persist (Blood Rot mod)
                 case 1: e.Slow(a, b); break;
                 case 2: e.Root(a); break;
                 case 3: e.Mark(a, b, (int)c); break;
@@ -1724,6 +2335,7 @@ public partial class Net : Node
                 case 5: e.AddFreeze(a, b, c); break;   // (NEW) frost witch freeze stacks + caster's frost profile (threshMul=b, durBonus=c) — best-of on the host
                 case 6: e.AddBurn(a, b, c, 0f, (int)Multiplayer.GetRemoteSenderId()); break;  // (NEW) Ember burn stacks (amt=a, perStackDps=b, bombFlat=c); owner = the client who cast it
                 case 7: e.ConsumeCurse(a, b, c); break;   // (NEW) Forsaken voodoo crush: a=frac of stacks, b=damage per stack, c=effective-stack cap
+                case 8: e.SetArcaneMark(a > 0.5f); break;   // (NEW) Arcane witch: a client caster's mark on/off on the host (a=1 on, 0 off)
             }
             return;
         }
@@ -1777,7 +2389,7 @@ public partial class Net : Node
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
-    private void EnemySnapshot(int[] ids, int[] types, int[] elite, float[] hpf, int[] status, float[] xs, float[] ys, float[] zs, int[] aff, int[] burn)
+    private void EnemySnapshot(int[] ids, int[] types, int[] elite, float[] hpf, int[] status, float[] xs, float[] ys, float[] zs, int[] aff, int[] burn, int[] siz)
     {
         if (IsHost || Game.I == null) return;   // only clients render proxies
         var seen = new HashSet<int>();
@@ -1791,6 +2403,7 @@ public partial class Net : Node
                 e = new Enemy();
                 e.Configure(EnemyKinds.Types[types[i]], 1);   // configure BEFORE AddChild — _Ready builds the mesh from this
                 if (elite[i] == 1) e.MakeElite();              // match the host's gold/larger elite look
+                e.SizeMul = (siz != null && i < siz.Length) ? siz[i] / 100f : 1f;   // (NEW) use the HOST's size so the mesh + hitbox match — _Ready applies it before building
                 e.Remote = true;
                 e.NetId = id;
                 e.TypeIdx = types[i];
@@ -1854,7 +2467,7 @@ public partial class Net : Node
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
-    private void GuardianState(float x, float y, float z, float yaw, int slam)
+    private void GuardianState(float x, float y, float z, float yaw, float slamPhase)
     {
         if (Game.I == null) return;
         long id = Multiplayer.GetRemoteSenderId();
@@ -1865,7 +2478,7 @@ public partial class Net : Node
             g.GlobalPosition = new Vector3(x, y, z);
             _ghostGuardians[id] = g;
         }
-        g.SetGhost(new Vector3(x, y, z), yaw, slam == 1);
+        g.SetGhost(new Vector3(x, y, z), yaw, slamPhase);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.UnreliableOrdered)]
@@ -1884,11 +2497,11 @@ public partial class Net : Node
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, CallLocal = false, TransferMode = MultiplayerPeer.TransferModeEnum.Unreliable)]
-    private void NetVitals(float hp, float mana, float shield, float blessed, int blood, int armor, int witch, float bark, float eclipse, float storm)
+    private void NetVitals(float hp, float mana, float shield, float blessed, int blood, int armor, int witch, float bark, float eclipse, float storm, float luck)
     {
         long id = Multiplayer.GetRemoteSenderId();
         if (_remotes.TryGetValue(id, out var av) && GodotObject.IsInstanceValid(av))
-            av.SetVitals(hp, mana, shield, blessed, blood, armor, witch, bark, eclipse, storm);
+            av.SetVitals(hp, mana, shield, blessed, blood, armor, witch, bark, eclipse, storm, luck);
     }
 
     public System.Collections.Generic.List<RemoteAvatar> AllyAvatars()

@@ -1,4 +1,5 @@
 using Godot;
+using System.Collections.Generic;
 
 // Wisp.cs — a will-o'-wisp: a small floating mote that glows, gently bobs, drifts, and breathes. Purely
 // decorative + local (built per-machine from the chunk seed), so it needs no networking. Scattered through
@@ -6,9 +7,18 @@ using Godot;
 // bounce onto nearby surfaces. Short-range, shadowless light to stay cheap under Forward+ clustering. (NEW)
 public partial class Wisp : Node3D
 {
+    // (PERF) every live wisp registers here so Game.CullWispLights can keep only the nearest few OmniLights lit.
+    public static readonly List<Wisp> All = new();
     private MeshInstance3D _mote;
     private OmniLight3D _light;
     private float _t, _seed, _energy;
+    private bool _lit = true;
+
+    public Vector3 LightPos => GlobalPosition;
+    public void SetLit(bool on) { _lit = on; if (_light != null && GodotObject.IsInstanceValid(_light) && _light.Visible != on) _light.Visible = on; }
+
+    public override void _EnterTree() { All.Add(this); }
+    public override void _ExitTree() { All.Remove(this); }
 
     public void Init(Color col, float energy, float range, float seed)
     {
@@ -25,7 +35,10 @@ public partial class Wisp : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
+        // (PERF) far from the camera → the bob/breathe motion is imperceptible; skip the per-frame math entirely
+        var cam = Game.I.Player?.Cam;
+        if (cam != null && GlobalPosition.DistanceSquaredTo(cam.GlobalPosition) > 45f * 45f) return;
         _t += (float)delta;
         // gentle bob + slow lateral drift around the anchor + a soft breathing pulse
         float bob = Mathf.Sin(_t * 1.3f + _seed) * 0.35f;

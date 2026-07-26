@@ -47,7 +47,7 @@ public partial class CrescentOrb : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta;
         if (Remote)   // ghost: follow the owner's real positions (works for orbit, fling, and rotate-in-place alike)
         {
@@ -73,7 +73,7 @@ public partial class CrescentOrb : Node3D
             foreach (var e in Game.I.Enemies.ToArray())   // (FIX) snapshot — hits can mutate the live list
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-                if (GlobalPosition.DistanceTo(e.GlobalPosition) < e.Radius + 1.1f)
+                if (e.HitBy(GlobalPosition, 1.1f))   // (FIX) full-body capsule — was a sphere at the low origin, missing tall foes' upper body
                 {
                     ulong id = e.GetInstanceId();
                     float now = (float)Time.GetTicksMsec() / 1000f;

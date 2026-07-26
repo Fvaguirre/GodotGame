@@ -1,21 +1,35 @@
 using Godot;
 using System.Collections.Generic;
 
-// Stampede.cs — the Wild Swarm ultimate. A CONTINUOUS stream of little tree-ent critters (the same body
-// as the Verdant Thornlings) pours forward for a few seconds, trampling everything in their lane and
-// chanting a steady stream of silly battle-cries, kicking up cartoon dust as they go, then petering out.
-// The critters can't be damaged, detonated, or targeted by enemies — they're a pure forward sweep.
-// Damage is owner-only (routes to the host like any other hit); allies get a visual-only copy + the chant.
+// Stampede.cs — the Wild Swarm ultimate. A CONTINUOUS stream of little tree-ent critters pours forward for a few
+// seconds, trampling everything in their lane, chanting silly battle-cries and kicking up dust, then peters out.
+// The critters can't be damaged, detonated, or targeted — a pure forward sweep. Damage is owner-only (routes to the
+// host like any other hit); allies get a visual-only copy + the chant.
+//
+// (PERF REWORK) The old version spawned a fresh multi-mesh ent Node3D ~19×/sec, each living the whole ~12s window →
+// 200+ full-bodied ents on screen at once, a per-critter SurfaceHeight every frame, and an O(enemies×critters) trample
+// scan. That tanked the framerate. Now ALL critters are ONE GPU-instanced MultiMesh (a single draw call), capped at a
+// fixed instance count and recycled; ground height is sampled on a cheap per-critter stagger; and the trample is an
+// analytic lane-band test (O(enemies), not O(enemies×critters)).
 public partial class Stampede : Node3D
 {
     private Player _caster;
     private Vector3 _origin, _fwd, _right;
     private float _width, _dmg, _dur, _travel, _speed = 16f;
     private bool _visualOnly;
-    private float _elapsed = 0f, _spawnAcc = 0f, _chantAcc = 0.3f, _chantEvery = 0.5f, _dustT = 0f;
+    private float _elapsed = 0f, _spawnAcc = 0f, _chantAcc = 0.8f, _chantEvery = 2.5f, _dustT = 0f;
 
-    private class Crit { public Node3D Node; public float Lane, Dist, Speed, Phase; }
-    private readonly List<Crit> _crits = new();
+    private const int Cap = 80;                 // hard ceiling on live critters (one MultiMesh, one draw call)
+    private MultiMeshInstance3D _mmi;
+    private MultiMesh _mm;
+    private static Mesh _critMesh;
+
+    private struct Crit { public bool Active; public float Lane, Dist, Speed, Phase, GY, GYT, Scale; }
+    private readonly Crit[] _crits = new Crit[Cap];
+    private readonly Stack<int> _free = new();
+    private int _liveCount = 0;
+    private float _minDist = 1e9f, _maxDist = -1e9f;   // the occupied lane band (for the analytic trample)
+
     private readonly Dictionary<ulong, float> _hitCd = new();
 
     private static readonly string[] Lines = {
@@ -28,126 +42,139 @@ public partial class Stampede : Node3D
     {
         _caster = caster; _origin = origin; _fwd = fwd.Normalized(); _width = width; _dmg = dmg; _dur = durationSec; _visualOnly = visualOnly;
         _right = new Vector3(_fwd.Z, 0, -_fwd.X);
-        _travel = _dur * _speed + 6f;            // how far a critter runs before it peels off and fades
+        _travel = _dur * _speed + 6f;
+        BuildMultiMesh();
+        for (int i = Cap - 1; i >= 0; i--) { _free.Push(i); HideInstance(i); }
         Game.I.Sfx?.Rustle();
     }
 
+    // one shared low-poly brown ent body baked to a single Mesh so every critter is one MultiMesh instance
+    private static Mesh CritMesh()
+    {
+        if (_critMesh != null) return _critMesh;
+        _critMesh = new CapsuleMesh { Radius = 0.42f, Height = 1.25f, RadialSegments = 6, Rings = 3 };
+        return _critMesh;
+    }
+
+    private void BuildMultiMesh()
+    {
+        _mm = new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, Mesh = CritMesh(), InstanceCount = Cap };
+        _mmi = new MultiMeshInstance3D { Multimesh = _mm, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+        var mat = Game.ToonEmissive(new Color(0.42f, 0.30f, 0.16f), 0.35f, 0.02f);   // brown-bark, faintly lit
+        _mmi.MaterialOverride = mat;
+        AddChild(_mmi);
+    }
+
+    private void HideInstance(int i) => _mm.SetInstanceTransform(i, new Transform3D(Basis.Identity.Scaled(Vector3.Zero), new Vector3(0, -9999f, 0)));
+
     private void SpawnCritter()
     {
-        var bark = Game.ToonEmissive(new Color(0.42f, 0.30f, 0.18f), 0.4f, 0.03f);
-        var leaf = Game.ToonEmissive(new Color(0.30f, 0.72f, 0.34f), 0.7f, 0.04f);
-        var glow = Game.ToonEmissive(new Color(0.55f, 1f, 0.5f), 1.6f, 0.02f);
-        float s = (float)GD.RandRange(0.5, 0.8);
-
-        var node = new Node3D();
-        AddChild(node);
-        void Add(Mesh m, Material mat, Vector3 pos, Vector3 rotDeg = default)
-        { var mi = new MeshInstance3D { Mesh = m, MaterialOverride = mat }; mi.Position = pos; mi.RotationDegrees = rotDeg; node.AddChild(mi); }
-        Add(new CylinderMesh { TopRadius = 0.22f, BottomRadius = 0.3f, Height = 1.0f }, bark, new Vector3(0, 0.5f, 0));   // trunk
-        Add(new SphereMesh { Radius = 0.55f, Height = 1.1f }, leaf, new Vector3(0, 1.25f, 0));                            // canopy
-        Add(new SphereMesh { Radius = 0.36f, Height = 0.72f }, leaf, new Vector3(0.32f, 1.5f, 0.1f));
-        Add(new SphereMesh { Radius = 0.32f, Height = 0.64f }, leaf, new Vector3(-0.3f, 1.45f, -0.1f));
-        Add(new SphereMesh { Radius = 0.06f, Height = 0.12f }, glow, new Vector3(0.12f, 0.95f, 0.28f));                   // eyes
-        Add(new SphereMesh { Radius = 0.06f, Height = 0.12f }, glow, new Vector3(-0.12f, 0.95f, 0.28f));
-        node.Scale = Vector3.One * s;
-        node.Rotation = new Vector3(0, Mathf.Atan2(_fwd.X, _fwd.Z), 0);
-
-        float lane = (float)GD.RandRange(-_width * 0.5, _width * 0.5);
+        if (_free.Count == 0) return;
+        int i = _free.Pop();
         float back = (float)GD.RandRange(0.0, 3.0);
-        var p = _origin + _right * lane - _fwd * back;
-        node.GlobalPosition = new Vector3(p.X, 0, p.Z);
-        _crits.Add(new Crit { Node = node, Lane = lane, Dist = -back, Speed = _speed * (float)GD.RandRange(0.92, 1.12), Phase = (float)GD.RandRange(0.0, 6.28) });
+        _crits[i] = new Crit {
+            Active = true,
+            Lane = (float)GD.RandRange(-_width * 0.5, _width * 0.5),
+            Dist = -back,
+            Speed = _speed * (float)GD.RandRange(0.92, 1.12),
+            Phase = (float)GD.RandRange(0.0, 6.28),
+            GY = 0f, GYT = 0f, Scale = (float)GD.RandRange(0.6, 0.95),
+        };
+        _liveCount++;
     }
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused
         float dt = (float)delta;
         _elapsed += dt;
 
-        // continuous spawning at the back while the window is open → a flowing line, not a single row
+        // continuous spawning at the back while the window is open (capped by the free pool → density without a node blowup)
         if (_elapsed < _dur)
         {
             _spawnAcc += dt;
-            float every = 0.08f;
+            const float every = 0.08f;
             while (_spawnAcc >= every) { _spawnAcc -= every; SpawnCritter(); if (GD.Randf() < 0.5f) SpawnCritter(); }
         }
 
-        // advance critters; retire those that have run their distance
-        for (int i = _crits.Count - 1; i >= 0; i--)
+        // advance + write instance transforms in one pass; also track the occupied lane band for the trample
+        _minDist = 1e9f; _maxDist = -1e9f;
+        float yaw = Mathf.Atan2(_fwd.X, _fwd.Z);
+        for (int i = 0; i < Cap; i++)
         {
-            var c = _crits[i];
-            if (!GodotObject.IsInstanceValid(c.Node)) { _crits.RemoveAt(i); continue; }
+            if (!_crits[i].Active) continue;
+            ref var c = ref _crits[i];
             c.Dist += c.Speed * dt;
             c.Phase += dt * 16f;
+            if (c.Dist > _travel) { c.Active = false; _liveCount--; HideInstance(i); _free.Push(i); continue; }
+
+            // ground: sampled on a cheap per-critter stagger (~5×/s), not every frame for every critter
+            c.GYT -= dt;
             var bp = _origin + _fwd * c.Dist + _right * c.Lane;
+            if (c.GYT <= 0f) { c.GY = Game.I.SurfaceHeight(new Vector3(bp.X, 0f, bp.Z), 1e9f); c.GYT = 0.18f + GD.Randf() * 0.1f; }
             float hop = Mathf.Abs(Mathf.Sin(c.Phase)) * 0.3f;
-            float gy = Game.I != null ? Game.I.SurfaceHeight(new Vector3(bp.X, 0f, bp.Z), 1e9f) : 0f;   // (NEW) run ON the ground, not through hills
-            c.Node.GlobalPosition = new Vector3(bp.X, gy + hop, bp.Z);
-            c.Node.Rotation = new Vector3(Mathf.Sin(c.Phase) * 0.18f, Mathf.Atan2(_fwd.X, _fwd.Z), 0);   // lean/bob as they run
-            if (c.Dist > _travel)
-            {
-                var node = c.Node; var tw = node.CreateTween(); tw.TweenProperty(node, "scale", Vector3.Zero, 0.18f);
-                tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(node)) node.QueueFree(); }));
-                _crits.RemoveAt(i);
-            }
+            float lean = Mathf.Sin(c.Phase) * 0.18f;
+            var basis = (new Basis(Vector3.Up, yaw) * new Basis(Vector3.Right, lean)).Scaled(Vector3.One * c.Scale);
+            _mm.SetInstanceTransform(i, new Transform3D(basis, new Vector3(bp.X, c.GY + hop + 0.62f * c.Scale, bp.Z)));
+
+            if (c.Dist < _minDist) _minDist = c.Dist;
+            if (c.Dist > _maxDist) _maxDist = c.Dist;
         }
 
-        // dust puffs across the leading edge
+        // dust puffs across the front (throttled)
         _dustT -= dt;
-        if (_dustT <= 0f && _crits.Count > 0)
+        if (_dustT <= 0f && _liveCount > 0)
         {
-            _dustT = 0.05f;
-            for (int k = 0; k < 2; k++)
-            {
-                var c = _crits[(int)(GD.Randi() % (uint)_crits.Count)];
-                if (GodotObject.IsInstanceValid(c.Node)) SpawnDust(new Vector3(c.Node.GlobalPosition.X, 0.1f, c.Node.GlobalPosition.Z));
-            }
+            _dustT = 0.12f;
+            float d = Mathf.Lerp(_minDist, _maxDist, 0.85f + GD.Randf() * 0.15f);
+            float lane = (float)GD.RandRange(-_width * 0.5, _width * 0.5);
+            var dp = _origin + _fwd * d + _right * lane;
+            SpawnDust(new Vector3(dp.X, 0.1f, dp.Z));
         }
 
-        // continuous chant — a fresh silly line every half-second or so (owner broadcasts so everyone hears the chorus)
+        // continuous chant
         _chantAcc -= dt;
-        if (_chantAcc <= 0f && !_visualOnly && _crits.Count > 0)
+        if (_chantAcc <= 0f && !_visualOnly && _liveCount > 0)
         {
-            _chantAcc = _chantEvery = (float)GD.RandRange(0.35, 0.7);
-            var c = _crits[(int)(GD.Randi() % (uint)_crits.Count)];
-            if (GodotObject.IsInstanceValid(c.Node))
-            {
-                string line = Lines[(int)(GD.Randi() % (uint)Lines.Length)];
-                var col = new Color(0.55f, 1f, 0.5f);
-                Thornling.SpeakAt(c.Node.GlobalPosition, line, 3, col);
-                Game.I.NetMgr?.BroadcastMinionSay(c.Node.GlobalPosition, line, 3, col);
-            }
+            _chantAcc = _chantEvery = (float)GD.RandRange(1.8, 3.5);   // (TUNE) much sparser chirps — the longer ult made the old 0.35–0.7s spam grating
+            float d = Mathf.Lerp(_minDist, _maxDist, GD.Randf());
+            var cp = _origin + _fwd * d + _right * (float)GD.RandRange(-_width * 0.4, _width * 0.4);
+            cp = new Vector3(cp.X, Game.I.SurfaceHeight(new Vector3(cp.X, 0f, cp.Z), 1e9f) + 1.2f, cp.Z);
+            string line = Lines[(int)(GD.Randi() % (uint)Lines.Length)];
+            var col = new Color(0.55f, 1f, 0.5f);
+            Thornling.SpeakAt(cp, line, 3, col);
+            Game.I.NetMgr?.BroadcastMinionSay(cp, line, 3, col);
         }
 
-        // trample damage: any enemy near a critter takes a hit on a short per-enemy cooldown
-        if (!_visualOnly && Game.I != null)
+        // (PERF) trample = an analytic lane-band test: project each enemy onto the stampede axis and hit those inside the
+        // occupied band + lane width. O(enemies), not O(enemies × critters). Per-enemy cooldown as before.
+        if (!_visualOnly && _liveCount > 0)
         {
             float now = (float)Time.GetTicksMsec() / 1000f;
+            float halfW = _width * 0.5f + 1.5f, lo = _minDist - 1.5f, hi = _maxDist + 1.5f;
             foreach (var e in Game.I.Enemies.ToArray())
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                 if (_hitCd.TryGetValue(e.GetInstanceId(), out float t) && now < t) continue;
-                bool near = false;
-                foreach (var c in _crits)
-                    if (GodotObject.IsInstanceValid(c.Node) && c.Node.GlobalPosition.DistanceTo(e.GlobalPosition) < e.Radius + 1.5f) { near = true; break; }
-                if (near)
-                {
-                    _hitCd[e.GetInstanceId()] = now + 0.45f;
-                    e.Hurt(_dmg, DamageType.Nature, true, false);
-                    e.Knockback(_origin, 1.1f);
-                }
+                Vector3 rel = e.GlobalPosition - _origin; rel.Y = 0f;
+                float along = rel.Dot(_fwd);
+                if (along < lo || along > hi) continue;
+                if (Mathf.Abs(rel.Dot(_right)) > halfW + e.Radius) continue;
+                _hitCd[e.GetInstanceId()] = now + 0.45f;
+                e.Hurt(_dmg, DamageType.Nature, true, false);
+                e.Knockback(_origin, 1.1f);
             }
         }
 
-        if (_elapsed >= _dur && _crits.Count == 0) QueueFree();
+        if (_elapsed >= _dur && _liveCount == 0) QueueFree();
     }
 
     private void SpawnDust(Vector3 pos)
     {
         var dust = new MeshInstance3D
         {
-            Mesh = new SphereMesh { Radius = 0.4f, Height = 0.5f },
+            Mesh = new SphereMesh { Radius = 0.4f, Height = 0.5f, RadialSegments = 6, Rings = 4 },
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             MaterialOverride = new StandardMaterial3D
             {
                 AlbedoColor = new Color(0.75f, 0.70f, 0.58f, 0.6f),

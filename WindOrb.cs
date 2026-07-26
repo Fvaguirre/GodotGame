@@ -92,7 +92,7 @@ public partial class WindOrb : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused
         float dt = (float)delta;
         _life += dt;
 

@@ -4,7 +4,9 @@ using Godot;
 // Sfx.cs — procedural audio (cast/hit/release/UI cues). Game.I.Sfx is the singleton; call Release(type)/etc. No external assets.
 public partial class Sfx : Node
 {
-    private AudioStreamPlayer _clink, _thunder, _elem, _chord, _music, _drums, _crit;
+    private AudioStreamPlayer _clink, _thunder, _elem, _chord, _music, _drums, _crit, _wardHum, _hauntMus;
+    public float HauntBlend = 0f;            // (HAUNT) 0..1, set by Game: are you in the storm? drives the haunting music layer
+    private float _hauntBlendCur = 0f;
     private const float Tau = 6.2831853f;
 
     public override void _Ready()
@@ -25,19 +27,68 @@ public partial class Sfx : Node
         _drums = new AudioStreamPlayer { VolumeDb = -42f, Stream = BuildDrums() };  // starts inaudible, fades in with tension
         AddChild(_drums);
         _drums.Play();
+        _wardHum = new AudioStreamPlayer { VolumeDb = -26f, Stream = BuildWardHum() };   // (NEW) warding-ritual charge drone; idle until WardCharge() starts it
+        AddChild(_wardHum);
+        _hauntMus = new AudioStreamPlayer { VolumeDb = -80f, Stream = BuildHauntMusic() };   // (HAUNT) eerie layer — always looping, silent until you enter a storm; phase-locked to the arp so it mixes in cleanly
+        AddChild(_hauntMus); _hauntMus.Play();
         InitSpellSounds();
     }
 
     public void Clink() { if (_clink != null) _clink.Play(); }
+    public void Coins() { PlayOne(BuildCoins(), -3f); }   // (NEW) bright coin "ch-ching" when a chest pays out gold
     public void CritHit() { if (_crit != null) _crit.Play(); }   // (NEW) local-only crit ding (only the hitting player hears it)
     public void Thunder() { if (_thunder != null) _thunder.Play(); }
+    // (HAUNT) a positional thunderclap over the storm — a deep rolling crack, pitch-varied so repeats don't sound canned
+    private AudioStreamWav _stormThunder;
+    public void StormThunder(Vector3 pos, float pitch = 1f)
+    {
+        _stormThunder ??= BuildStormThunder();
+        At(_stormThunder, pos, 2f, 140f, pitch);
+    }
+    private static AudioStreamWav BuildStormThunder()
+    {
+        int rate = 22050, n = (int)(rate * 1.5f);   // longer, rolling
+        var s = new float[n];
+        var rng = new System.Random(19);
+        float lp = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            // a sharp crack that decays into a long low rolling rumble with a couple of secondary peaks
+            float crackEnv = Mathf.Min(1f, t * 120f) * Mathf.Exp(-t * 6.5f);
+            float rollEnv = Mathf.Exp(-t * 1.4f) * (0.6f + 0.4f * Mathf.Sin(t * Tau * 1.7f) + 0.3f * Mathf.Sin(t * Tau * 0.7f + 1f));
+            float noise = (float)(rng.NextDouble() * 2 - 1);
+            lp += (noise - lp) * 0.18f;   // low-passed rumble noise
+            float rumble = Mathf.Sin(t * Tau * 52f) * 0.5f + Mathf.Sin(t * Tau * 33f) * 0.4f + Mathf.Sin(t * Tau * 21f) * 0.3f;
+            float crack = noise * crackEnv;
+            s[i] = (crack * 0.5f + (rumble + lp * 1.2f) * rollEnv * 0.55f);
+        }
+        for (int i = 0; i < n; i++) s[i] = (float)System.Math.Tanh(s[i] * 1.1) * 0.9f;
+        return Wav(s, rate);
+    }
+
+    // (NEW) warding-ritual charge loop — call every frame a warden stands in the circle; pitch + volume swell with the fill (0..1)
+    public void WardCharge(float frac)
+    {
+        if (_wardHum == null) return;
+        frac = Mathf.Clamp(frac, 0f, 1f);
+        if (!_wardHum.Playing) _wardHum.Play();
+        _wardHum.PitchScale = 0.72f + frac * 0.95f;                    // rises ~0.72 → 1.67 as it fills — the drone "gets more filled"
+        _wardHum.VolumeDb = Mathf.Lerp(-24f, -6f, Mathf.Sqrt(frac));   // swells in (sqrt so it's audible early, blooms toward 100%)
+    }
+    public void WardChargeStop() { if (_wardHum != null && _wardHum.Playing) _wardHum.Stop(); }
+    public void WardComplete() { PlayOne(BuildWardComplete(), -2f); WardChargeStop(); }   // (NEW) witchy relief ding at 100%
+
+    public void UnicornCall(Vector3 pos) { At(BuildUnicornCall(), pos, -4f, 60f); }   // (NEW) ethereal spectre shimmer/whinny on spawn
+    public void UnicornCharge(Vector3 pos) { At(BuildUnicornCharge(), pos, -3f, 70f); }   // (NEW) rising magical gallop as it charges the boss
+    public void ArcaneBoom(Vector3 pos) { At(BuildArcaneBoom(), pos, 4f, 120f); }   // (NEW) the mushroom-cloud detonation — deep boom + rumble + shimmer
 
     // ---- spell / combat one-shots (round-robin pool so they overlap) ----
     private AudioStreamPlayer[] _pool;
     private int _pi = 0;
     private AudioStreamPlayer3D[] _pool3d;     // spatial one-shots for enemy sounds (directional alerts)
     private int _pi3 = 0;
-    private AudioStreamWav _enemyGrowl, _enemyShoot, _bossRoar;
+    private AudioStreamWav _enemyGrowl, _enemyShoot, _bossRoar, _zAttack, _zGroan, _zDeath, _zExcited;   // (PERF) swarm sounds cached once, not synth'd per play
     private System.Collections.Generic.Dictionary<DamageType, AudioStreamWav> _cast, _impact, _charge, _release;
     private AudioStreamWav _death, _discord, _riteWin, _riteFail;
     private AudioStreamWav _damageTick, _critPlink;              // (NEW) universal per-hit confirm; crit → satisfying plink
@@ -54,6 +105,7 @@ public partial class Sfx : Node
         for (int i = 0; i < _hitPool.Length; i++) { _hitPool[i] = new AudioStreamPlayer3D { MaxDistance = 55f, UnitSize = 7f }; AddChild(_hitPool[i]); }
         _damageTick = BuildDamageTick(); _critPlink = BuildCritPlink();
         _enemyGrowl = BuildEnemyGrowl(); _enemyShoot = BuildEnemyShoot(); _bossRoar = BuildBossRoar();
+        _zAttack = BuildZombieAttack(); _zGroan = BuildZombieGroan(); _zDeath = BuildZombieDeath(); _zExcited = BuildZombieExcited();   // (PERF) build the swarm WAVs ONCE (was rebuilt every play → GC storm in a horde)
         _cast = new(); _impact = new(); _charge = new(); _release = new();
         foreach (DamageType t in System.Enum.GetValues(typeof(DamageType)))
         {
@@ -79,11 +131,17 @@ public partial class Sfx : Node
     public void Creak()               { PlayOne(BuildCreak(), -5f); }     // Barkskin activation — great tree groaning
     public void Minion(int kind)      { PlayOne(BuildMinion(kind), -13f); } // 0 spawn,1 attack,2 detonate,3 rally
     public void Fizzle()              { PlayOne(BuildFizzle(), -9f); }      // failed cast — not enough mana/blood
+    public void PlayerHurt(float sev) { PlayOne(BuildPlayerHurt(Mathf.Clamp(sev, 0f, 1f)), Mathf.Lerp(-11f, -2f, Mathf.Clamp(sev, 0f, 1f))); }   // (NEW) local pained thud when a hit reaches your HP — scales with severity
+    public void ShieldBreak()         { PlayOne(BuildShieldBreak(), -3f); }   // (NEW) crystalline shield-down shatter
+    public void ArmorBreak()          { PlayOne(BuildArmorBreak(), -3f); }    // (NEW) metallic armor-charge clang
+    public void Heartbeat()           { PlayOne(BuildHeartbeat(), -6f); }     // (NEW) low-health pulse thump (quickens near death)
+    public void LowHealth()           { PlayOne(BuildLowHealth(), -3f); }     // (NEW) one-shot alarm when you cross into low health
 
     // ---- spatial enemy sounds (directional alerts; played at the enemy's world position) ----
     public void EnemyGrowl(Vector3 pos) { At(_enemyGrowl, pos, -7f, 50f); }
     public void Poof(Vector3 pos) { At(BuildPoof(), pos, -13f, 45f); }   // (NEW) quiet magical spawn poof
     public void EnemyShoot(Vector3 pos) { At(_enemyShoot, pos, -9f, 55f); }
+    public void Incoming(Vector3 pos)   { At(BuildIncoming(), pos, -6f, 60f); }   // (NEW) spatial rising whistle — a shot on a collision course with you
     public void BossRoar(Vector3 pos)   { At(_bossRoar, pos, 0f, 95f); }
     public void BossTell(Vector3 pos)   { At(BuildBossTell(), pos, -4f, 80f); }   // short rising guttural wind-up grunt (NEW)
     public void CrunchAt(Vector3 pos)   { At(BuildCrunch(), pos, -5f, 55f); }   // smashed pumpkin: wet caving-in splat + rind cracks (NEW)
@@ -97,12 +155,22 @@ public partial class Sfx : Node
     public void ModSpike(Vector3 pos, bool net = true)   { At(BuildSpikeStab(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModSpike, pos); }
     public void ModCurse(Vector3 pos, bool net = true)   { At(BuildCurseWhoosh(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModCurse, pos); }
     public void CurseCrush(Vector3 pos)                  { At(BuildCurseCrush(), pos, -3f, 60f); }   // (NEW) voodoo crush — squelchy dark implosion (no net: the kind-58 VFX plays it on allies)
+    public void HexWeave(Vector3 pos)                    { At(BuildHexWeave(), pos, -4f, 60f); }      // (NEW) dark curse incantation for the Hex combos (replaced the scratchy WitchCackle)
+    private float _whishLast = -1f;
+    public void Whish(Vector3 pos)                       // (NEW) soft airy whoosh — the Cyclone swallowing an enemy projectile
+    {
+        float now = Time.GetTicksMsec() / 1000f;
+        if (now - _whishLast < 0.05f) return;            // throttle so a volley of eaten bolts isn't a wall of noise
+        _whishLast = now;
+        At(BuildWhish(), pos, -8f, 45f);
+    }
     public void ModChime(Vector3 pos, bool net = true)   { At(BuildLunarChime(), pos, -7f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModChime, pos); }
     public void ModHoly(Vector3 pos, bool net = true)    { At(BuildHolyChord(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModHoly, pos); }
     public void ModSmite(Vector3 pos, bool net = true)   { At(BuildSmiteStrike(), pos, -4f, 60f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModSmite, pos); }
     public void ModPour(Vector3 pos, bool net = true)    { At(BuildBloodPour(), pos, -6f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModPour, pos); }
     public void ModWind(Vector3 pos, bool net = true)    { At(BuildWindWhoosh(), pos, -5f, 60f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ModWind, pos); }
     public void ArcaneBlast(Vector3 pos, bool net = true){ At(BuildArcaneBlast(), pos, -3f, 75f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ArcaneBlast, pos); }
+    public void UltCast(Vector3 pos) { At(BuildUltCast(), pos, -1f, 95f); }   // (NEW) universal cinematic ult-activation whoomph (local — every ult already broadcasts its own element sound)
     public void HolyLances(Vector3 pos, bool net = true) { At(BuildLanceFall(), pos, -4f, 65f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.HolyLances, pos); }
     public void WindRushBy(Vector3 pos, bool net = true) { At(BuildWindWhoosh(), pos, -2f, 75f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.WindRushBy, pos); }
     public void WindSlash(Vector3 pos, bool net = true)  { At(BuildWindSlash(), pos, -4f, 65f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.WindSlash, pos); }
@@ -112,10 +180,18 @@ public partial class Sfx : Node
     public void GasHiss(Vector3 pos, bool net = true)    { At(BuildGasRelease(), pos, -6f, 50f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.GasHiss, pos); }
     public void FireworkLaunch(Vector3 pos) { At(BuildFireworkLaunch(), pos, -5f, 90f); }   // rising whistle (Firework plays locally on each machine)
     public void FireworkBurst(Vector3 pos)  { At(BuildFireworkBurst(), pos, -3f, 100f); }    // crackle boom
-    public void ZombieGroan(Vector3 pos, bool net = true) { At(BuildZombieGroan(), pos, -7f, 45f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieGroan, pos); }   // swarmer ambient (pool via random pitch)
-    public void ZombieDeath(Vector3 pos, bool net = true) { At(BuildZombieDeath(), pos, -5f, 45f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieDeath, pos); }   // swarmer death groan
-    public void ZombieAttack(Vector3 pos, bool net = true) { At(BuildZombieAttack(), pos, -6f, 45f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieAttack, pos); }   // bite/lunge (random build → variation)
-    public void ZombieExcited(Vector3 pos, bool net = true){ At(BuildZombieExcited(), pos, -6f, 50f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieExcited, pos); }   // spotted you
+    public void ZombieGroan(Vector3 pos, bool net = true) { At(_zGroan, pos, -7f, 45f, 0.82f + GD.Randf() * 0.32f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieGroan, pos); }   // (PERF) cached WAV + random pitch for variation
+    public void ZombieDeath(Vector3 pos, bool net = true) { At(_zDeath, pos, -5f, 45f, 0.88f + GD.Randf() * 0.26f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieDeath, pos); }   // (PERF) cached
+    private float _zAtkLast = -1f;
+    public void ZombieAttack(Vector3 pos, bool net = true)   // bite/lunge
+    {
+        float now = Time.GetTicksMsec() / 1000f;
+        if (now - _zAtkLast < 0.05f) return;   // (PERF) 150 swarmers biting a stationary player was ~150 fresh-WAV builds/sec (GC storm → 100ms spikes) — cache the WAV + throttle to ~20/sec
+        _zAtkLast = now;
+        At(_zAttack, pos, -6f, 45f, 0.82f + GD.Randf() * 0.32f);
+        if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieAttack, pos);
+    }
+    public void ZombieExcited(Vector3 pos, bool net = true){ At(_zExcited, pos, -6f, 50f, 0.88f + GD.Randf() * 0.26f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieExcited, pos); }   // (PERF) cached
     public void ZombieScream(Vector3 pos, bool net = true) { At(BuildZombieScream(), pos, -4f, 60f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieScream, pos); }   // shriek on spotting
     public void ZombieSnicker(Vector3 pos, bool net = true) { At(BuildZombieSnicker(), pos, -8f, 35f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieSnicker, pos); }   // idle chuckle
     public void TakerGrowl(Vector3 pos, bool net = true) { At(BuildTakerGrowl(), pos, -2f, 90f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerGrowl, pos); }   // deep spawn announce
@@ -437,6 +513,103 @@ public partial class Sfx : Node
         return Wav(s, rate);
     }
 
+    // (NEW) local pained thud when a hit reaches your HP. Bigger hits = lower, meatier, longer.
+    private static AudioStreamWav BuildPlayerHurt(float sev)
+    {
+        int rate = 22050, n = (int)(rate * (0.15f + 0.12f * sev)); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        float dur = n / (float)rate, baseF = Mathf.Lerp(215f, 120f, sev); float prev = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate, k = tt / dur;
+            float env = Mathf.Min(1f, tt / 0.004f) * Mathf.Exp(-tt * (17f - 7f * sev));
+            float f = Mathf.Lerp(baseF, baseF * 0.55f, k);                        // downward "oof"
+            float body = Mathf.Sin(tt * Tau * f) * 0.55f + Mathf.Sin(tt * Tau * f * 1.5f) * 0.22f;
+            float white = (float)(rng.NextDouble() * 2 - 1);
+            float hp = white - prev; prev = white;                               // fleshy impact hiss
+            s[i] = (body + hp * (0.22f + 0.22f * sev)) * env * 0.85f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) shield emptied — a bright glassy cluster that cracks apart and powers down.
+    private static AudioStreamWav BuildShieldBreak()
+    {
+        int rate = 22050, n = (int)(rate * 0.34f); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate;
+            float env = Mathf.Min(1f, tt / 0.003f) * Mathf.Exp(-tt * 9f);
+            float glass = Mathf.Sin(tt * Tau * 1400f) * 0.3f + Mathf.Sin(tt * Tau * 1870f) * 0.22f + Mathf.Sin(tt * Tau * 2540f) * 0.15f;
+            float shard = (rng.NextDouble() < 0.25) ? (float)(rng.NextDouble() * 2 - 1) * 0.6f * Mathf.Exp(-tt * 11f) : 0f;
+            float sweep = Mathf.Sin(tt * Tau * Mathf.Lerp(900f, 300f, tt / 0.34f)) * 0.2f * Mathf.Exp(-tt * 6f);   // falling power-down
+            s[i] = (glass + shard + sweep) * env * 0.7f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) armor charge popped — an inharmonic metallic clang.
+    private static AudioStreamWav BuildArmorBreak()
+    {
+        int rate = 22050, n = (int)(rate * 0.26f); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate;
+            float env = Mathf.Min(1f, tt / 0.002f) * Mathf.Exp(-tt * 13f);
+            float clang = Mathf.Sin(tt * Tau * 520f) * 0.35f + Mathf.Sin(tt * Tau * 1190f) * 0.25f + Mathf.Sin(tt * Tau * 1730f) * 0.17f;
+            float ring = Mathf.Sin(tt * Tau * 2600f) * 0.12f * Mathf.Exp(-tt * 5f);
+            float grit = ((float)rng.NextDouble() * 2 - 1) * 0.25f * Mathf.Exp(-tt * 20f);
+            s[i] = (clang + ring + grit) * env * 0.75f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) low-health heartbeat — a lub-dub of low sine thumps.
+    private static AudioStreamWav BuildHeartbeat()
+    {
+        int rate = 22050, n = (int)(rate * 0.30f); var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate;
+            float lub = Mathf.Sin(tt * Tau * 62f) * Mathf.Min(1f, tt / 0.004f) * Mathf.Exp(-tt * 30f);
+            float t2 = tt - 0.13f;
+            float dub = t2 > 0f ? Mathf.Sin(t2 * Tau * 54f) * Mathf.Min(1f, t2 / 0.004f) * Mathf.Exp(-t2 * 34f) * 0.8f : 0f;
+            s[i] = (lub + dub) * 0.9f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) spatial "incoming" whistle — a rising airy tone that reads as a projectile bearing down on you.
+    private static AudioStreamWav BuildIncoming()
+    {
+        int rate = 22050, n = (int)(rate * 0.42f); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate, k = tt / 0.42f;
+            float env = Mathf.Min(1f, tt / 0.02f) * Mathf.Min(1f, (1f - k) / 0.25f);   // swell in, cut near the end
+            float f = Mathf.Lerp(520f, 1150f, k * k);                                   // rising whistle = approaching
+            float tone = Mathf.Sin(tt * Tau * f) * 0.5f + Mathf.Sin(tt * Tau * f * 2.01f) * 0.12f;
+            float air = ((float)rng.NextDouble() * 2 - 1) * 0.12f;                       // faint wind hiss
+            s[i] = (tone + air) * env * 0.5f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) one-shot low-health alarm — a tense descending double-sting.
+    private static AudioStreamWav BuildLowHealth()
+    {
+        int rate = 22050, n = (int)(rate * 0.5f); var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate, k = tt / 0.5f;
+            float env = Mathf.Min(1f, tt / 0.006f) * Mathf.Exp(-tt * 3.4f);
+            float wob = 1f + 0.02f * Mathf.Sin(tt * Tau * 11f);
+            float f = Mathf.Lerp(500f, 330f, k) * wob;                            // descending, uneasy
+            float body = Mathf.Sin(tt * Tau * f) * 0.4f + Mathf.Sin(tt * Tau * f * 0.5f) * 0.3f + Mathf.Sin(tt * Tau * f * 1.5f) * 0.12f;
+            s[i] = body * env * 0.6f;
+        }
+        return Wav(s, rate);
+    }
+
     private static AudioStreamWav BuildRiteWin()
     {
         int rate = 22050, n = (int)(rate * 0.75f);
@@ -474,6 +647,99 @@ public partial class Sfx : Node
         return Wav(s, rate);
     }
 
+    // (NEW) witchy warding drone — an open-fifth lunar pad that breathes, with a faint high shimmer. 2s loop; every partial
+    // and modulator completes whole cycles over the loop, so it repeats seamlessly. Pitch is scaled live by WardCharge().
+    public static AudioStreamWav BuildWardHum()
+    {
+        int rate = 22050, n = (int)(rate * 2f); var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float breathe = 0.62f + 0.38f * Mathf.Sin(t * Tau * 1.5f);                                              // slow swell (3 cycles / 2s)
+            float drone = Mathf.Sin(t * Tau * 196f) * 0.34f + Mathf.Sin(t * Tau * 294f) * 0.22f + Mathf.Sin(t * Tau * 392f) * 0.12f;  // G3 + D4 + G4 open fifth — mystical
+            float shimmer = (Mathf.Sin(t * Tau * 1176f) * 0.06f + Mathf.Sin(t * Tau * 1568f) * 0.04f) * (0.5f + 0.5f * Mathf.Sin(t * Tau * 7f)); // high sparkle
+            s[i] = (drone * breathe + shimmer) * 0.32f;
+        }
+        var w = Wav(s, rate); w.LoopMode = AudioStreamWav.LoopModeEnum.Forward; w.LoopBegin = 0; w.LoopEnd = n; return w;
+    }
+
+    // (NEW) warding-complete relief ding — a bright major chord struck together (resolve), inharmonic bell partials on top,
+    // and a shimmering magical tail that rings out. Witchy + triumphant.
+    private static AudioStreamWav BuildWardComplete()
+    {
+        int rate = 22050, n = (int)(rate * 1.15f); var s = new float[n];
+        float root = 523.25f;                                   // C5
+        float[] chord = { 1f, 1.25f, 1.5f, 2f };                // C E G C — struck all at once
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float env = Mathf.Min(1f, t / 0.006f) * Mathf.Exp(-t * 2.2f);
+            float ch = 0f; foreach (var m in chord) ch += Mathf.Sin(t * Tau * root * m);
+            ch *= 0.16f;
+            float bell = (Mathf.Sin(t * Tau * root * 4f) * 0.12f + Mathf.Sin(t * Tau * root * 6.2f) * 0.06f) * Mathf.Exp(-t * 3.4f);         // inharmonic bell
+            float sparkle = Mathf.Sin(t * Tau * (1900f + 420f * Mathf.Sin(t * Tau * 5f))) * 0.05f * Mathf.Exp(-t * 1.9f);                    // shimmer tail
+            s[i] = (ch + bell + sparkle) * env * 0.8f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (NEW) arcane-spectre unicorn spawn — a bright rising four-note shimmer over an airy breath. Ethereal, otherworldly.
+    private static AudioStreamWav BuildUnicornCall()
+    {
+        int rate = 22050, n = (int)(rate * 0.95f); var s = new float[n]; var rng = new System.Random(7);
+        float root = 587.33f; float[] steps = { 1f, 1.5f, 2f, 2.667f };
+        float lp = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, k = t / 0.95f;
+            int stage = Mathf.Clamp((int)(k * 4f), 0, 3); float local = k * 4f - stage;
+            float f = root * steps[stage];
+            float env = Mathf.Min(1f, local * 9f) * Mathf.Exp(-local * 1.7f);
+            float tone = Mathf.Sin(t * Tau * f) * 0.42f + Mathf.Sin(t * Tau * f * 2.01f) * 0.16f + Mathf.Sin(t * Tau * f * 3f) * 0.07f;
+            float noise = (float)(rng.NextDouble() * 2 - 1); lp += (noise - lp) * 0.05f;
+            float breath = lp * 0.1f * Mathf.Exp(-t * 1.2f);
+            s[i] = (tone * env + breath) * 0.6f;
+        }
+        return Wav(s, rate);
+    }
+    // (NEW) the unicorn's charge — a swelling upward magical whoosh (rising pitch + gallop pulse)
+    private static AudioStreamWav BuildUnicornCharge()
+    {
+        int rate = 22050, n = (int)(rate * 0.7f); var s = new float[n]; var rng = new System.Random(21);
+        float lp = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, k = t / 0.7f;
+            float f = Mathf.Lerp(300f, 1100f, k * k);
+            float env = Mathf.Min(1f, t / 0.05f) * (1f - k * 0.3f);
+            float tone = (Mathf.Sin(t * Tau * f) + Mathf.Sin(t * Tau * f * 1.5f) * 0.5f) * 0.3f;
+            float noise = (float)(rng.NextDouble() * 2 - 1); lp += (noise - lp) * 0.2f;
+            float whoosh = lp * 0.25f * k;
+            float gallop = 0.6f + 0.4f * Mathf.Sin(t * Tau * 8f);
+            s[i] = (tone + whoosh) * env * gallop * 0.7f;
+        }
+        return Wav(s, rate);
+    }
+    // (NEW) the arcane nuke — a sub-bass thump, a sharp crack, a long low-passed rumble, and a magical high shimmer tail
+    private static AudioStreamWav BuildArcaneBoom()
+    {
+        int rate = 22050, n = (int)(rate * 2.2f); var s = new float[n]; var rng = new System.Random(99);
+        float lp = 0f, lp2 = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float subF = Mathf.Lerp(95f, 36f, Mathf.Clamp(t / 0.6f, 0f, 1f));
+            float sub = Mathf.Sin(t * Tau * subF) * Mathf.Exp(-t * 1.5f) * 0.9f;
+            float noise = (float)(rng.NextDouble() * 2 - 1);
+            lp += (noise - lp) * 0.08f; lp2 += (lp - lp2) * 0.08f;
+            float crack = noise * Mathf.Exp(-t * 26f) * 0.5f;
+            float rumble = lp2 * Mathf.Exp(-t * 1.05f) * 0.7f;
+            float shim = (Mathf.Sin(t * Tau * 1400f) + Mathf.Sin(t * Tau * 2100f)) * 0.04f * Mathf.Exp(-t * 2.3f) * (0.5f + 0.5f * Mathf.Sin(t * Tau * 9f));
+            s[i] = Mathf.Clamp(sub + crack + rumble + shim, -1f, 1f);
+        }
+        return Wav(s, rate);
+    }
+
     private static AudioStreamWav BuildDiscord()
     {
         int rate = 22050, n = (int)(rate * 0.5f);
@@ -503,18 +769,32 @@ public partial class Sfx : Node
         pitch = Mathf.Clamp(pitch, 0.85f, 1.6f);
         if (_music != null) _music.PitchScale = pitch;
         if (_drums != null) _drums.PitchScale = pitch;
+        if (_hauntMus != null) _hauntMus.PitchScale = pitch;   // (HAUNT) the eerie layer speeds up with the combat tempo too
     }
 
     // drum presence rises with tension: silent when calm, driving when things get hairy
     public float MusicVol = 0.8f;        // 0..1 base music volume (player-adjustable)
     private float MusicGainDb => Mathf.Lerp(-40f, 0f, Mathf.Clamp(MusicVol, 0f, 1f));
 
+    // (DIAGNOSTIC) hard mutes so a periodic click can be isolated to a single looping stream — see the `audio` dev command
+    public bool MuteDrums = false, MuteMusic = false;
     public void SetIntensity(float t)
     {
         if (_drums == null) return;
+        if (MuteDrums) { _drums.VolumeDb = -80f; if (_music != null) _music.VolumeDb = MuteMusic ? -80f : (EventActive ? -11f : -15f) + MusicGainDb; return; }
+        if (MuteMusic && _music != null) _music.VolumeDb = -80f;
         float eff = Mathf.Clamp(Mathf.Max(t, EventActive ? 0.5f : 0f), 0f, 1f);
-        _drums.VolumeDb = Mathf.Lerp(-42f, -7f, eff) + MusicGainDb;
-        if (_music != null) _music.VolumeDb = (EventActive ? -11f : -15f) + MusicGainDb;
+        // (FIX) the old -42dB "silent" floor wasn't silent — in a quiet moment you could hear the dry shaker ticking under
+        // the arp. Drop the floor far enough that a calm scene really is just the melody.
+        _drums.VolumeDb = (eff < 0.02f ? -80f : Mathf.Lerp(-54f, -7f, eff)) + MusicGainDb;
+        if (_music != null) _music.VolumeDb = MuteMusic ? -80f : (EventActive ? -11f : -15f) + MusicGainDb;
+        // (HAUNT) fade the eerie layer in/out with HauntBlend; it swells with combat intensity while you're in the storm
+        _hauntBlendCur = Mathf.Lerp(_hauntBlendCur, HauntBlend, 0.05f);   // ~0.35s dynamic crossfade
+        if (_hauntMus != null)
+        {
+            float target = Mathf.Lerp(-19f, -6f, eff);                    // louder as the fight heats up
+            _hauntMus.VolumeDb = (MuteMusic || _hauntBlendCur < 0.01f) ? -80f : Mathf.Lerp(-80f, target, _hauntBlendCur) + MusicGainDb;
+        }
     }
     public void Element(DamageType t)
     {
@@ -551,6 +831,35 @@ public partial class Sfx : Node
             float wob = 0.6f + 0.4f * Mathf.Sin(t * Tau * 1.3f);
             float v = (Mathf.Sin(t * Tau * 110f) * 0.4f + Mathf.Sin(t * Tau * 165f) * 0.25f + Mathf.Sin(t * Tau * 220f) * 0.12f) * wob;
             s[i] = v * 0.3f;
+        }
+        var w = Wav(s, rate); w.LoopMode = AudioStreamWav.LoopModeEnum.Forward; w.LoopBegin = 0; w.LoopEnd = n; return w;
+    }
+
+    // eerie overlapping whispers for the maze darkness veil — breathy shaped-noise "syllables" from a few
+    // detuned voices, with sibilant onsets and a faint low murmur underneath. Loops seamlessly. (NEW)
+    public static AudioStreamWav WhisperStream()
+    {
+        int rate = 22050, n = (int)(rate * 4f); var s = new float[n]; var rng = new System.Random(31337);
+        float lp = 0f;
+        float[] vPhase = { 0f, 1.7f, 3.4f }, vRate = { 3.1f, 2.3f, 4.4f }, vf = { 900f, 1300f, 700f }, vp = { 1f, 0.72f, 1.35f };
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float noise = (float)(rng.NextDouble() * 2 - 1);
+            lp += (noise - lp) * 0.14f;         // heavy low-pass → soft breath
+            float breath = lp, hiss = noise - lp;   // residue = sibilance (s / sh)
+            float v = 0f;
+            for (int k = 0; k < 3; k++)
+            {
+                float ph = t * vRate[k] + vPhase[k];
+                float frac = ph - Mathf.Floor(ph);
+                float vowel = frac < 0.5f ? 0.5f - 0.5f * Mathf.Cos(frac / 0.5f * Tau) : 0f;   // whispered "word", then a gap
+                float con = frac < 0.1f ? (1f - frac / 0.1f) : 0f;                              // sibilant consonant onset
+                float form = 0.6f + 0.4f * Mathf.Sin(t * Tau * vf[k] * vp[k]);                  // formant colour (ring-mod tint)
+                v += (breath * vowel * form + hiss * con * 0.5f) * 0.55f;
+            }
+            v += Mathf.Sin(t * Tau * 64f) * 0.03f * (0.5f + 0.5f * Mathf.Sin(t * Tau * 0.6f));   // low murmur bed
+            s[i] = Mathf.Clamp(v * 0.5f, -1f, 1f);
         }
         var w = Wav(s, rate); w.LoopMode = AudioStreamWav.LoopModeEnum.Forward; w.LoopBegin = 0; w.LoopEnd = n; return w;
     }
@@ -638,6 +947,44 @@ public partial class Sfx : Node
             float dark = Mathf.Sin(t * Tau * (320f - 240f * t)) * 0.3f * Mathf.Exp(-t * 5f);    // dark downward magic sweep
             float crunch = (float)(rng.NextDouble() * 2 - 1) * 0.5f * Mathf.Exp(-t * 42f);       // sharp initial crunch
             s[i] = (thud + squelch + dark + crunch) * env;
+        }
+        return Wav(s, rate);
+    }
+
+    // A dark curse incantation for the Hex combos — an ominous rising drone, a deep sub, a detuned "curse chord"
+    // shimmer with slow vibrato, and a soft bell "seal". Fully tonal/harmonic — no white-noise rasp (replaces the
+    // scratchy WitchCackle that read like a record scratch).
+    private static AudioStreamWav BuildHexWeave()
+    {
+        int rate = 22050, n = (int)(rate * 0.6f); var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float env = Mathf.Exp(-t * 3.0f);
+            float drone = Mathf.Sin(t * Tau * (68f + 84f * t)) * 0.5f;                                   // ominous rising drone 68→152
+            float sub = Mathf.Sin(t * Tau * 44f) * 0.28f * Mathf.Exp(-t * 2.5f);                         // deep sub weight
+            float shimmer = (Mathf.Sin(t * Tau * 415f) + Mathf.Sin(t * Tau * 622f) * 0.6f + Mathf.Sin(t * Tau * 311f) * 0.5f)
+                            * 0.14f * (0.55f + 0.45f * Mathf.Sin(t * Tau * 5.5f));                       // detuned curse chord + slow vibrato
+            float seal = Mathf.Sin(t * Tau * 260f) * 0.35f * Mathf.Exp(-Mathf.Abs(t - 0.05f) * 36f);     // a soft 'seal' bell early on
+            s[i] = (drone + sub + shimmer + seal) * env;
+        }
+        return Wav(s, rate);
+    }
+
+    // A soft airy whoosh (low-passed noise swelling up then down + a faint downward wind tone). No harsh rasp — the
+    // noise is heavily smoothed so it reads as moving air, not static.
+    private static AudioStreamWav BuildWhish()
+    {
+        int rate = 22050, n = (int)(rate * 0.3f); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        float lp = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, u = t / 0.3f;
+            float env = Mathf.Sin(u * Mathf.Pi);                                   // swells up and fades — the "whoosh" shape
+            float white = (float)(rng.NextDouble() * 2 - 1);
+            lp = lp * 0.84f + white * 0.16f;                                        // low-pass → airy, not scratchy
+            float tone = Mathf.Sin(t * Tau * (620f - 320f * u)) * 0.12f;           // faint wind tone sweeping down
+            s[i] = (lp * 0.7f + tone) * env * 0.5f;
         }
         return Wav(s, rate);
     }
@@ -849,7 +1196,9 @@ public partial class Sfx : Node
             {
                 float t = j / (float)rate;
                 float noise = (float)(rng.NextDouble() * 2 - 1);
-                s[at + j] += noise * Mathf.Exp(-t * 55f) * amp;
+                // (FIX) ~1ms attack ramp. Jumping straight to full-amplitude white noise on the first sample is a hard
+                // discontinuity — i.e. a CLICK — which is what made this read as static rather than as a shaker.
+                s[at + j] += noise * Mathf.Min(1f, t * 900f) * Mathf.Exp(-t * 55f) * amp;
             }
         }
 
@@ -946,6 +1295,103 @@ public partial class Sfx : Node
         w.LoopBegin = 0;
         w.LoopEnd = n;
         return w;
+    }
+
+    // ===== LEVEL-UP SLOT ROLL (NEW) — the cards spin, tick past, and slam to a stop, brighter the rarer they land =====
+    private AudioStreamWav _rollTick;
+    private AudioStreamWav[] _rollLock;   // indexed by rarity tier 0..4
+    public void RollTick()
+    {
+        _rollTick ??= BuildRollTick();
+        PlayOne(_rollTick, -13f);   // soft — it fires many times per spin
+    }
+    public void RollLock(int tier)
+    {
+        tier = Mathf.Clamp(tier, 0, 4);
+        _rollLock ??= new AudioStreamWav[5];
+        _rollLock[tier] ??= BuildRollLock(tier);
+        PlayOne(_rollLock[tier], Mathf.Lerp(-7f, -1f, tier / 4f));   // rarer = louder
+        if (tier >= 4) { Thunder(); }                                // legendary lands with a thunderclap
+        else if (tier >= 3) Clink();                                 // epic gets a bright ping on top
+    }
+    // a dry witchy "tok" — a muted low blip with a faint bell partial, quick tick as a card face flicks past
+    private static AudioStreamWav BuildRollTick()
+    {
+        int rate = 22050, n = (int)(rate * 0.055f);
+        var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float env = Mathf.Min(1f, t / 0.001f) * Mathf.Exp(-t * 70f);
+            float v = Mathf.Sin(t * Tau * 180f) * 0.7f + Mathf.Sin(t * Tau * 540f) * 0.14f;   // dull body + a whisper of bell
+            s[i] = v * env * 0.5f;
+        }
+        return Wav(s, rate);
+    }
+    // the card slamming to a stop: a struck bell whose brightness, ring-length and sub-thump all grow with rarity.
+    // common = a flat wooden knock; legendary = a bright, long, shimmering chime. Punchy attack on every tier.
+    private static AudioStreamWav BuildRollLock(int tier)
+    {
+        int rate = 22050;
+        float dur = Mathf.Lerp(0.16f, 0.62f, tier / 4f);
+        int n = (int)(rate * dur);
+        var s = new float[n];
+        var rng = new System.Random(1000 + tier);
+        // fundamental climbs a little with rarity so higher tiers ring brighter (A minor-ish steps)
+        float f0 = new[] { 196f, 220f, 261.63f, 329.63f, 392f }[tier];
+        float ring = Mathf.Lerp(9f, 3.4f, tier / 4f);     // higher tier = longer sustain
+        float partialMix = tier / 4f;                     // more (glassy, inharmonic) upper partials as it gets rarer
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float atk = Mathf.Min(1f, t / 0.0015f);        // hard punchy transient
+            float env = atk * Mathf.Exp(-t * ring);
+            float bell = Mathf.Sin(t * Tau * f0) * 0.6f
+                       + Mathf.Sin(t * Tau * f0 * 2.01f) * 0.26f * partialMix
+                       + Mathf.Sin(t * Tau * f0 * 3.02f) * 0.16f * partialMix
+                       + Mathf.Sin(t * Tau * f0 * 4.7f) * 0.10f * partialMix;   // inharmonic = magical shimmer
+            float sub = Mathf.Sin(t * Tau * f0 * 0.5f) * (0.20f + 0.22f * partialMix) * Mathf.Exp(-t * 14f);   // punch under it
+            float knock = (float)(rng.NextDouble() * 2 - 1) * Mathf.Exp(-t * 130f) * 0.22f;                     // woody attack click
+            s[i] = (bell + sub + knock) * env * 0.55f;
+        }
+        // a soft high shimmer sweep tacked on for epic+ — the "ooo, rare" tail
+        if (tier >= 3)
+            for (int i = 0; i < n; i++)
+            {
+                float t = i / (float)rate;
+                float f = Mathf.Lerp(1400f, 3200f, Mathf.Min(1f, t / dur));
+                s[i] += Mathf.Sin(t * Tau * f) * 0.10f * Mathf.Sin(Mathf.Min(1f, t / dur) * Mathf.Pi) * (tier == 4 ? 1.3f : 0.8f);
+            }
+        for (int i = 0; i < n; i++) s[i] = (float)System.Math.Tanh(s[i] * 1.15) * 0.9f;
+        return Wav(s, rate);
+    }
+
+    // (NEW) REFUSED — "you can't afford that". Deliberately NOT the spell fizzle (which is a crackly sputter that grates
+    // when it repeats): a soft, dull two-note fall, like a coin refused. Short, dry, and easy on the ear.
+    private AudioStreamWav _denied;
+    public void Denied()
+    {
+        _denied ??= BuildDenied();
+        PlayOne(_denied, -7f);
+    }
+    private static AudioStreamWav BuildDenied()
+    {
+        int rate = 22050, n = (int)(rate * 0.30f);
+        var s = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float k = t / 0.30f;
+            // two soft muted tones a tone apart, the second lower — a downward "nuh-uh"
+            float f = k < 0.42f ? 262f : 196f;
+            float phase = k < 0.42f ? t : (t - 0.126f);
+            float gate = k < 0.42f ? Mathf.Min(1f, phase / 0.008f) * Mathf.Exp(-phase * 9f)
+                                   : Mathf.Min(1f, phase / 0.008f) * Mathf.Exp(-phase * 7f);
+            float v = Mathf.Sin(phase * Tau * f) * 0.7f + Mathf.Sin(phase * Tau * f * 2f) * 0.12f;   // mostly fundamental = dull, not bright
+            float body = Mathf.Sin(phase * Tau * f * 0.5f) * 0.22f;                                    // a little weight underneath
+            s[i] = (v + body) * gate * 0.5f;
+        }
+        return Wav(s, rate);
     }
 
     // failed-cast sputter: a bright spark that crackles then fizzles out, pitch sliding down
@@ -1065,6 +1511,26 @@ public partial class Sfx : Node
         return Wav(s, rate);
     }
 
+    private static AudioStreamWav BuildCoins()
+    {
+        int rate = 22050, n = (int)(rate * 0.45f); var s = new float[n];
+        // two bright metallic dings, the second a touch later + higher → a "ch-ching"
+        float[] onset = { 0f, 0.07f };
+        float[] freq = { 1760f, 2637f };
+        for (int i = 0; i < n; i++)
+        {
+            float tt = i / (float)rate; float v = 0f;
+            for (int k = 0; k < 2; k++)
+            {
+                float lt = tt - onset[k]; if (lt < 0f) continue;
+                float env = Mathf.Min(1f, lt / 0.002f) * Mathf.Exp(-lt * 22f);
+                v += (Mathf.Sin(lt * Tau * freq[k]) * 0.5f + Mathf.Sin(lt * Tau * freq[k] * 2.01f) * 0.28f + Mathf.Sin(lt * Tau * freq[k] * 3.02f) * 0.14f) * env;
+            }
+            s[i] = v * 0.5f;
+        }
+        return Wav(s, rate);
+    }
+
     private static AudioStreamWav BuildLunarChime()
     {
         int rate = 22050, n = (int)(rate * 0.6f); var s = new float[n];
@@ -1136,6 +1602,23 @@ public partial class Sfx : Node
             float lp = prev + (white - prev) * 0.2f; prev = lp;   // low-passed → airy whoosh
             float howl = Mathf.Sin(tt * Tau * Mathf.Lerp(300f, 600f, k)) * 0.15f;   // rising whistle
             s[i] = (lp * 0.8f + howl) * env * 0.7f;
+        }
+        return Wav(s, rate);
+    }
+
+    private static AudioStreamWav BuildUltCast()   // cinematic "power unleashed": rising sweep + deep sub-boom + bright shimmer + rumble tail
+    {
+        int rate = 22050, n = (int)(rate * 1.0f); var s = new float[n]; var rng = new System.Random((int)GD.Randi());
+        float prev = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, k = t / 1.0f;
+            float env = Mathf.Min(1f, t / 0.005f) * Mathf.Exp(-t * 2.4f);
+            float sweep = Mathf.Sin(t * Tau * Mathf.Lerp(160f, 950f, Mathf.Min(1f, t * 3.2f))) * 0.32f * Mathf.Exp(-t * 4.5f);   // rising whoosh
+            float sub = Mathf.Sin(t * Tau * Mathf.Lerp(72f, 44f, k)) * 0.6f;                                                    // deep sub boom
+            float shimmer = (Mathf.Sin(t * Tau * 1760f) + Mathf.Sin(t * Tau * 2350f)) * 0.09f * Mathf.Exp(-t * 6.5f);          // crystalline shimmer
+            float noise = (float)(rng.NextDouble() * 2 - 1); float lp = prev + (noise - prev) * 0.28f; prev = lp;              // rumble body
+            s[i] = (sub * 0.7f + sweep + shimmer + lp * 0.22f) * env * 0.85f;
         }
         return Wav(s, rate);
     }
@@ -1405,6 +1888,62 @@ public partial class Sfx : Node
     }
 
     // thunderous electric buzz
+    // (HAUNT) the eerie layer that mixes over the witchy arp inside a storm. SAME 2.4s loop length as BuildArp so the two
+    // stay phase-locked when SetTempo pitches them together. A low dread drone + a sparse, breathy, dissonant motif (with a
+    // tritone for unease) on detuned voices with long ghostly tails that wrap the loop.
+    private static AudioStreamWav BuildHauntMusic()
+    {
+        int rate = 22050;
+        float stepDur = 0.15f; int steps = 16, stepN = (int)(rate * stepDur), n = stepN * steps;
+        float loopSec = n / (float)rate;
+        var s = new float[n];
+        var rng = new System.Random(29);
+
+        // low dread drone (A1) + a tense minor-second beating above it — whole cycles so it wraps seamlessly
+        float d0 = Mathf.Round(55f * loopSec) / loopSec;
+        float d1 = Mathf.Round(58.27f * loopSec) / loopSec;   // ~Bb1 → slow dissonant beat
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float breath = 0.7f + 0.3f * Mathf.Sin(t * Tau * (1f / loopSec));   // one slow swell per loop
+            float drone = (Mathf.Sin(t * Tau * d0) * 0.5f + Mathf.Sin(t * Tau * d1) * 0.28f + Mathf.Sin(t * Tau * d0 * 0.5f) * 0.3f) * breath;
+            s[i] += drone * 0.16f;
+        }
+
+        // sparse haunting motif — A minor with the raised 7th (G#) + a tritone (D#) for the "wrong" feel
+        float A3 = 220f, C4 = 261.63f, Ds4 = 311.13f, E4 = 329.63f, Gs4 = 415.30f, A4 = 440f;
+        var notes = new (int step, float f, float amp)[] {
+            (0, A3, 0.9f), (3, E4, 0.6f), (5, Ds4, 0.7f), (8, C4, 0.8f), (10, Gs4, 0.55f), (12, A4, 0.5f), (14, E4, 0.45f),
+        };
+        int tailN = (int)(rate * 1.1f);   // long ghostly ring
+        foreach (var (step, f, amp) in notes)
+        {
+            int start = step * stepN;
+            for (int j = 0; j < tailN; j++)
+            {
+                int idx = (start + j) % n;
+                float t = j / (float)rate;
+                float env = Mathf.Exp(-t * 3.2f) * Mathf.Min(1f, t * 40f);        // soft breathy onset, long decay
+                float vib = 1f + 0.006f * Mathf.Sin(t * Tau * 4.5f);              // wavering, unsettled pitch
+                float breathNoise = 1f + 0.10f * (float)(rng.NextDouble() * 2 - 1);   // airy, voice-like texture
+                float voice = Mathf.Sin(t * Tau * f * vib) * 0.5f
+                            + Mathf.Sin(t * Tau * f * 1.003f * vib) * 0.34f          // detuned twin = chorus/haunt
+                            + Mathf.Sin(t * Tau * f * 2f) * 0.14f
+                            + Mathf.Sin(t * Tau * f * 2.98f) * 0.08f;               // slightly inharmonic = glassy dread
+                s[idx] += voice * env * breathNoise * amp * 0.2f;
+            }
+        }
+        // a faint high shimmer drifting through — like a distant wail
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate;
+            float wail = Mathf.Sin(t * Tau * (784f + 12f * Mathf.Sin(t * Tau * 0.5f))) * 0.03f * (0.5f + 0.5f * Mathf.Sin(t * Tau * (1f / loopSec) - 1f));
+            s[i] += wail;
+        }
+        for (int i = 0; i < n; i++) s[i] = (float)System.Math.Tanh(s[i] * 1.2) * 0.8f;
+        var w = Wav(s, rate); w.LoopMode = AudioStreamWav.LoopModeEnum.Forward; w.LoopBegin = 0; w.LoopEnd = n; return w;
+    }
+
     private static AudioStreamWav BuildThunder()
     {
         int rate = 22050, n = (int)(rate * 0.62f);

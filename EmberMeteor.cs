@@ -7,7 +7,7 @@ using Godot;
 public partial class EmberMeteor : Node3D
 {
     public bool Remote = false;
-    private float _fall = 1.7f, _age = 0f;   // (NEW) a touch slower — more time to read the danger ring & reposition (was 1.3)
+    private float _fall = 1.7f, _fallDur = 1.7f, _age = 0f;   // (NEW) fall duration is now configurable (mod meteors fall slower so you can tell them apart)
     private bool _impacted = false;
     private float _radius, _dmg, _burnPer, _bombFlat;
     private int _burnStacks;
@@ -16,9 +16,9 @@ public partial class EmberMeteor : Node3D
     private MeshInstance3D _rock, _tele, _disc;
     private OmniLight3D _light;
 
-    public void Init(Vector3 at, float radius, float dmg, int burnStacks, float burnPer, float bombFlat, Player src)
-    { _radius = radius; _dmg = dmg; _burnStacks = burnStacks; _burnPer = burnPer; _bombFlat = bombFlat; _src = src; Build(at); }
-    public void InitRemote(Vector3 at, float radius) { Remote = true; _radius = radius; Build(at); }
+    public void Init(Vector3 at, float radius, float dmg, int burnStacks, float burnPer, float bombFlat, Player src, float fallTime = 1.7f)
+    { _radius = radius; _dmg = dmg; _burnStacks = burnStacks; _burnPer = burnPer; _bombFlat = bombFlat; _src = src; _fall = _fallDur = fallTime; Build(at); }
+    public void InitRemote(Vector3 at, float radius, float fallTime = 1.7f) { Remote = true; _radius = radius; _fall = _fallDur = fallTime; Build(at); }
 
     private void Build(Vector3 at)
     {
@@ -34,8 +34,9 @@ public partial class EmberMeteor : Node3D
         dm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; dm.AlbedoColor = new Color(1f, 0.45f, 0.12f, 0.3f); dm.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
         _disc.MaterialOverride = dm; _disc.Position = new Vector3(0, 0.03f, 0); AddChild(_disc);
         float rs = 0.55f + _radius * 0.07f;
-        _rock = new MeshInstance3D { Mesh = new SphereMesh { Radius = rs, Height = rs * 2f, RadialSegments = 7, Rings = 5 }, MaterialOverride = Game.ToonEmissive(new Color(0.5f, 0.22f, 0.12f), 1.8f, 0.09f) };
+        _rock = new MeshInstance3D { Mesh = new SphereMesh { Radius = rs, Height = rs * 2f, RadialSegments = 6, Rings = 4 }, MaterialOverride = Game.ToonEmissive(new Color(0.2f, 0.09f, 0.05f), 0.5f, 0.09f) };   // (POLISH) charred low-poly crust
         _rock.Position = new Vector3(0, 38f, 0); AddChild(_rock);
+        _rock.AddChild(new MeshInstance3D { Mesh = new SphereMesh { Radius = rs * 0.86f, Height = rs * 1.72f }, MaterialOverride = Game.Emissive(new Color(1f, 0.6f, 0.2f), 3.2f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, Position = new Vector3(0, -rs * 0.4f, 0) });   // molten leading face glowing through the cracks
         _rock.AddChild(new OmniLight3D { OmniRange = 8f, LightColor = new Color(1f, 0.5f, 0.2f), LightEnergy = 3f });
         _light = new OmniLight3D { OmniRange = _radius * 2.2f, LightColor = new Color(1f, 0.4f, 0.15f), LightEnergy = 0.6f, Position = new Vector3(0, 1f, 0) };
         AddChild(_light);
@@ -43,12 +44,12 @@ public partial class EmberMeteor : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta; _age += dt;
         if (!_impacted)
         {
             _fall -= dt;
-            float t = Mathf.Clamp(1f - _fall / 1.7f, 0f, 1f);
+            float t = Mathf.Clamp(1f - _fall / _fallDur, 0f, 1f);
             if (_rock != null) { _rock.Position = new Vector3(0, Mathf.Lerp(38f, 0.5f, t * t), 0); _rock.RotationDegrees += new Vector3(240f * dt, 160f * dt, 0f); }
             if (_tele != null) _tele.Scale = Vector3.One * (0.9f + 0.12f * Mathf.Sin(_age * 24f)) * (0.7f + 0.3f * t);
             if (_fall <= 0f) Impact();
@@ -77,8 +78,7 @@ public partial class EmberMeteor : Node3D
         }
         Game.I.SpawnEmberBurst(_ground + Vector3.Up * 0.4f, _radius * 1.3f, net: false);   // each machine (real or ghost) shows its own burst
         Game.I.VfxRing(_ground, DamageTypes.Col(DamageType.Ember), _radius * 1.4f, 0.5f);
-        Game.I.Sfx?.ModEmber(_ground, false);
-        Game.I.Sfx?.Thunder();
+        Game.I.Sfx?.ModEmber(_ground, false);   // positional ember boom is the impact; dropped the extra global Thunder() that stacked into a wall of blasts when meteors rain
         if (_light != null) _light.LightEnergy = 3f;
     }
 }

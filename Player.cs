@@ -38,6 +38,12 @@ public partial class Player : Node3D
     private bool _chargedRefund = false;   // set on a non-blood charged release; refunds 1 mana on first enemy hit
     private bool _charging = false;
     public float MouseSens = 0.0022f;
+    // ---- gamepad right-stick look ----
+    public static float PadLookSens = 3.1f;     // base yaw/pitch rate (rad/s) at full stick deflection
+    public static float PadSensMul = 1f;        // user "Gamepad Look" setting multiplier (persisted alongside look sens)
+    private const float PadLookDead = 0.16f;    // radial deadzone
+    private Vector2 _padLook = Vector2.Zero;    // smoothed stick vector
+    private float _turn180 = 0f;                // remaining yaw for an R3 quick-turn
 
     public bool Charging = false;
     public float ChargeAmt = 0f;
@@ -52,20 +58,104 @@ public partial class Player : Node3D
     public float FreshT = 0f;
     public float FireHeat = 0f;       // rises while firing fast → drives music tempo
     public float HurtT = 0f;          // recent-damage spike for musical tension
+    public float HurtFlash = 0f;      // (NEW) full-screen red vignette intensity, scaled by hit severity
+    public float ShieldBreakT = 0f;   // (NEW) spikes when a hit empties the shield → HUD flash + callout
+    public float ArmorBreakT = 0f;    // (NEW) spikes when an armor charge pops → HUD flash + callout
+    public bool LowHp => !Downed && Hp > 0f && Hp <= S.MaxHp * 0.20f;   // (NEW) low-health alarm state
+    private bool _lowHpWarned = false;
+    private float _heartT = 0f;
     public float DashT = 0f;          // recent-dodge spike for musical tension
 
     // ---- ultimate ----
-    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze, HexCircle, LifeDrain, LifeCurse, MeteorDescent, WildfireRush, PhoenixAscend }   // …Forsaken = HexCircle/LifeDrain/LifeCurse (NEW)
+    public enum UltKind { None, Eclipse, LunarLight, Crescent, FaithShield, Judgement, Divinity, BloodTsunami, Exsanguinate, BloodRot, GroveGuardian, WildSwarm, Barkskin, Cyclone, Hurricane, Stormform, Blizzard, FrostElemental, DeepFreeze, HexCircle, LifeDrain, LifeCurse, MeteorDescent, WildfireRush, PhoenixAscend, ArcaneAscend, ArcaneEruption, ArcaneOvercharge }   // …Arcane = ArcaneAscend/ArcaneEruption/ArcaneOvercharge (NEW)
     public UltKind Ult = UltKind.None;
     public float UltCharge = 0f;       // 0..1
+    public float UltLingerT = 0f;      // (NEW) while >0, an ult's lingering field/summon/transformation is still active → NO ult recharge (anti-chain; DoTs/instant bursts are unaffected)
     public float DmgWindow = 0f;        // damage dealt since last team-damage broadcast (ult-share)
-    public int UltTier = 0;            // rarity tier 0..4 (boss-token upgrades)
+    public int UltTier = 0;            // rarity tier 0..4 (upgraded via Epic level-up cards)
+    // (ULT CARDS) per-ult tier, so tiers PERSIST across a swap — drop an ult and re-pick it later and it comes back at
+    // the tier you had it. Cleared only on witch config / new run.
+    public readonly System.Collections.Generic.Dictionary<UltKind, int> UltTiers = new();
+    public void EquipUlt(UltKind k)
+    {
+        Ult = k;
+        UltTier = UltTiers.TryGetValue(k, out int tr) ? tr : 0;   // restore this ult's saved tier
+        UltCharge = 0f;
+        Game.I?.Hud?.Banner(UltTier > 0 ? "ultimate re-bound" : "ultimate bound");
+    }
+    public void UpgradeUltTier()
+    {
+        if (Ult == UltKind.None || UltTier >= 4) return;
+        UltTier++;
+        UltTiers[Ult] = UltTier;   // remember it for after a swap
+        Game.I?.Hud?.Banner("ultimate empowered");
+    }
     public bool UltActive = false;
     public float UltActiveT = 0f;
     public float UltDmgMul = 1f;
+    // ---- Arcane witch: passive (crit-heal) + ult state ----
+    private const float ArcaneCritHeal = 0.25f;   // heals 25% of a crit's damage (her passive)
+    public float ArcanePowerMul = 1f;             // Arcane affinity: her spell damage (missiles / chain-lightning / ult lightning)
+    public float ArcaneCritHealBonus = 0f;        // Arcane affinity: extra crit-heal fraction
+    public bool ArcaneChainReaction = false;      // Arcane legendary: a foe slain by her arcane bursts in a nova
+    public bool ArcanePersistMarks = false;       // Arcane legendary: the chain no longer burns off Conduit marks
+    public bool ArcaneLiving = false;             // Arcane affinity capstone (Living Current) dedup gate
+    private bool _inArcaneNova = false;           // reentrancy guard for the Chain Reaction nova
+    private bool _arcaneAscend = false; private float _arcaneAscendFireT = 0f; private ArcaneAura _arcaneAura;
+    private ArcaneAura _ultAura;   // (NEW) reusable element-coloured empowerment aura for other witches' ults (Eclipse / Divinity / …)
+    private void GrantUltAura(Color col, float radius = 2.6f) { if (_ultAura != null && GodotObject.IsInstanceValid(_ultAura)) _ultAura.QueueFree(); _ultAura = new ArcaneAura(); AddChild(_ultAura); _ultAura.Init(radius, 0f, col); }
+    private void ClearUltAura() { if (_ultAura != null && GodotObject.IsInstanceValid(_ultAura)) { _ultAura.QueueFree(); _ultAura = null; } }
+    public bool ArcaneAscendActive => _arcaneAscend;
+    public bool OverchargeActive => false;   // (REWORK) ArcaneOvercharge is no longer a stat steroid — it's the Arcane Storm rain field; the old steroid buffs are neutralized here
+    private float OverchargeSpeedMul => OverchargeActive ? (1.4f + UltTier * 0.06f + (ModArcUnbound ? 0.35f : 0f)) : 1f;   // Unbound: greater buffs
+    private float OverchargeJumpMul => OverchargeActive ? (1.7f + UltTier * 0.12f + (ModArcUnbound ? 0.5f : 0f)) : 1f;
+    public float OverchargeCrit => OverchargeActive ? (0.30f + UltTier * 0.05f + (ModArcUnbound ? 0.2f : 0f)) : 0f;
+    public float OverchargeCritDmg => OverchargeActive ? (0.6f + UltTier * 0.18f + (ModArcUnbound ? 0.5f : 0f)) : 0f;
     public bool ModEclipse = false, ModLight = false, ModCrescent = false;   // legendary ult-mods
-    public float EclipseCrit => (Ult == UltKind.Eclipse && UltActive) ? 0.25f : 0f;   // +crit while the eclipse is up
-    private bool RollCrit() => GD.Randf() < Mathf.Min(0.95f, S.CritChance + EclipseCrit + (EmberFervorT > 0f ? _emberFervorCrit : 0f));
+    public float EclipseCrit => (Ult == UltKind.Eclipse && UltActive) ? (0.25f + UltTier * 0.05f) : 0f;   // (REWORK) +25% crit, +5%/tier while eclipsed
+    public bool EclipseOn => Ult == UltKind.Eclipse && UltActive;
+    public float UltMax = 1f;   // (ULT METERS) the full duration of the current active ult, for the HUD duration bar
+    private float _eclipseBoomCd = 0f;
+    private bool _eclipseWasOn = false;
+    private bool _eclipseNovaBusy = false;
+    public bool EclipseNovaBusy => _eclipseNovaBusy;   // (ECLIPSE) true while a nova is dealing its own lunar damage → don't re-detonate
+    // (ECLIPSE) a shadow-nova on ANY lunar hit she lands — fired from Enemy.Hurt on HER machine (so it catches left/right
+    // click, charged, finishers, mods, AND fields/projectiles, and works whether she's host or client). Throttled; the
+    // busy flag stops its own lunar damage from re-triggering. VFX broadcast so allies see the black/white burst.
+    public void EclipseNovaAt(Vector3 at)
+    {
+        if (_eclipseBoomCd > 0f || _eclipseNovaBusy) return;
+        _eclipseBoomCd = 0.12f;
+        _eclipseNovaBusy = true;
+        float r = 4.5f * S.SpellArea;
+        float dmg = Base() * (0.55f + UltTier * 0.15f);
+        foreach (var e in Game.I.Enemies.ToArray())
+            if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) &&
+                new Vector2(e.GlobalPosition.X - at.X, e.GlobalPosition.Z - at.Z).Length() < r + e.Radius)
+                e.Hurt(dmg, DamageType.Lunar, true);
+        _eclipseNovaBusy = false;
+        var up = at + Vector3.Up * 0.6f;
+        Game.I.VfxRing(up, Colors.Black, r, 0.32f);
+        Game.I.VfxRing(up, Colors.White, r * 0.62f, 0.26f);
+        Game.I.NetMgr?.BroadcastVfx(0, up, Vector3.Up, r, 0.3f, Colors.White);   // allies see the shadow-nova ring
+    }
+    private void EclipseBlinkVfx(Vector3 at)
+    {
+        Game.I.VfxRing(at + Vector3.Up * 1f, Colors.Black, 3.2f, 0.3f);
+        Game.I.VfxRing(at + Vector3.Up * 1f, Colors.White, 1.8f, 0.25f);
+    }
+    // (LUNAR LIGHT) purge the player's negative statuses — stun, root, slow, venom, and a Taker grab
+    public void CleanseNegative()
+    {
+        StunT = 0f; _snareT = 0f; _slowT = 0f; VenomT = 0f; VenomDps = 0f; RootingSnakeId = 0;
+        if (GrabbedBy != 0) GrabbedBy = 0;   // slip a kidnapper's grasp
+    }
+    public float EclipseSpeedMul => EclipseOn ? 2f : 1f;    // (REWORK) ×2 move speed while eclipsed
+    public float EclipseJumpMul => EclipseOn ? 3f : 1f;     // (REWORK) ×3 jump height while eclipsed
+    private bool RollCrit() => GD.Randf() < Mathf.Min(0.95f, S.CritChance + EclipseCrit + OverchargeCrit + (EmberFervorT > 0f ? _emberFervorCrit : 0f));
+    public bool RollCritPublic() => RollCrit();       // (REWORK) so Deep Freeze icicles / Phoenix / Arcane Storm can crit with the caster's crit stat
+    public float CritMultPublic() => CritMult();
+    public float CritChanceNow => Mathf.Min(0.95f, S.CritChance + EclipseCrit + OverchargeCrit + (EmberFervorT > 0f ? _emberFervorCrit : 0f));   // (REWORK) effective crit chance snapshot for host-simulated field ults (Arcane Storm bolts respect her crit passive)
     private float _eclipseMax = 1f;
     public float EclipseFrac => _eclipseMax > 0f ? Mathf.Clamp(UltActiveT / _eclipseMax, 0f, 1f) : 0f;
     public float EclipseTime => UltActiveT;
@@ -76,15 +166,40 @@ public partial class Player : Node3D
     public bool ModCyclone = false, ModHurricane = false, ModStorm = false;   // gale legendary ult-mods (NEW)
     public bool ModBlizzard = false, ModFrostElem = false, ModDeepFreeze = false;   // frost legendary ult-mods (NEW)
     public bool ModPlague = false, ModRapture = false, ModRite = false;   // forsaken legendary ult-mods (NEW)
+    public bool ModMeteorDesc = false, ModWildfire = false, ModPhoenix = false;   // ember legendary ult-mods (NEW)
+    public bool ModArcStorm = false, ModArcCataclysm = false, ModArcUnbound = false;   // arcane legendary ult-mods (NEW)
+    private int _phoenixRebirths = 0;   // (NEW) how many cheat-deaths remain this Phoenix (Immortal Phoenix ult-mod → 2)
     // ---- Ember ult runtime state (NEW) ----
     private bool _meteorAscend = false; private float _meteorAscendT = 0f, _meteorBaseY = 0f;   // Meteor Descent: rise + top-down aim window
+    private bool _meteorDiving = false; private Vector3 _meteorDiveTarget;   // (NEW) Meteor Descent: the plummet phase (travel time) between confirm and impact
+    private int _meteorRainLeft = 0; private float _meteorRainT = 0f;   // (REWORK) Meteor Descent: meteors that rain at random while she's aloft aiming
     private int _flameDashCharges = 0; private float _flameDashWindowT = 0f, _flameDashT = 0f, _flameDashDur = 0f, _flameDashDist = 0f; private Vector3 _flameDashDir;   // Wildfire Rush: dash stock + window + motion
+    private int _windCharges = 0; private float _windWindowT = 0f;   // (STORMFORM REWORK) Wind Rush dash charges + use window (mirrors Wildfire Rush)
+    public int WindCharges => _windCharges;   // HUD: charges left this Stormform
+    public int FlameCharges => _flameDashCharges;   // HUD: charges left this Wildfire Rush
+    private float _rushDashLingerT = 0f, _rushDashLingerMax = 1f;   // (REWORK) HUD: how long the LAST dash's lingering field (flame trail / wind area) still burns
+    public float RushDashLingerT => _rushDashLingerT;
+    public float RushDashLingerFrac => _rushDashLingerMax > 0.01f ? Mathf.Clamp(_rushDashLingerT / _rushDashLingerMax, 0f, 1f) : 0f;
+    // HUD: time left in the CHARGE-SPEND WINDOW (Wildfire Rush / Wind Rush must spend charges before it closes)
+    public float RushWindowT => Ult == UltKind.WildfireRush ? _flameDashWindowT : (Ult == UltKind.Stormform ? _windWindowT : 0f);
+    public float RushWindowFrac => Ult == UltKind.WildfireRush ? Mathf.Clamp(_flameDashWindowT / 10f, 0f, 1f) : (Ult == UltKind.Stormform ? Mathf.Clamp(_windWindowT / 12f, 0f, 1f) : 0f);
     public float BurnLifestealT = 0f;   // Wildfire Rush: while >0, this player's burn ticks heal her 100%
     private bool _phoenix = false, _phoenixRebirth = false; private float _phoenixAuraT = 0f;   // Phoenix Ascendant: transform + one-shot cheat-death
     public bool PhoenixActive => Ult == UltKind.PhoenixAscend && UltActive;
     private Node3D _phoenixVfx;
     // ---- Ember Fervor finisher buff (crit + move speed; witch-agnostic) ----
     public float EmberFervorT = 0f; private float _emberFervorCrit = 0f, _emberFervorSpeed = 0f, _fervorNetT = 0f;
+    public int FervorWildfire = 0, FervorPhoenix = 0;   // (OVERHAUL) Fervor evolutions: hits-ignite (Wildfire) / heal-over-buff (Phoenix Heart)
+    public float EmberBurnMul = 1f, FlameReachMul = 1f, LivingBombMul = 1f;   // (NEW) Ember-affinity blessings scale burn / flame reach / Living-Bomb blasts
+    public bool EmberInferno = false;   // (NEW) Ember legendary blessing (once)
+    public float FireWallT = 0f;   // (NEW) Ring of Fire can't recharge while an active wall is still burning
+    public float SnakeRootCd = 0f; public int RootingSnakeId = 0;   // (NEW) snake root: once per 5s per player, ground-only, ends when that snake dies
+    public void TrySnakeRoot(int snakeId)
+    {
+        if (Downed || Airborne || SnakeRootCd > 0f) return;   // ground only; throttled per player
+        SnareMe(2f); SnakeRootCd = 5f; RootingSnakeId = snakeId;
+    }
+    public void ClearSnakeRoot(int snakeId) { if (RootingSnakeId == snakeId && snakeId != 0) { _snareT = 0f; RootingSnakeId = 0; } }   // the rooting snake died → free the player
     private readonly System.Collections.Generic.List<Node3D> _fervorFlames = new();
     public bool EmberFervorActive => EmberFervorT > 0f;
     // ---- Forsaken ult runtime state (NEW) ----
@@ -110,6 +225,8 @@ public partial class Player : Node3D
     public float StormFrac => _stormMax > 0f ? Mathf.Clamp(UltActiveT / _stormMax, 0f, 1f) : 0f;   // Stormform meter 0..1 (NEW)
     public float StormTime => UltActiveT;                                      // Stormform seconds left (NEW)
     private float StormSpeedMul => StormActive ? 1.5f : 1f;                    // Stormform: +50% move speed (NEW)
+    private float HurricaneSpeedMul => (Ult == UltKind.Hurricane && UltActive) ? 2.5f : 1f;   // (REWORK) ×2.5 caster move speed while piloting the hurricane
+    public float WindZoneT = 0f; private float WindZoneMul => WindZoneT > 0f ? 3f : 1f;   // (WIND RUSH) ×3 move speed while standing in a wind area
     public float MoveSpeedFactor => Mathf.Max(1f, StormSpeedMul * WindBoonSpeedMul * (EmberFervorT > 0f ? 1f + _emberFervorSpeed : 1f));   // (NEW) swarmers scale up to keep pace with a fast player; Ember Fervor also speeds her
     private float StormFireMul => StormActive ? 0.6f : 1f;                     // Stormform: 40% faster casts (NEW)
     private float _galeGuard = 0f;                                             // Tailwind: brief damage-reduction window after a dash (Gale) (NEW)
@@ -137,7 +254,11 @@ public partial class Player : Node3D
     public bool FrostWitch = false;     // (NEW) Frost sniper — freezing beam + charged icicle spear + shatter
     public bool ForsakenWitch = false;  // (NEW) Curse controller — a lock-on curse-suck beam that tethers foes into hexed groups
     public bool EmberWitch = false;     // (NEW) Ember pyro — flamethrower cone + aimed meteor; stacks burn → Living Bomb
-    public int WitchIndex => EmberWitch ? 7 : ForsakenWitch ? 6 : FrostWitch ? 5 : GaleWitch ? 4 : (VerdantWitch ? 3 : (CrimsonWitch ? 2 : (DivineWitch ? 1 : 0)));   // 0 Lunar,1 Divine,2 Crimson,3 Verdant,4 Gale,5 Frost,6 Forsaken,7 Ember
+    public bool ArcaneWitch = false;    // (NEW) Arcane — 3-round homing missile burst + a chargeable sustained beam that arcane-marks foes
+    public int WitchIndex => ArcaneWitch ? 8 : EmberWitch ? 7 : ForsakenWitch ? 6 : FrostWitch ? 5 : GaleWitch ? 4 : (VerdantWitch ? 3 : (CrimsonWitch ? 2 : (DivineWitch ? 1 : 0)));   // 0 Lunar,1 Divine,2 Crimson,3 Verdant,4 Gale,5 Frost,6 Forsaken,7 Ember,8 Arcane
+    // (NEW) does this witch's PRIMARY fire launch piercing bolts? Lunar/Divine/Crimson/Verdant/Gale do; Frost/Forsaken/Ember use
+    // beams/cones (which already hit everything in their path) and Arcane uses homing missiles — so S.Pierce does nothing for them.
+    public bool FiresBolts => !FrostWitch && !ForsakenWitch && !EmberWitch && !ArcaneWitch;
     // ---- Forsaken (Curse) witch tuning ----
     public int MaxLinks = 6;              // (NEW) how many foes she can tether across all curse groups at once
     public float CurseRate = 2.5f;        // (NEW) curse stacks/sec the suck-beam builds — faster so groups form quickly
@@ -181,7 +302,8 @@ public partial class Player : Node3D
     public bool ModThornSkin = false;        // Thorn Skin legendary: bigger burst + root/poison
     public int GroveEvery = 14;                                   // combo per summoned ent (lower = faster; upgradeable)
     public int GroveBonusEnts = 0;                               // extra max ents from upgrades
-    public int MaxEnts => 3 + GroveBonusEnts;                    // base 3; grows ONLY via Deepening Grove cards (cap +4 → 7)
+    public int MaxEnts => 4 + GroveBonusEnts;                    // (REWORK) base 4 (was 3); grows via Grove perks/cards
+    private float _groveTrickleT = 0f;                           // (REWORK) Living Grove: a slow passive summon even without combo
     public float MinionDamage() => Base() * 0.6f;
     public float MinionBurst() => Base() * 3.0f;                   // full-charge detonation — her big burst
     public float PoisonDps() => Base() * 0.15f;                   // (NERF 0.22→0.15) per application — additive, stacks while you keep hitting; her primary poison was ~2.6× overtuned
@@ -197,6 +319,26 @@ public partial class Player : Node3D
     public int CountEnts() { Ents.RemoveAll(e => e == null || !GodotObject.IsInstanceValid(e)); return Ents.Count; }
     public float EntProgress => Mathf.Clamp(_entCombo / (float)GroveEvery, 0f, 1f);   // 0..1 toward the next ent
 
+    // (NEW) "Grafted Element": the Verdant Witch can attune her tree-ents to a chosen damage type — their explosions deal it
+    // (plus a fitting on-hit effect), and the ents visibly take on that element's look for the rest of the run.
+    public DamageType EntElement = DamageType.Nature;
+    public bool EntElementChosen = false;
+    public void RefreshEntVisuals() { foreach (var e in Ents) if (e != null && GodotObject.IsInstanceValid(e)) e.SetElement(EntElement); }
+    public void ApplyEntStatus(Enemy e, Vector3 center)   // element-specific rider on an ent blast (on top of the usual poison+root)
+    {
+        switch (EntElement)
+        {
+            case DamageType.Ember: e.AddBurn(1.5f, Base() * 0.08f, Base() * 3f, 0f, Game.I.LocalPeer); break;
+            case DamageType.Frost: e.AddFreeze(1.5f, FreezeThreshMul, FrostDurBonus); break;
+            case DamageType.Curse: e.Mark(3f, S.MarkAmp, 0); break;
+            case DamageType.Lunar: e.Slow(1.4f, 0.65f); break;
+            case DamageType.Wind:  e.Knockback(center, 7f); break;
+            case DamageType.Holy:  Heal(S.MaxHp * 0.01f); break;
+            case DamageType.Blood: BloodReward(0.25f); break;
+            // Arcane / Nature: no extra rider (Nature already gets its poison + root)
+        }
+    }
+
     // Wild Swarm ult: a forward-charging stampede of critters that trample everything in their path,
     // then vanish. They can't be damaged, detonated, or targeted — pure sweeping offense. ModSwarm
     // (Teeming Grove) makes the wave wider, deeper, and more numerous.
@@ -205,9 +347,9 @@ public partial class Player : Node3D
         Vector3 fwd = AimDir(); fwd.Y = 0;
         if (fwd.LengthSquared() < 0.01f) fwd = -GlobalTransform.Basis.Z;
         fwd = fwd.Normalized();
-        float width = 9f + (ModSwarm ? 4f : 0f);
-        float dur = 3f + t * 0.5f + (ModSwarm ? 1.5f : 0f);
-        float dmg = MinionBurst() * (0.5f + 0.1f * t);            // per-hit; enemies in the lane get hit repeatedly as the stream passes
+        float width = (9f + (ModSwarm ? 4f : 0f)) * S.SpellArea;   // Stampede stores _width raw; scale the trample lane here
+        float dur = 12f + t * 1.0f + (ModSwarm ? 1.5f : 0f);       // (REWORK) base 12s
+        float dmg = MinionBurst() * (0.75f + 0.15f * t);          // (REWORK) buffed per-hit; enemies in the lane get hit repeatedly as the stream passes
         var st = new Stampede();
         Game.I.AddChild(st);
         st.Init(this, GlobalPosition, fwd, width, dmg, dur, false);
@@ -226,7 +368,7 @@ public partial class Player : Node3D
     // crit damage multiplier with diminishing returns past +150% (keeps it strong but not runaway)
     public float CritMult()
     {
-        float cd = S.CritDamage;
+        float cd = S.CritDamage + OverchargeCritDmg;
         float eff = cd <= 1.5f ? cd : 1.5f + (cd - 1.5f) * 0.45f;
         return 1f + eff;
     }
@@ -242,10 +384,20 @@ public partial class Player : Node3D
     public int ArmorPacked => (Armor.Count & 0xF) | ((ThornCount & 0xF) << 4);   // NetVitals: low nibble total, next nibble thorn
     public int StunStateNet => GrabbedBy != 0 ? 2 : (StunT > 0.1f ? 1 : 0);   // (NEW) synced via ArmorPacked bits 8-9 for the ally roster
     public bool HasShieldSource => Ult == UltKind.BloodTsunami || Fin.Exists(f => f.Type == FinType.ThornSkin);
-    public void GrantRandomArmor()   // chest drop: ONE random armor charge (blood or thorn), respects the cap
+    public void GrantRandomArmor()   // ONE random armor charge (blood or thorn), respects the cap
     {
         bool thorn = GD.Randf() < 0.5f;
         AddArmor(thorn, thorn ? Base() * 1.6f : 0f);
+    }
+    public void FillArmorRandom()    // chest reward: FILL every empty armor slot with random charges (blood/thorn)
+    {
+        int guard = 0;
+        while (Armor.Count < MaxArmor && ShieldSuppress <= 0f && guard++ < 32)
+        {
+            int before = Armor.Count;
+            GrantRandomArmor();
+            if (Armor.Count == before) break;   // cap/suppression hit — stop
+        }
     }
     public void AddArmor(bool thorn, float dmg = 0f)
     {
@@ -285,11 +437,12 @@ public partial class Player : Node3D
         int maxSpend = 1 + Mathf.FloorToInt(Mathf.Clamp(charge, 0f, 1f) * 5f);   // 1..6
         int spend = Mathf.Min(BloodStacks, maxSpend);
         BloodStacks -= spend;
-        Heal(S.MaxHp * 0.045f * spend);
+        Heal(S.MaxHp * (CrimsonWitch ? 0.035f : 0.045f) * spend);   // (TWEAK) Crimson now also gets BURST from the dump, so lean her heal down a touch; other witches (heal-only) keep the old value
         if (spend > 0) { Ring(GlobalPosition, DamageTypes.Col(DamageType.Blood), 3.5f, 0.4f); ProcFlash = 0.25f; }
-        if (Hemoclast && spend > 0)   // the heal-dump also erupts a blood nova scaling with stacks spent
+        if ((CrimsonWitch || Hemoclast) && spend > 0)   // (NEW) the stack-dump ALWAYS erupts a blood nova for Crimson (was Hemoclast-only — her signature loop had ZERO burst); Hemoclast makes it bigger
         {
-            float nr = 5f + spend * 0.8f, nd = Base() * (0.5f + 0.35f * spend);
+            float mag = Hemoclast ? (0.5f + 0.35f * spend) : (0.35f + 0.25f * spend);   // base ≈Base×1.85 @6 stacks; Hemoclast ≈Base×2.6 (unchanged)
+            float nr = (5f + spend * 0.8f) * S.SpellArea, nd = Base() * mag;
             foreach (var en in Game.I.Enemies.ToArray())
                 if (en != null && !en.Dead && GodotObject.IsInstanceValid(en) && Flat(en, GlobalPosition) < nr + en.Radius)
                     en.Hurt(nd, DamageType.Blood, true);
@@ -313,9 +466,50 @@ public partial class Player : Node3D
     public bool Downed = false;         // incapacitated — an ally can revive; game-over only when ALL are down
     public float ReviveProg = 0f;       // 0..1 reviver progress (for HUD), set by Game while an ally holds E
     public float BlessedT = 0f;         // Blessed: amplifies all healing received
+    // (NEW) VENOM — the Warded Phalanx's arrow rain leaves poison in you. It's refreshed for as long as you stand in
+    // the volley circle (VenomHold) but only starts BITING once you're clear of it, so the punish lands after the
+    // dodge, not on top of the field damage. Blessed purges it outright — a Divine ally can cleanse the whole party.
+    public float VenomT = 0f, VenomDps = 0f, VenomHold = 0f;
+    private float _venomTick = 0f;
+    public bool Sanctuary = false;      // (NERFER) Sanctuary shrine armed → soft aura + angelic hum + 2 HP/s regen during the boss fight
     public bool Divinity = false;       // Divinity ult active (ascended, invulnerable)
     private float _divT = 0f, _divBaseY = 0f, _noFall = 0f;
     private bool _divFalling = false;   // stays invulnerable through the descent until her feet touch ground
+    private bool _divRisen = false;      // (REWORK) finished the initial ascent → free-flight control is live
+    // (EXSANGUINATE REWORK) a channeled blood transform: a DoT aura that ticks foes; a kill pops + heals her full
+    private bool _exsang = false; private float _exsangRad = 12f, _exsangDps = 10f, _exsangTickT = 0f;
+    public bool ExsangActive => _exsang;
+    private void UpdateExsanguinate(float dt)
+    {
+        if (!_exsang) return;
+        _exsangTickT -= dt;
+        if (_exsangTickT > 0f) return;
+        _exsangTickT = 0.4f;
+        float tick = _exsangDps * 0.4f;
+        bool anyKill = false;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) > _exsangRad + e.Radius) continue;
+            e.Hurt(tick, DamageType.Blood, true);   // Base-scaled DoT → works on bosses, not %HP
+            if (e.Dead) { ExsangPop(e.GlobalPosition); anyKill = true; }
+        }
+        if (anyKill) { Heal(S.MaxHp); Ring(GlobalPosition, DamageTypes.Col(DamageType.Blood).Lerp(Colors.White, 0.4f), 3.5f, 0.4f); }
+        // a soft pulsing aura ring each tick so the danger zone reads
+        Ring(new Vector3(GlobalPosition.X, 0.06f, GlobalPosition.Z), DamageTypes.Col(DamageType.Blood), _exsangRad, 0.4f);
+    }
+    // a foe dies inside the aura → a small blood nova damages nearby others (chains the harvest)
+    private void ExsangPop(Vector3 at)
+    {
+        float r = 4.5f * S.SpellArea, dmg = _exsangDps * 1.5f;
+        foreach (var e in Game.I.Enemies.ToArray())
+            if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, at) < r + e.Radius)
+                e.Hurt(dmg, DamageType.Blood, true);
+        var bc = DamageTypes.Col(DamageType.Blood);
+        Game.I.VfxRing(at + Vector3.Up * 0.5f, bc, r, 0.3f);
+        Game.I.SpawnBloodMist(at, r * 0.7f);
+        Game.I.NetMgr?.BroadcastVfx(0, at + Vector3.Up * 0.5f, Vector3.Up, r, 0.3f, bc);
+    }
     private HolyGround _holyArea = null;   // the one consecrated strip the holy ray leaves (only one at a time)
 
     public float HealMul() => BlessedT > 0f ? 1.6f : 1f;
@@ -383,7 +577,7 @@ public partial class Player : Node3D
     private const float DashDur = 0.16f;
     public int Level = 1;
     public float Xp = 0f;
-    public float XpNext = 28f;
+    public float XpNext = 26f;
     public float ManaFlash = 0f;
 
     public List<FinisherSlot> Fin = new();
@@ -413,7 +607,7 @@ public partial class Player : Node3D
     // ===== FROST WITCH: freezing beam (primary) =====
     private SegBeam _frostSeg; private const int FrostBeamSegs = 7; private float _frostBeamNetT = 0f, _frostBeamSndT = 0f, _beamHitT = 0f, _frostMarkT = 0f;
     private Node3D _frostNock;   // (NEW) nocked ice arrow shown while charging the icicle spear
-    public float FreezeRate = 1.6f;   // stacks/sec the beam builds (card-scalable later)
+    public float FreezeRate = 2.0f;   // (BUFF 1.6→2.0) stacks/sec the beam builds — snappier so the freeze→shatter loop keeps up (card-scalable later)
     public float FrostDurBonus = 0f;     // (NEW) Lingering Frost: +frozen seconds
     public float FreezeThreshMul = 1f;   // (NEW) Brittle: lower freeze threshold
     public float ShatterPowerMul = 1f;   // (NEW) Shatterpoint: stronger shatter
@@ -422,6 +616,7 @@ public partial class Player : Node3D
     public bool DeepWinter = false;      // (NEW legendary) frozen foes chill neighbours into freezing
     public bool GlacialImpaler = false;  // (NEW legendary) spear pierces everything + shatters frozen at any charge
     private const float BeamLen = 42f;
+    private float _beamLen = BeamLen;   // BeamLen × SpellRange, captured at StartBeam (a const can't read instance stats)
     public bool Channeling => _beamT > 0;
 
     private Node3D _armL, _armR;
@@ -436,15 +631,297 @@ public partial class Player : Node3D
     private static float Now => Game.GameClock;
     private static int Tier(Rarity r) => (int)r;
     private float FrenzyMul() => SanguineFrenzy ? (1f + 0.25f * (1f - Mathf.Clamp(Hp / Mathf.Max(1f, S.MaxHp), 0f, 1f))) : 1f;   // up to +25% near death
-    private float Base() => 10f * S.Atk * UltDmgMul * DamageMul * FrenzyMul() * JetstreamMul();   // JetstreamMul = Gale airborne bonus (NEW)
+    private float Base() => 10f * S.Atk * UltDmgMul * DamageMul * FrenzyMul() * JetstreamMul() * HolyEmpowerMul();   // JetstreamMul = Gale airborne bonus (NEW); HolyEmpowerMul = Divine Hallowed buff (OVERHAUL)
     public float ShatterBurstDmg() => Base() * 7.0f * ComboMul();   // (NEW) player-scaled flat shatter burst — her signature single-target snipe, tuned to edge out the Forsaken's crush (~68 → shatter ~73+ at full HP)
     public float DamageMul = 1f;   // per-witch base-damage scalar (Divine trades damage for sustain)
+    public float HolyEmpowerT = 0f, HolyEmpowerAmt = 0f;   // (OVERHAUL) Consecrated Ground Hallowed: a timed Holy damage buff
+    private float HolyEmpowerMul() => HolyEmpowerT > 0f ? 1f + HolyEmpowerAmt : 1f;
+    private float _thornBurstRad = 5f, _thornRoot = 0f, _thornResistT = 0f, _thornResistAmt = 0f;   // (OVERHAUL) Thorn Skin stacks cached for the armor-break burst
+    private int _beamOverload = 0; private float _beamHeld = 0f; private readonly System.Collections.Generic.List<SegBeam> _prismSegs = new();   // (OVERHAUL) Spelllance Overload crit-ramp + Prism extra beams
     public float ComboMul() => 1f + Mathf.Min(Mathf.Max(Combo - 1, 0), S.ComboCap) * S.ComboPow;
     public float ComboFrac() => Mathf.Clamp((S.ComboWindow - (Now - ComboT)) / S.ComboWindow, 0, 1);
     public bool ComboLive => Combo > 1 && (Now - ComboT) <= S.ComboWindow;
     public Vector3 AimDir() => (-_cam.GlobalTransform.Basis.Z).Normalized();
     public Vector3 EyePos => _cam.GlobalPosition;
     public Camera3D Cam => _cam;
+
+    private Camera3D _tpCam;
+    private WitchModel _tpPuppet;
+    private bool _tp = false;
+    private float _tpYaw, _tpPitch = 0.15f, _tpDist = 8f;
+    private Vector3 _tpFocus, _prevTpPos;
+    private bool _tpCastHeld;   // edge-detect for the C-key cast preview in third-person
+    private bool _castWasHeld;  // co-op cast-broadcast edge detect
+    private float _castRepulse; // co-op cast-broadcast re-pulse timer (keeps the mask alive while cast is held)
+    private bool _chargeWasHeld; // edge detect for the charge-release animation trigger
+    private bool _fpAuthored;   // (DEV prototype) first-person view uses the AUTHORED witch arms/body instead of primitives
+    private WitchModel _fpPuppet;
+    private float _fpEyeY = 3.1f;   // eye/camera height for the authored FP view (tunable via `fp <eye>`)
+    private float _fpYaw = 0.54f;   // body twist (~31°) to bring the arms toward center (tunable via `fp <eye> <twistDeg>`)
+    private float _fpNear = 0.8f;   // camera near-clip (m) — slices off the chest/head splat close to the lens, keeps the arms
+    private float _fpNearSaved = 0.05f;   // original camera near, restored on exit
+    private float _fpFwd = 0f;      // forward(+)/back(-) offset of the authored body relative to the camera
+    public bool FirstPersonAuthored => _fpAuthored;
+    // (DEV) playable THIRD-PERSON prototype: authored witch shown full-body, follow-cam behind, she faces your aim + strafes.
+    private bool _tp3;
+    private WitchModel _tp3Puppet;
+    private float _tp3H = 4.0f, _tp3D = 2.8f, _tp3Lat = 1.2f;   // OVER-THE-SHOULDER cam: height, distance behind, lateral offset
+    public bool ThirdPersonPlay => _tp3;
+    private float _leftFire;    // 0→1 left-arm thrust blend (ramps up while LMB held, down on release)
+    private bool _castIK;       // (DEV EXPERIMENT) drive the cast arms with IK instead of the clip poses
+    private float _releaseIK;   // 0→1 decaying push-out blend fired on charge release
+    private Vector3 _ikLeftTarget, _ikChargeTarget;   // where the IK hands reach — used as the fire muzzle when IK is on
+    private float _jumpBlend, _jumpElapsed, _jumpSeek, _landT; private bool _jumpRun, _jumpMir, _wasAir;   // jump blend/scrub/land + takeoff variant
+    private const float LandDur = 0.28f;   // landing (knee-bend absorb) duration
+    public string ToggleCastIK()
+    {
+        if (!_tp3 || _tp3Puppet == null || !GodotObject.IsInstanceValid(_tp3Puppet)) return "enter tp3 first ('tp3').";
+        _castIK = !_castIK;
+        if (_castIK) _tp3Puppet.SetupCastIK();
+        return _castIK ? "cast IK ON — left hand points at the crosshair on fire (clip pose off)." : "cast IK OFF — back to the clip pose.";
+    }
+    // (DEV) anim viewer: browse the casting clips on the witch model with [ / ]
+    private bool _animView;
+    private WitchModel _animPuppet;
+    private System.Collections.Generic.List<(string key, string name)> _animList;
+    private int _animIdx;
+    private Label3D _animLabel;
+    private bool _animPrevHeld, _animNextHeld;
+    private static readonly string[] ViewerAnims = {
+        "witches/anims/magic/standing 1H cast spell 01.fbx",
+        "witches/anims/magic/Standing 1H Magic Attack 01.fbx",
+        "witches/anims/magic/Standing 1H Magic Attack 02.fbx",
+        "witches/anims/magic/Standing 1H Magic Attack 03.fbx",
+        "witches/anims/magic/Standing 2H Cast Spell 01.fbx",
+        "witches/anims/magic/Standing 2H Magic Attack 01.fbx",
+        "witches/anims/magic/Standing 2H Magic Attack 02.fbx",
+        "witches/anims/magic/Standing 2H Magic Attack 03.fbx",
+        "witches/anims/magic/Standing 2H Magic Attack 04.fbx",
+        "witches/anims/magic/Standing 2H Magic Attack 05.fbx",
+        "witches/anims/magic/Standing 2H Magic Area Attack 01.fbx",
+        "witches/anims/magic/Standing 2H Magic Area Attack 02.fbx",
+    };
+    public bool AnimViewer => _animView;
+    public bool ThirdPerson => _tp;
+    // (DEV) third-person inspect toggle: drop a full witch puppet (authored mesh if available) into the WORLD (fixed, so
+    // it doesn't spin with you) + a mouse-ORBIT camera around it; hides the FP body/hands. Mouse = orbit, wheel = zoom.
+    public bool ToggleThirdPerson()
+    {
+        _tp = !_tp;
+        if (_tp)
+        {
+            Vector3 feet = GlobalPosition;
+            _tpPuppet = new WitchModel();
+            _tpPuppet.Build(WitchIndex, false);        // non-FP → uses the authored mesh when one exists
+            Game.I.AddChild(_tpPuppet);                // parent to the WORLD, not the player, so she stays put
+            _tpPuppet.GlobalPosition = feet;
+            _tpPuppet.Rotation = new Vector3(0, Rotation.Y + Mathf.Pi, 0);   // face toward the camera's starting side
+            _tpFocus = feet + Vector3.Up * 2.4f;       // orbit around her mid-body
+            _tpYaw = Rotation.Y; _tpPitch = 0.15f; _tpDist = 8f; _prevTpPos = GlobalPosition;
+            _tpCam = new Camera3D { Fov = 58, Current = true };
+            Game.I.AddChild(_tpCam);
+            UpdateTpCam();
+            if (_bodyModel != null && GodotObject.IsInstanceValid(_bodyModel)) _bodyModel.Visible = false;
+            if (_armL != null) _armL.Visible = false;
+            if (_armR != null) _armR.Visible = false;
+        }
+        else
+        {
+            if (_tpCam != null && GodotObject.IsInstanceValid(_tpCam)) _tpCam.QueueFree();
+            _tpCam = null;
+            if (_tpPuppet != null && GodotObject.IsInstanceValid(_tpPuppet)) _tpPuppet.QueueFree();
+            _tpPuppet = null;
+            if (_cam != null) _cam.Current = true;
+            if (_bodyModel != null && GodotObject.IsInstanceValid(_bodyModel)) _bodyModel.Visible = true;
+            if (_armL != null) _armL.Visible = true;
+            if (_armR != null) _armR.Visible = true;
+        }
+        return _tp;
+    }
+
+    private SkelViz _tpSkelViz;
+    // (DEV) toggle the pulsing skeleton overlay on the third-person inspect puppet. Returns a status/bone summary.
+    public string ToggleTpSkeleton()
+    {
+        if (!_tp || _tpPuppet == null || !GodotObject.IsInstanceValid(_tpPuppet)) return "enter third-person first (type 'tp').";
+        if (_tpSkelViz != null && GodotObject.IsInstanceValid(_tpSkelViz)) { _tpSkelViz.QueueFree(); _tpSkelViz = null; return "skeleton overlay OFF."; }
+        var (summary, viz) = ModelAssets.ShowSkeleton(_tpPuppet);
+        _tpSkelViz = viz;
+        return summary;
+    }
+
+    // (DEV prototype) Toggle a UNIFIED first-person view: the authored Mixamo witch parented to the player, camera at her
+    // eyes, head+hat culled, primitive FP hands hidden. You see your REAL authored arms — same mesh/anims as co-op allies —
+    // driven by your movement + cast mask. Lets us judge how the authored arms read while aiming/casting.
+    public string ToggleFirstPersonAuthored(float eyeY = -1f, float twistDeg = -999f, float near = -1f, float fwd = -999f)
+    {
+        bool hasArgs = eyeY > 0f || twistDeg > -900f || near > 0f || fwd > -900f;
+        if (_fpAuthored && !hasArgs)   // already on + no args → toggle OFF
+        {
+            if (_fpPuppet != null && GodotObject.IsInstanceValid(_fpPuppet)) _fpPuppet.QueueFree();
+            _fpPuppet = null; _fpAuthored = false;
+            SetPrimitiveFpVisible(true);
+            _cam.Near = _fpNearSaved;                        // restore normal near-clip
+            return "first-person AUTHORED off — primitive hands restored.";
+        }
+        if (!_fpAuthored)   // turn ON
+        {
+            var puppet = new WitchModel();
+            puppet.Build(WitchIndex, false);                 // non-FP branch → authored full body + anim tree
+            if (!puppet.IsAuthored) { puppet.QueueFree(); return "no authored mesh for this witch (drop witch_<key>.fbx first)."; }
+            _fpPuppet = puppet;
+            AddChild(_fpPuppet);                             // parent to the player → yaws with your look, moves with you
+            ModelAssets.HideForFirstPerson(_fpPuppet);       // collapse head/neck/hair + legs (keep arms + torso)
+            SetPrimitiveFpVisible(false);
+            _fpNearSaved = _cam.Near;
+            _fpAuthored = true;
+        }
+        if (eyeY > 0f) _fpEyeY = eyeY;                       // live tuning (works while it's already on too)
+        if (twistDeg > -900f) _fpYaw = Mathf.DegToRad(twistDeg);
+        if (near > 0f) _fpNear = near;
+        if (fwd > -900f) _fpFwd = fwd;
+        if (_fpPuppet != null)
+        {
+            _fpPuppet.Rotation = new Vector3(0f, Mathf.Pi + _fpYaw, 0f);   // mesh faces +Z → +Pi to camera, +twist to center the arms
+            _fpPuppet.Position = new Vector3(0f, 0f, -_fpFwd);            // +fwd = push the body/arms forward (camera looks -Z)
+        }
+        _cam.Near = _fpNear;                                 // clip the chest/head splat near the lens
+        return $"first-person AUTHORED — eye {_fpEyeY:0.0}m, twist {Mathf.RadToDeg(_fpYaw):0}°, near {_fpNear:0.00}m, fwd {_fpFwd:0.00}m. 'fp' exits; 'fp <eye> <twistDeg> <near> <fwd>' tunes live.";
+    }
+
+    // (DEV) Playable third-person: full authored witch behind a follow-cam, facing your aim, strafing with WASD, casting with
+    // the mask. Spawns stay ON — this is meant to be actually played. `tp3 <dist> <height>` tunes the camera live.
+    public string ToggleThirdPersonPlay(float dist = -1f, float height = -1f, float lat = -999f)
+    {
+        bool hasArgs = dist > 0f || height > 0f || lat > -900f;
+        if (_tp3 && !hasArgs)
+        {
+            if (_tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.QueueFree();
+            _tp3Puppet = null; _tp3 = false;
+            SetPrimitiveFpVisible(true);
+            return "third-person PLAY off — first-person restored.";
+        }
+        if (!_tp3)
+        {
+            var p = new WitchModel();
+            p.Build(WitchIndex, false);
+            if (!p.IsAuthored) { p.QueueFree(); return "no authored mesh for this witch (drop witch_<key>.fbx first)."; }
+            _tp3Puppet = p;
+            AddChild(_tp3Puppet);
+            _tp3Puppet.Position = Vector3.Zero;
+            _tp3Puppet.Rotation = new Vector3(0f, Mathf.Pi, 0f);   // mesh faces +Z → +Pi so she faces your aim (-Z), back to the cam
+            SetPrimitiveFpVisible(false);
+            _tp3 = true;
+        }
+        if (dist > 0f) _tp3D = dist;
+        if (height > 0f) _tp3H = height;
+        if (lat > -900f) _tp3Lat = lat;
+        return $"third-person PLAY on — over-shoulder cam dist {_tp3D:0.0} height {_tp3H:0.0} lateral {_tp3Lat:0.0}. Move + cast. 'tp3' exits; 'tp3 <dist> <height> <lateral>' tunes.";
+    }
+
+    // Projectile spawn origin. In 3rd-person play: LEFT hand for the primary mote, BOTH hands (midpoint) for a charge release;
+    // in all other modes it's the usual camera muzzle — so normal first-person play is byte-for-byte unchanged.
+    private bool _muzzleCharge;   // set true only around the charge-release fire so FireOrigin uses both hands
+    private Vector3 FireOrigin(Vector3 camFwd)
+    {
+        if (_castIK && _tp3 && _tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet))
+        {   // IK: fire from the hand reach point computed FRESH this instant (no stale-frame lag during a jump)
+            Vector3 camF = camFwd.Normalized(), camR = _cam.GlobalTransform.Basis.X.Normalized();
+            Vector3 pos = _tp3Puppet.GlobalPosition;
+            if (_muzzleCharge) return pos + Vector3.Up * 3.8f + camF * 2.4f;   // both-hand push point
+            return pos + Vector3.Up * 3.9f - camR * 0.6f + camF * 1.8f;        // left reach point
+        }
+        if (_tp3 && _tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet) && TryHands(out var lh, out var rh))
+        {
+            var f = camFwd.Normalized();
+            return (_muzzleCharge ? (lh + rh) * 0.5f : lh) + f * 0.4f;   // clear the mesh
+        }
+        return _cam.GlobalPosition + camFwd * 1.2f;   // FP: usual camera muzzle
+    }
+
+    private bool TryHands(out Vector3 left, out Vector3 right)
+    {
+        left = default; right = default; bool gotL = false, gotR = false;
+        var skel = ModelAssets.FindSkeleton(_tp3Puppet);
+        if (skel == null) return false;
+        for (int i = 0; i < skel.GetBoneCount(); i++)
+        {
+            string n = (string)skel.GetBoneName(i);   // the hand itself; finger bones are ...Hand{Index,Thumb,...}1
+            if (!gotL && n.EndsWith("LeftHand")) { left = (skel.GlobalTransform * skel.GetBoneGlobalPose(i)).Origin; gotL = true; }
+            else if (!gotR && n.EndsWith("RightHand")) { right = (skel.GlobalTransform * skel.GetBoneGlobalPose(i)).Origin; gotR = true; }
+        }
+        if (gotL && !gotR) right = left; else if (gotR && !gotL) left = right;
+        return gotL || gotR;
+    }
+
+    // (DEV) Anim viewer: drop the witch in front of the camera, disable her loco/cast tree, and play the casting clips one at
+    // a time (looped, in place). [ = previous, ] = next; the clip name floats above her.
+    public string ToggleAnimViewer()
+    {
+        if (_animView)
+        {
+            if (_animPuppet != null && GodotObject.IsInstanceValid(_animPuppet)) _animPuppet.QueueFree();
+            _animPuppet = null; _animList = null; _animLabel = null; _animView = false;
+            SetPrimitiveFpVisible(true);
+            return "anim viewer OFF.";
+        }
+        var p = new WitchModel();
+        p.Build(WitchIndex, false);
+        if (!p.IsAuthored) { p.QueueFree(); return "no authored mesh for this witch."; }
+        _animPuppet = p;
+        AddChild(_animPuppet);
+        _animPuppet.Position = Vector3.Zero;
+        _animPuppet.Rotation = new Vector3(0f, 0f, 0f);   // face +Z toward the front camera so you see the cast
+        _animPuppet.EnableTree(false);                    // stop the loco/cast tree — we drive clips directly
+        _animList = ModelAssets.LoadViewerAnims(_animPuppet.Ap, ViewerAnims);
+        SetPrimitiveFpVisible(false);
+        _animLabel = new Label3D
+        {
+            Billboard = BaseMaterial3D.BillboardModeEnum.Enabled, NoDepthTest = true, FontSize = 64, PixelSize = 0.004f,
+            Modulate = new Color(1f, 0.93f, 0.45f), OutlineModulate = new Color(0f, 0f, 0f), OutlineSize = 14,
+            Position = new Vector3(0f, 5.6f, 0f),
+        };
+        _animPuppet.AddChild(_animLabel);
+        _animIdx = 0; _animView = true;
+        PlayViewerAnim();
+        return $"anim viewer ON ({_animList?.Count ?? 0} casting clips). '[' prev · ']' next · 'animview' exits.";
+    }
+
+    private void PlayViewerAnim()
+    {
+        if (_animPuppet == null || !GodotObject.IsInstanceValid(_animPuppet) || _animList == null || _animList.Count == 0) return;
+        _animIdx = ((_animIdx % _animList.Count) + _animList.Count) % _animList.Count;
+        var (key, name) = _animList[_animIdx];
+        _animPuppet.Ap?.Play(key);
+        if (_animLabel != null && GodotObject.IsInstanceValid(_animLabel)) _animLabel.Text = $"{_animIdx + 1}/{_animList.Count}  {name}";
+    }
+
+    // Hide the first-person (camera-anchored) charge visuals — they read as floating at the reticle in 3rd-person modes.
+    // The generic charge sphere is KEPT in tp3 (repositioned to her hands); the others are hidden for now.
+    private void HideFpChargeVisuals()
+    {
+        if (_thornCharge != null) _thornCharge.Visible = false;
+        if (_frostNock != null) _frostNock.Visible = false;
+        if (_voodoo != null && GodotObject.IsInstanceValid(_voodoo)) _voodoo.Visible = false;
+        if (_arcaneOrb != null && GodotObject.IsInstanceValid(_arcaneOrb)) _arcaneOrb.Visible = false;
+        if (_chargeOrb != null && !_tp3) _chargeOrb.Visible = false;   // in tp3 we reposition it to her hands instead
+    }
+
+    private void SetPrimitiveFpVisible(bool v)
+    {
+        if (_bodyModel != null && GodotObject.IsInstanceValid(_bodyModel)) _bodyModel.Visible = v;
+        if (_armL != null) _armL.Visible = v;
+        if (_armR != null) _armR.Visible = v;
+    }
+
+    private void UpdateTpCam()
+    {
+        if (_tpCam == null || !GodotObject.IsInstanceValid(_tpCam)) return;
+        float cp = Mathf.Cos(_tpPitch), sp = Mathf.Sin(_tpPitch);
+        var dir = new Vector3(cp * Mathf.Sin(_tpYaw), sp, cp * Mathf.Cos(_tpYaw));
+        _tpCam.GlobalPosition = _tpFocus + dir * _tpDist;
+        _tpCam.LookAt(_tpFocus, Vector3.Up);
+    }
 
     public override void _Ready()
     {
@@ -550,7 +1027,7 @@ public partial class Player : Node3D
         n.AddChild(fore);
         var hand = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.13f, Height = 0.26f } };
         hand.Position = new Vector3(0, 0, -0.62f);
-        hand.MaterialOverride = Game.ToonEmissive(skin, 0.5f, 0.02f);
+        hand.MaterialOverride = Game.ToonEmissive(skin, 0.3f, 0.02f);   // (PAINTERLY) calmer hand glow — stop the pure-white bloom crescents
         n.AddChild(hand);
         handMesh = hand;
         return n;
@@ -600,8 +1077,20 @@ public partial class Player : Node3D
         if (e is InputEventMouseButton pmb && pmb.Pressed && pmb.ButtonIndex == MouseButton.Middle && Game.I != null && Game.I.CanControlLocal()) { DoPing(); return; }   // (NEW) middle-click ping
         if (e is InputEventMouseButton mb && mb.Pressed && Input.MouseMode != Input.MouseModeEnum.Captured && Game.I.State == GameState.Playing && !Game.I.ConsoleOpen)
         { Input.MouseMode = Input.MouseModeEnum.Captured; return; }
+        if (_tp && e is InputEventMouseButton tw && tw.Pressed)   // (DEV inspect) wheel = zoom the orbit
+        {
+            if (tw.ButtonIndex == MouseButton.WheelUp) { _tpDist = Mathf.Max(3f, _tpDist - 0.7f); UpdateTpCam(); return; }
+            if (tw.ButtonIndex == MouseButton.WheelDown) { _tpDist = Mathf.Min(22f, _tpDist + 0.7f); UpdateTpCam(); return; }
+        }
         if (e is InputEventMouseMotion mm && Input.MouseMode == Input.MouseModeEnum.Captured)
         {
+            if (_tp)   // (DEV inspect) mouse orbits the puppet instead of turning the player
+            {
+                _tpYaw -= mm.Relative.X * MouseSens;
+                _tpPitch = Mathf.Clamp(_tpPitch - mm.Relative.Y * MouseSens, -1.2f, 1.3f);
+                UpdateTpCam();
+                return;
+            }
             RotateY(-mm.Relative.X * MouseSens);
             _pitch = Mathf.Clamp(_pitch - mm.Relative.Y * MouseSens, -1.4f, 1.4f);
             _cam.Rotation = new Vector3(_pitch, 0, 0);
@@ -612,18 +1101,67 @@ public partial class Player : Node3D
             for (int i = 0; i < Fin.Count; i++)
                 if (Fin[i].Bind != Key.None && k.PhysicalKeycode == Fin[i].Bind) { FireFinisher(i); break; }
         }
+        // gamepad: R3 = quick-turn 180°; hold LB + a face button = fire spell slot 1-5
+        if (e is InputEventJoypadButton jb && jb.Pressed && Game.I != null && Game.I.CanControlLocal() && Game.I.State == GameState.Playing)
+        {
+            if (jb.ButtonIndex == JoyButton.RightStick) { _turn180 = Mathf.Pi; return; }   // whip around to face behind
+            if (Input.IsJoyButtonPressed(jb.Device, JoyButton.LeftShoulder))
+            {
+                int slot = jb.ButtonIndex switch { JoyButton.X => 0, JoyButton.Y => 1, JoyButton.B => 2, JoyButton.A => 3, JoyButton.RightShoulder => 4, _ => -1 };
+                if (slot >= 0) { FireFinisher(slot); return; }
+            }
+        }
+    }
+
+    // right-stick look: radial deadzone + squared response curve + light exponential smoothing, all frame-rate independent.
+    // Also drives the R3 quick-turn. Runs every frame the player is controllable (incl. during flight/ascend ults).
+    private void UpdatePadLook(float dt)
+    {
+        if (_turn180 > 0f) { float step = Mathf.Min(_turn180, 22f * dt); RotateY(step); _turn180 -= step; }   // snap-turn at a fixed fast rate — reads instant, no nausea
+        if (!Game.PadActive) return;
+        var raw = new Vector2(Input.GetJoyAxis(0, JoyAxis.RightX), Input.GetJoyAxis(0, JoyAxis.RightY));
+        float mag = raw.Length();
+        Vector2 target = Vector2.Zero;
+        if (mag > PadLookDead)
+        {
+            float t = Mathf.Clamp((mag - PadLookDead) / (1f - PadLookDead), 0f, 1f);
+            target = (raw / mag) * (t * t);   // squared curve: precise near center, fast at the edge
+        }
+        _padLook = _padLook.Lerp(target, 1f - Mathf.Exp(-dt * 32f));   // fast, light smoothing — kills stick jitter with negligible latency
+        if (_padLook.LengthSquared() < 1e-8f) return;
+        float rate = PadLookSens * PadSensMul * dt;
+        RotateY(-_padLook.X * rate);
+        _pitch = Mathf.Clamp(_pitch - _padLook.Y * rate, -1.4f, 1.4f);
+        _cam.Rotation = new Vector3(_pitch, 0, 0);
     }
 
     public override void _Process(double delta)
     {
         float dt = (float)delta;
+        // menus pause the world (WorldRunning=false) → freeze the authored anim trees to a still frame (this must run even
+        // while paused, so it's before the CanControlLocal early-return below)
+        bool worldRunning = Game.I == null || Game.I.WorldRunning;
+        if (_tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.EnableTree(worldRunning);
+        if (_fpPuppet != null && GodotObject.IsInstanceValid(_fpPuppet)) _fpPuppet.EnableTree(worldRunning);
+        if (_tp && _tpPuppet != null && GodotObject.IsInstanceValid(_tpPuppet))   // (DEV inspect) drive the puppet's walk/idle from your movement
+        {
+            Vector3 d = GlobalPosition - _prevTpPos; d.Y = 0f;
+            // pass world move dir so the puppet (fixed facing) plays the matching strafe clip — walk any direction to preview
+            _tpPuppet.Animate(dt, Mathf.Clamp(d.Length() / Mathf.Max(dt, 1e-4f) / 9f, 0f, 1f), false, d);
+            _prevTpPos = GlobalPosition;
+            bool castKey = Input.IsPhysicalKeyPressed(Key.C);                        // press C to preview the upper-body cast mask
+            if (castKey && !_tpCastHeld) _tpPuppet.Cast();
+            _tpCastHeld = castKey;
+        }
         if (_iframe > 0) _iframe -= dt;   // (FIX) always decay iframes — opening the console or being grabbed must NOT freeze immunity
+        UpdateMenuImmunity(dt);           // (MP) elemental bubble while she's in a menu; on close it bursts, shoving foes off her
+        if (Downed && !_grounded && Game.I != null && Game.I.WorldRunning) UpdateVertical(dt, false);   // (NEW) a body downed mid-air keeps falling to the ground instead of freezing there (fall damage is a no-op while Downed)
         if (Game.I != null && !Game.I.CanControlLocal()) { if (_frostSeg != null) EndFrostBeam(); if (_curseSeg != null) EndCurseBeam(); return; }
-        if (GodMode) { Hp = Mathf.Min(S.MaxHp, Hp + S.MaxHp * 3f * dt); Mana = S.ManaMax; }   // (NEW) dev god mode: takes hits (numbers show) but fast-regens + never dies
+        if (GodMode) { Hp = Mathf.Min(S.MaxHp, Hp + S.MaxHp * 3f * dt); Mana = S.ManaMax; if (Ult != UltKind.None && !UltActive) UltCharge = 1f; if (Game.I != null) Game.I.BossTokens = Mathf.Max(Game.I.BossTokens, 99f); }   // (NEW) dev god mode: fast-regens + never dies, infinite mana, ult stays charged, and infinite boss tokens (free ult upgrade/swap via [U])
         if (GrabbedBy != 0)   // (NEW) held by a Taker: stunned + carried in its grasp
         {
             var t = Game.I.EnemyByNetId(GrabbedBy);
-            if (t == null || t.Dead) GrabbedBy = 0;
+            if (t == null || t.Dead || MenuShielded || FullyImmune) GrabbedBy = 0;   // (MP) the bubble / Divinity / Faith Shield lets her slip a Taker's grasp
             else
             {
                 StunT = Mathf.Max(StunT, 0.25f);
@@ -633,6 +1171,15 @@ public partial class Player : Node3D
             }
         }
         if (_fireCd > 0) _fireCd -= dt;
+        // co-op: broadcast a cast pulse so allies' avatars play the upper-body cast overlay — on press + re-pulse while held
+        bool casting = Input.IsActionPressed("cast");
+        _castRepulse -= dt;
+        if (casting && (!_castWasHeld || _castRepulse <= 0f))
+        {
+            Game.I.NetMgr?.BroadcastCast(); _castRepulse = 0.6f;
+            if (_fpAuthored && _fpPuppet != null && GodotObject.IsInstanceValid(_fpPuppet)) _fpPuppet.Cast();   // your own FP arms cast
+        }
+        _castWasHeld = casting;
         if (ManaFlash > 0) ManaFlash -= dt;
         if (ProcFlash > 0) ProcFlash -= dt;
         if (HealFlash > 0) HealFlash -= dt;
@@ -641,21 +1188,123 @@ public partial class Player : Node3D
         if (Input.IsActionJustPressed("release_mouse")) Input.MouseMode = Input.MouseModeEnum.Visible;
 
         AnimateHands(dt);
+        if (_tp3 || _fpAuthored || _animView) HideFpChargeVisuals();   // FP charge orb/doll/nock are screen-anchored — hide them in 3rd-person
         if (Game.I != null && Game.I.CanControlLocal()) DrawCurseTethers();   // (NEW) tethers persist + show on every machine (synced group)
         if (_bodyModel != null)
         {
             var mv = GlobalPosition - _prevBodyPos; mv.Y = 0f; _prevBodyPos = GlobalPosition;
             float sp = Mathf.Clamp(mv.Length() / Mathf.Max(dt, 1e-4f) / Mathf.Max(1f, S.Speed), 0f, 1f);
             _bodyModel.Animate(dt, sp, !_grounded);
+            if (_fpAuthored && _fpPuppet != null && GodotObject.IsInstanceValid(_fpPuppet))
+                _fpPuppet.Animate(dt, 0f, false);   // FP: freeze at idle (legs hidden) so the arms stay stable on screen; cast still fires
+            if (_tp3 && _tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet))
+            {
+                _tp3Puppet.Animate(dt, _grounded ? sp : 0f, !_grounded, mv);   // airborne → freeze locomotion to idle (no run-cycle bob under the jump)
+                if (_castIK)   // IK drives the arms (grounded AND airborne — the jump is legs-only, so arms stay free to cast)
+                {
+                    Vector3 camF = (-_cam.GlobalTransform.Basis.Z).Normalized(), camR = _cam.GlobalTransform.Basis.X.Normalized();
+                    Vector3 pos = _tp3Puppet.GlobalPosition;
+                    Vector3 shL = pos + Vector3.Up * 3.9f - camR * 0.6f, shR = pos + Vector3.Up * 3.9f + camR * 0.6f;
+                    Vector3 magL = shL + Vector3.Down * 1.2f - camR * 1.0f, magR = shR + Vector3.Down * 1.2f + camR * 1.0f;   // elbow hints
+                    _ikLeftTarget = shL + camF * 1.8f;                          // primary reach point → also the fire muzzle
+                    _ikChargeTarget = pos + Vector3.Up * 3.8f + camF * 2.4f;    // release push point → both-hand muzzle
+                    if (!Charging && _chargeWasHeld) _releaseIK = 1f;                 // trigger a forward push on charge release
+                    _releaseIK = Mathf.MoveToward(_releaseIK, 0f, dt * 4.5f);
+                    if (Charging)   // both hands gather to a close point in front, rising with charge
+                    {
+                        Vector3 gather = pos + Vector3.Up * 3.6f + camF * 0.9f;
+                        _tp3Puppet.DriveLeftIK(gather - camR * 0.35f, magL, ChargeAmt);
+                        _tp3Puppet.DriveRightIK(gather + camR * 0.35f, magR, ChargeAmt);
+                    }
+                    else if (_releaseIK > 0.02f)   // both hands thrust forward toward the crosshair
+                    {
+                        _tp3Puppet.DriveLeftIK(_ikChargeTarget - camR * 0.3f, magL, _releaseIK);
+                        _tp3Puppet.DriveRightIK(_ikChargeTarget + camR * 0.3f, magR, _releaseIK);
+                    }
+                    else   // primary: left hand points at the crosshair, right arm relaxed
+                    {
+                        _tp3Puppet.DriveLeftIK(_ikLeftTarget, magL, _leftFire);
+                        _tp3Puppet.DriveRightIK(Vector3.Zero, magR, 0f);
+                    }
+                }
+                // drive the charge sphere directly (AnimateHands leaves it hidden in 3rd-person): show + grow it at the
+                // midpoint of her raised/gathering hands while charging
+                if (_chargeOrb != null)
+                {
+                    bool show = Charging && ChargeAmt > 0.02f;   // charge orb shows in the air too (arms are free to gather)
+                    _chargeOrb.Visible = show;
+                    if (show)
+                    {
+                        Vector3 camF = (-_cam.GlobalTransform.Basis.Z).Normalized();
+                        // VISUAL only (does not touch _charge / damage): halved max size (~2.0 vs 4.0), eased (pow 1.6) so it
+                        // keeps growing across the whole charge; sits in FRONT of the hands by its own radius.
+                        float scale = 0.3f + Mathf.Pow(ChargeAmt, 1.6f) * 1.7f;
+                        float radius = scale * 0.18f;   // sphere base radius
+                        Vector3 handsMid = _tp3Puppet.GlobalPosition + Vector3.Up * 3.6f + camF * 0.9f;
+                        _chargeOrb.GlobalPosition = handsMid + camF * radius;
+                        _chargeOrb.Scale = Vector3.One * scale;
+                    }
+                }
+            }
+            // two-button caster: drive the authored puppet's charge gather-pose + fire the release on let-go
+            var authored = _tp3 ? _tp3Puppet : (_fpAuthored ? _fpPuppet : null);
+            if (authored != null && GodotObject.IsInstanceValid(authored))
+            {
+                authored.SetCharge(_castIK ? 0f : (Charging ? ChargeAmt : 0f));   // IK owns the arms when enabled; charge works in the air (legs-only jump)
+                if (!_castIK && !Charging && _chargeWasHeld) authored.Release();
+                // left fire: thrust the arm forward FAST on LMB-press, hold while held (rapid fire), recover on release
+                float lfTarget = (Input.IsActionPressed("cast") && !Charging) ? 1f : 0f;
+                _leftFire = Mathf.MoveToward(_leftFire, lfTarget, (lfTarget > _leftFire ? 16f : 7f) * dt);
+                authored.SetLeftFire(_castIK ? 0f : _leftFire);   // IK owns the arm when enabled
+                // jump: freeze a whole-body falling pose while airborne — running vs still picked at takeoff
+                bool air = !_grounded;
+                if (air && !_wasAir)   // capture at takeoff: run vs still, and strafe-right → mirrored variant for variety
+                {
+                    _jumpRun = sp > 0.5f;
+                    Vector3 local = _tp3Puppet != null ? _tp3Puppet.GlobalTransform.Basis.Inverse() * (mv.LengthSquared() > 1e-4f ? mv.Normalized() : Vector3.Zero) : Vector3.Zero;
+                    _jumpMir = local.X > 0f;
+                    _jumpElapsed = 0f;
+                }
+                if (!air && _wasAir) _landT = LandDur;   // touchdown → play the land phase (knee-bend absorb)
+                float jlen = authored.JumpClipLen;
+                if (air)   // LAUNCH → HOLD FALL: scrub fast (4×) to ~80% of the clip, then hold
+                {
+                    _jumpElapsed += dt;
+                    _jumpSeek = Mathf.Min(_jumpElapsed * 4f, 0.80f * jlen);
+                    _jumpBlend = Mathf.MoveToward(_jumpBlend, 0.8f, 4.5f * dt);
+                }
+                else if (_landT > 0f)   // LAND: play the clip's tail (80→100%) and ease the legs back to locomotion
+                {
+                    _landT -= dt;
+                    float lp = Mathf.Clamp(1f - _landT / LandDur, 0f, 1f);
+                    _jumpSeek = Mathf.Lerp(0.80f, 1.0f, lp) * jlen;
+                    _jumpBlend = 0.8f * (1f - lp * lp);
+                }
+                else _jumpBlend = Mathf.MoveToward(_jumpBlend, 0f, 11f * dt);
+                authored.SetJump(_jumpBlend, _jumpRun, _jumpMir, _jumpSeek);
+                _wasAir = air;
+            }
+            _chargeWasHeld = Charging;
         }
 
         if (_camKick > 0f) _camKick = Mathf.Max(0f, _camKick - dt * 4.5f);
         _cam.Fov = BaseFov + _camKick * 9f - (FrostWitch && Charging ? ChargeAmt * 34f : 0f);   // (NEW) Frost sniper: zoom in on the cursor as she draws
-        _cam.Position = new Vector3(0, 2.6f, _camKick * 0.18f);
+        // camera placement: anim-viewer front cam · 3rd-person follow-cam · authored-FP eye height · else normal FP eye
+        if (_animView) _cam.Position = new Vector3(0f, 4.2f, 6.5f + _camKick * 0.18f);   // front view to see the cast
+        else if (_tp3) _cam.Position = new Vector3(_tp3Lat, _tp3H, _tp3D + _camKick * 0.18f);   // over-the-shoulder: lens near her shoulder so fire reads from her
+        else _cam.Position = new Vector3(0, _fpAuthored ? _fpEyeY : 2.6f, _camKick * 0.18f);
+        if (_animView)   // browse casting clips with [ / ]
+        {
+            bool pv = Input.IsPhysicalKeyPressed(Key.Bracketleft), nx = Input.IsPhysicalKeyPressed(Key.Bracketright);
+            if (pv && !_animPrevHeld) { _animIdx--; PlayViewerAnim(); }
+            if (nx && !_animNextHeld) { _animIdx++; PlayViewerAnim(); }
+            _animPrevHeld = pv; _animNextHeld = nx;
+        }
 
         if (Game.I == null || !Game.I.CanControlLocal())
         {
             if (_beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; _beamT = 0; }
+        foreach (var ps in _prismSegs) ps?.Free(); _prismSegs.Clear();
             return;
         }
 
@@ -663,7 +1312,10 @@ public partial class Player : Node3D
         MaxShield = S.MaxHp * S.ShieldPct;
         if (ShieldSuppress > 0f) ShieldSuppress = Mathf.Max(0f, ShieldSuppress - dt);
         if (_combatT < 1e6f) _combatT += dt;
-        bool outOfCombat = _combatT >= 5f || (Game.I != null && Game.I.Enemies.Count == 0);   // no recent damage, or no enemies left (NEW)
+        bool inMist = Game.I != null && Game.I.RitualVeil;
+        // the shield still regenerates normally (the slow trickle) — but while the maze veil is up we suppress the
+        // fast out-of-combat RUSH-back (50%/s), which otherwise outpaced the mist's 10/s so it could never kill you.
+        bool outOfCombat = (_combatT >= 5f || (Game.I != null && Game.I.Enemies.Count == 0)) && !inMist;
         if (Shield < MaxShield && ShieldSuppress <= 0f)
         {
             if (outOfCombat)
@@ -674,36 +1326,79 @@ public partial class Player : Node3D
         else if (_shieldT > 0f) _shieldT -= dt;
 
 
+        UpdateWitchPassives(dt);   // (SURVIVAL PASSIVES) Frost Armor / Soul Siphon / Cinder Skin
+
         if (Combo > 0 && Now - ComboT > S.ComboWindow) { Combo = 0; _lastAct = ComboAct.None; }
         if (FreshT > 0f) { FreshT -= dt; if (FreshT <= 0f) FreshHit = false; }
         FireHeat = Mathf.Max(0f, FireHeat - dt * 1.2f);
         if (HurtT > 0f) HurtT -= dt;
+        if (HurtFlash > 0f) HurtFlash = Mathf.Max(0f, HurtFlash - dt * 2.2f);
+        if (ShieldBreakT > 0f) ShieldBreakT -= dt;
+        if (ArmorBreakT > 0f) ArmorBreakT -= dt;
+        {   // (NEW) low-health alarm: one-shot warning on crossing 20%, then a heartbeat that quickens as you near death
+            float hpf = Hp / Mathf.Max(1f, S.MaxHp);
+            if (!Downed && Hp > 0f && hpf <= 0.20f)
+            {
+                if (!_lowHpWarned) { _lowHpWarned = true; Game.I?.Sfx?.LowHealth(); Game.I?.Hud?.Banner("LOW HEALTH"); }
+                _heartT -= dt;
+                if (_heartT <= 0f) { _heartT = Mathf.Lerp(0.42f, 0.95f, Mathf.Clamp(hpf / 0.20f, 0f, 1f)); Game.I?.Sfx?.Heartbeat(); }
+            }
+            else if (hpf > 0.28f) _lowHpWarned = false;   // hysteresis: re-arm only after healing well clear
+        }
         if (BlessedT > 0f) BlessedT -= dt;
+        UpdateVenom(dt);   // (NEW) phalanx arrow-venom
+        if (HolyEmpowerT > 0f) HolyEmpowerT -= dt;   // (OVERHAUL) Hallowed buff decay
+        if (UltLingerT > 0f) UltLingerT -= dt;       // (NEW) ult-linger recharge-lock decay
+        if (_eclipseBoomCd > 0f) _eclipseBoomCd -= dt;   // (ECLIPSE) shadow-nova throttle
+        if (WindZoneT > 0f) WindZoneT -= dt;             // (WIND RUSH) ×3-speed wind-area timer (refreshed by the field while inside)
+        if (!EclipseOn && _eclipseWasOn) { _eclipseWasOn = false; _bodyModel?.SetEclipse(false); }   // eclipse ended → restore her colours
+        else if (EclipseOn) _eclipseWasOn = true;
+        if (_thornResistT > 0f) _thornResistT -= dt;   // (OVERHAUL) Ironbark thorn-resist decay
         if (_noFall > 0f) _noFall -= dt;
         if (DashT > 0f) DashT -= dt;
         if (DmgDirT > 0f) DmgDirT -= dt;
         UpdateUlt(dt);
         if (_srcComboCd > 0f) _srcComboCd -= dt;
         if (_dotComboCd > 0f) _dotComboCd -= dt;   // (NEW) DoT-driven combo throttle
-        foreach (var f in Fin) { if (f.NotReadyFlash > 0f) f.NotReadyFlash -= dt; if (f.Armed && f.Type != FinType.CrimsonRush) { f.Window -= dt; if (f.Window <= 0) { f.Armed = false; f.Charge = 0; } } }
+        foreach (var f in Fin) { if (f.NotReadyFlash > 0f) f.NotReadyFlash -= dt; }   // (OVERHAUL) finishers no longer expire — once armed they stay armed until fired (was: Window countdown that wiped Charge; only Blood Rush was exempt). In a swarm game the timer only punished repositioning; cadence is tuned via each finisher's Every instead.
 
         if (_beamT > 0) UpdateBeam(dt);
 
         if (StunT > 0f)
         {
             StunT -= dt;        // stunned: no movement, dashing, casting, or finishers
+            ApplyKnockback(dt); // …but a shove still pushes you
             return;
         }
 
+        UpdatePadLook(dt);   // gamepad right-stick aim + R3 quick-turn (before the flight/ult early-returns so it works while aloft)
+
         if (Divinity)
         {
-            _divT -= dt;
-            Floating = false; _bodyModel?.ShowWings(false);
-            _iframe = Mathf.Max(_iframe, 0.2f);                         // unkillable while ascended
+            _divT -= dt; UltActiveT = _divT;
+            _iframe = Mathf.Max(_iframe, 0.2f);                         // unkillable while ascended (FullyImmune blocks CC too)
+            _bodyModel?.ShowWings(true); Floating = true;
+            // (REWORK) rise once, then FREE FLIGHT: steer horizontally at flight speed, jump = ascend, dash-key = descend,
+            // gravity off. She hovers when you're not pressing up/down, so you can hold station and rain motes.
             float targetY = _divBaseY + 12f;
-            GlobalPosition = new Vector3(GlobalPosition.X, Mathf.MoveToward(GlobalPosition.Y, targetY, 16f * dt), GlobalPosition.Z);
+            if (!_divRisen)
+            {
+                GlobalPosition = new Vector3(GlobalPosition.X, Mathf.MoveToward(GlobalPosition.Y, targetY, 16f * dt), GlobalPosition.Z);
+                if (GlobalPosition.Y >= targetY - 0.3f) _divRisen = true;
+            }
+            else
+            {
+                Vector3 mv = InputDir() * S.Speed * 1.15f;
+                float vy = 0f;
+                if (Input.IsActionPressed("jump")) vy += 10f;
+                if (Input.IsActionPressed("descend")) vy -= 10f;   // (FIX) descend = the standard flight-down bind (Ctrl), same as every other flight ult
+                Vector3 np = ClampPos(GlobalPosition + (mv + Vector3.Up * vy) * dt);
+                float floorY = Game.I.SurfaceHeight(np, np.Y) + 3.5f;   // never sink into the ground while flying
+                np.Y = Mathf.Max(np.Y, floorY);
+                GlobalPosition = np;
+            }
             if (Input.IsActionPressed("cast") && _fireCd <= 0f) { FireDivinityMote(); _fireCd = Mathf.Max(0.2f, S.FireCd * 1.25f); }
-            if (_divT <= 0f) { Divinity = false; UltActive = false; _iframe = 0.3f; _noFall = 3.0f; _divFalling = true; }   // immortal + no fall damage until she lands
+            if (_divT <= 0f) { Divinity = false; UltActive = false; _divRisen = false; _iframe = 0.3f; _noFall = 3.0f; _divFalling = true; ClearUltAura(); }   // immortal + no fall damage until she lands
             return;
         }
 
@@ -711,7 +1406,10 @@ public partial class Player : Node3D
         if (LifeDrainActive) { UpdateLifeDrain(dt); return; }   // aloft, draining — free flight, then the release burst (NEW)
         if (_galeDiving) { UpdateGaleDive(dt); return; }   // Gale air-slam: rocket to the aimed spot, then slam (NEW)
         if (_meteorAscend) { UpdateMeteorAscend(dt); return; }   // (NEW) Ember ult: suspended, aiming the landing zone
-        if (PhoenixActive) { UpdatePhoenix(dt); return; }        // (NEW) Ember ult: free phoenix flight + immolation aura
+        if (_meteorDiving) { UpdateMeteorDive(dt); return; }     // (NEW) …then plummeting toward it (travel time, not an instant slam)
+        if (_phoenix) { UpdatePhoenix(dt); return; }             // (legacy flight — no longer used by the reworked Phoenix, kept guarded by _phoenix which stays false)
+        if (ArcaneAscendActive) { UpdateArcaneAscend(dt); return; }   // (NEW) Arcane ult: ascend aloft, rain chain-lightning with LMB
+        if (_vineRising) { UpdateVineRise(dt); return; }         // (NEW) grappling up a jungle vine
 
         if (_rushT > 0f)
         {
@@ -736,13 +1434,14 @@ public partial class Player : Node3D
         }
         else
         {
-            if (Input.IsActionJustPressed("dash") && DashStock > 0 && _snareT <= 0f && !_inWaterBody) StartDash();   // dash allowed mid-air, but not while rooted or wading/swimming — jump out of the water first (NEW)
+            if (Input.IsActionJustPressed("dash") && DashStock > 0 && _snareT <= 0f && !_inWaterBody && !Game.PadSpellHeld()) StartDash();   // dash allowed mid-air, but not while rooted or wading/swimming — jump out of the water first (NEW). LB+B is spell slot 3, not a dash.
             Move(dt);
         }
         if (_snareT > 0f) _snareT -= dt;
         if (_slowT > 0f) _slowT -= dt;
-        if (Input.IsActionJustPressed("jump") && _jumps > 0) { _vy = JumpVel * S.JumpMul * (GaleWitch ? 1.1f : 1f); _jumps--; _grounded = false; if (Game.I.InWater(GlobalPosition, GlobalPosition.Y)) Game.I.WaterDisturb(GlobalPosition, 0.8f); Game.I.GlowFlowersNear(GlobalPosition, 2.4f); Game.I.PlayerSound(GlobalPosition, 0.5f); }   // Gale: +10% jump; splash off water + stir flowers on takeoff; quiet noise (NEW)
-        Floating = !_grounded && _vy < 0f && Input.IsActionPressed("jump");   // hold Space while falling → glide (Move() already gives air steering)
+        bool padSpell = Game.PadSpellHeld();   // holding LB casts a spell slot with the face buttons — A/B don't jump/glide then
+        if (Input.IsActionJustPressed("jump") && _jumps > 0 && !padSpell) { _vy = JumpVel * S.JumpMul * (GaleWitch ? 1.1f : 1f) * OverchargeJumpMul * EclipseJumpMul; _jumps--; _grounded = false; if (Game.I.InWater(GlobalPosition, GlobalPosition.Y)) Game.I.WaterDisturb(GlobalPosition, 0.8f); Game.I.GlowFlowersNear(GlobalPosition, 2.4f); Game.I.PlayerSound(GlobalPosition, 0.5f); }   // Gale: +10% jump; splash off water + stir flowers on takeoff; quiet noise (NEW)
+        Floating = !_grounded && _vy < 0f && Input.IsActionPressed("jump") && !padSpell;   // hold Space while falling → glide (Move() already gives air steering)
         UpdateVertical(dt, Floating);
         _bodyModel?.ShowWings(Floating);
         if (DashStock < S.DashCharges)
@@ -755,7 +1454,7 @@ public partial class Player : Node3D
         if (_flareCd > 0f) _flareCd -= dt;
         if (_killProcCd > 0f) _killProcCd -= dt;   // (NEW) age the on-kill legendary throttle
         if (GaleWitch && Airborne && Game.I.State == GameState.Playing) Game.I.MyStats.Highlight += dt;   // (NEW) Gale highlight = seconds aloft
-        if (!Downed && Game.I.CanControlLocal() && Input.IsPhysicalKeyPressed(Key.T) && _flareCd <= 0f) { FireFlare(); _flareCd = 2f; }   // (NEW) hold T → firework flare
+        if (!Downed && Game.I.CanControlLocal() && Input.IsPhysicalKeyPressed(Key.T) && _flareCd <= 0f) { FireFlare(); Game.I.RecallUnicorn(Game.I.LocalPeer); _flareCd = 2f; }   // (NEW) hold T → firework flare AND recall the arcane unicorn to you
 
         Combat(dt);
     }
@@ -774,7 +1473,7 @@ public partial class Player : Node3D
         Game.I.AddMinimapBlip(GlobalPosition, DamageTypes.Col(WitchDamage)); // (NEW) minimap ping so allies triangulate you
     }
 
-    public DamageType WitchDamage => WitchIndex switch { 1 => DamageType.Holy, 2 => DamageType.Blood, 3 => DamageType.Nature, 4 => DamageType.Wind, 5 => DamageType.Frost, 6 => DamageType.Curse, 7 => DamageType.Ember, _ => DamageType.Lunar };
+    public DamageType WitchDamage => WitchIndex switch { 1 => DamageType.Holy, 2 => DamageType.Blood, 3 => DamageType.Nature, 4 => DamageType.Wind, 5 => DamageType.Frost, 6 => DamageType.Curse, 7 => DamageType.Ember, 8 => DamageType.Arcane, _ => DamageType.Lunar };
 
     private Vector3 InputDir()
     {
@@ -789,9 +1488,25 @@ public partial class Player : Node3D
 
     private void Move(float dt)
     {
+        ApplyKnockback(dt);         // (NEW) external shove decays here too — applies even while rooted
+        if (_launchVel.LengthSquared() > 0.0001f)   // (GALE PAD) ballistic horizontal momentum through the arc; cleared the frame we touch down
+        {
+            if (_grounded) _launchVel = Vector3.Zero;
+            else
+            {
+                Vector3 wish = InputDir();   // (NEW) air-steer: WASD curves the launch direction somewhat (dashing pivots it harder — see StartDash)
+                if (wish.LengthSquared() > 0.01f)
+                {
+                    float sp = _launchVel.Length();
+                    _launchVel = _launchVel.Lerp(wish.Normalized() * sp, Mathf.Clamp(dt * 1.3f, 0f, 1f));
+                    float sp2 = _launchVel.Length(); if (sp2 > 0.001f) _launchVel *= sp / sp2;   // keep the launch speed, only turn its heading
+                }
+                GlobalPosition = ClampPos(GlobalPosition + _launchVel * dt);
+            }
+        }
         if (_snareT > 0f) return;   // rooted by a hexer
         Vector3 dir = InputDir();
-        float spd = S.Speed * (_beamT > 0 ? 0.5f : 1f) * StormSpeedMul * WindBoonSpeedMul * SlowMul;   // StormSpeedMul = Stormform; WindBoonSpeedMul = Eyewall; SlowMul = swarmer hits (NEW)
+        float spd = S.Speed * (_beamT > 0 ? 0.5f : 1f) * StormSpeedMul * OverchargeSpeedMul * WindBoonSpeedMul * EclipseSpeedMul * HurricaneSpeedMul * WindZoneMul * SlowMul * (_specter ? 3f : 1f);   // (REWORK) Specter: ×3 move while immaterial   // StormSpeedMul = Stormform; OverchargeSpeedMul = Arcane Overcharge; WindBoonSpeedMul = Eyewall; EclipseSpeedMul = ×2 eclipse; HurricaneSpeedMul = ×2.5 hurricane; WindZoneMul = ×3 wind-rush area; SlowMul = swarmer hits (NEW)
         // water state: how far the bottom sits below the still surface right here (NEW)
         float wterrain = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y);
         float wdepth = World.WaterLevel - wterrain;
@@ -817,8 +1532,21 @@ public partial class Player : Node3D
     {
         Vector3 dir = InputDir();
         if (dir == Vector3.Zero) { dir = -GlobalTransform.Basis.Z; dir.Y = 0; dir = dir.Normalized(); }
+        // (ECLIPSE) her shift becomes an ARCANE BLINK — an instant teleport in the eclipse's black/white theme, not a slide
+        if (EclipseOn)
+        {
+            float blink = Mathf.Max(9f, S.DashDist * 2.2f);
+            Vector3 dest = ClampPos(GlobalPosition + dir * blink);
+            var from = GlobalPosition;
+            GlobalPosition = new Vector3(dest.X, GlobalPosition.Y, dest.Z);
+            DashStock--; DashT = 1f; if (DashCdT <= 0) DashCdT = S.DashCd; _iframe = Mathf.Max(_iframe, 0.3f);
+            EclipseBlinkVfx(from); EclipseBlinkVfx(GlobalPosition);
+            Game.I.Sfx?.Cast(DamageType.Lunar);
+            return;
+        }
         _dashDir = dir; _dashT = DashDur; DashStock--;
         DashT = 1f;
+        if (_launchVel.LengthSquared() > 0.01f) _launchVel = dir * _launchVel.Length();   // (GALE) dashing mid-launch pivots the arc hard toward the dash direction
         if (DashCdT <= 0) DashCdT = S.DashCd;
         _iframe = Mathf.Max(_iframe, 0.26f);
         if (GaleWitch) _galeGuard = 0.8f;   // Tailwind: brief damage reduction right after dashing (NEW)
@@ -826,16 +1554,23 @@ public partial class Player : Node3D
 
     private Vector3 ClampPos(Vector3 p)
     {
-        foreach (var b in Game.I.Blockers)
-        {
-            var off = new Vector2(p.X - b.Pos.X, p.Z - b.Pos.Z);
-            float dd = off.Length();
-            if (dd < b.Radius + 1.0f) { float k = (b.Radius + 1.0f) / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + off.X * k; p.Z = b.Pos.Z + off.Y * k; }
-        }
+        // (NEW) structures aren't infinitely tall — once you're flying clear above the local ground (arcing off a gale pad, an ult, etc.)
+        // you sail over their footprints instead of snagging on the invisible column. ~13u clears the tallest grove trees. Disc + decks still clamp.
+        bool aboveStructures = (p.Y - Game.I.SurfaceHeight(p, p.Y)) > 16f;   // fallback for blockers without a known top (maze etc.)
+        if (!aboveStructures)
+            foreach (var b in Game.I.Blockers)
+            {
+                if (b.Top > 0.01f && p.Y > b.Top + 0.5f) continue;   // flying clear above THIS structure's actual top → sail over it (no invisible column)
+                var off = new Vector2(p.X - b.Pos.X, p.Z - b.Pos.Z);
+                float dd = off.Length();
+                if (dd < b.Radius + 1.0f) { float k = (b.Radius + 1.0f) / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + off.X * k; p.Z = b.Pos.Z + off.Y * k; }
+            }
         // raised platforms are solid from the sides (but walkable on top): push out if we're below the top
         foreach (var d in Game.I.Decks)
         {
+            if (d.LowPad) continue;   // (NEW) a short dais — step straight up any side, no wall push-out (matches enemies)
             if (GlobalPosition.Y >= d.TopY - 0.6f) continue;   // standing on/near the top — let us walk to the edge
+            if (d.Floating && GlobalPosition.Y < d.TopY - 4.0f) continue;   // (NEW) sky island: only a thin solid rim below the top — open air below, so you can fly under it to catch a vine (no invisible column)
             float ex = d.Half.X + 0.9f, ez = d.Half.Y + 0.9f;
             float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
             if (Mathf.Abs(dx) < ex && Mathf.Abs(dz) < ez)
@@ -844,13 +1579,18 @@ public partial class Player : Node3D
                 else p.Z = d.Center.Z + Mathf.Sign(dz) * ez;
             }
         }
+        p = Game.I.ClampToWorld(p, 3f);   // (NEW) the overworld cliff-wall boundary — hard stop just inside World.WorldRadius (no-op in maze/expedition/sky)
         return p;   // Y preserved — vertical handled by UpdateVertical
     }
 
     // ---- jumping & gravity (floaty) ----
     public const int MaxJumps = 2;
     public int JumpsMax => MaxJumps + (GaleWitch ? 1 : 0);   // Tailwind: the Gale witch gets a 3rd jump (NEW)
-    private const float Gravity = -18f, JumpVel = 8.5f, FallHurtSpeed = 16f;
+    private const float Gravity = -18f, FallHurtSpeed = 16f;
+    // jump scaled to the authored witch height (all FitHeight-normalized to ~4.8m). ~11.5 → ~3.7m peak, proportional to her
+    // size. If future witches use a different height H, scale by sqrt(H/4.8) so taller witches clear proportionally.
+    private const float AuthoredHeight = 4.8f;
+    private static readonly float JumpVel = 8.5f * Mathf.Sqrt(AuthoredHeight / 2.5f);   // 2.5 = the old procedural character height
     private const float GroundSnap = 0.6f;        // stick to slopes/steps so walking a hill never reads as "airborne" (NEW)
     private const float WaterWadeMin = 0.35f;     // water this deep+ counts as being in the water (slow, no dash, not airborne) (NEW)
     private const float WaterFloatDepth = 1.5f;   // deeper than this and we can't stand → float at the surface (NEW)
@@ -859,12 +1599,78 @@ public partial class Player : Node3D
     private float _vy = 0f;
     public bool Floating = false;       // gliding (hold Space while falling) — drives wings + no fall damage
     public float _snareT = 0f;          // hexer root: can't move while > 0
-    public void SnareMe(float dur) { if (!Downed) _snareT = Mathf.Max(_snareT, dur); }
+    // (MP) inside her menu bubble she shrugs off ALL crowd control — roots, snares, slows, stuns, grabs, knockbacks
+    public bool MenuShielded => Game.I != null && Game.I.MenuImmune;
+    // (DIVINE) fully immune to EVERYTHING — damage, stun, root, slow, venom, grab. Divinity (ascended), standing inside a
+    // Faith Shield dome, or the menu bubble. Guards every incoming-status entry point so boss abilities / hex / phalanx
+    // arrows / roots can't slip through the shield or through Divinity.
+    public bool InsideFaithShield => Game.I?.Shield != null && GodotObject.IsInstanceValid(Game.I.Shield)
+        && new Vector2(GlobalPosition.X - Game.I.Shield.GlobalPosition.X, GlobalPosition.Z - Game.I.Shield.GlobalPosition.Z).Length() < Game.I.Shield.Radius;
+    public bool FullyImmune => Divinity || MenuShielded || InsideFaithShield || BarkActive || _specter;   // (REWORK) Barkskin + Specter = full immunity (CC too, not just damage)
+    public bool SpecterActive => _specter;   // (REWORK) LifeCurse immaterial transform: cannot act, immune to everything, 3x speed, heals
+    public float SpecterActive01 => _specter ? 1f : 0f;   // (MP) synced to allies so they see the violet projection
+    private bool _specter = false; private float _specterT = 0f, _specterNetT = 0f, _specterDotT = 0f; private Node3D _specterVfx;
+    public void SnareMe(float dur) { if (!Downed && !MenuShielded && !FullyImmune) _snareT = Mathf.Max(_snareT, dur); }
+
+    private Vector3 _knockVel;          // (NEW) decaying external shove (troll charge, blasts) — applies even while snared/stunned
+    public void Knockback(Vector3 from, float power)
+    {
+        if (MenuShielded) return;   // (MP) the bubble eats external shoves too
+        Vector3 d = GlobalPosition - from; d.Y = 0f;
+        d = d.LengthSquared() > 0.001f ? d.Normalized() : new Vector3(-GlobalTransform.Basis.Z.X, 0f, -GlobalTransform.Basis.Z.Z).Normalized();
+        _knockVel = d * power;
+        HurtT = 0.7f; DmgDirWorld = from - GlobalPosition; DmgDirWorld.Y = 0f; DmgDirT = 1.2f;   // red flash + hit-direction arrow, so it reads as a hit
+    }
+    private void ApplyKnockback(float dt)
+    {
+        if (_knockVel.LengthSquared() < 0.0001f) return;
+        GlobalPosition = ClampPos(GlobalPosition + _knockVel * dt);   // ClampPos → the shove still respects trees/walls
+        _knockVel = _knockVel.MoveToward(Vector3.Zero, 30f * dt);
+    }
     private float _slowT = 0f, _slowMul = 1f;
     private float SlowMul => _slowT > 0f ? _slowMul : 1f;
-    public void SlowMe(float dur, float mul) { if (!Downed) { _slowMul = mul; _slowT = Mathf.Max(_slowT, dur); } }   // swarmer hits (NEW)
+    public void SlowMe(float dur, float mul) { if (!Downed && !MenuShielded && !FullyImmune) { _slowMul = mul; _slowT = Mathf.Max(_slowT, dur); } }   // swarmer hits (NEW)
+
+    // ===== (MP CONTINUE-AROUND) menu-immunity bubble =====
+    // While she's in a menu (level-up / shop / equip-swap) and the world keeps running around her (MP), she's sealed in a
+    // bubble of her own element — immune to everything (see the CC guards + Hurt). On close the bubble bursts, flinging every
+    // foe within 10u outward (no damage) so she never gets released into a pile-on. Bubble is local; the burst is networked.
+    private MenuBubble _menuBubble;
+    private bool _wasMenuImmune = false;
+    private const float MenuNovaRadius = 10f;
+    private void UpdateMenuImmunity(float dt)
+    {
+        bool mi = Game.I != null && Game.I.MenuImmune;
+        if (mi) { EnsureMenuBubble(); if (_menuBubble != null) _menuBubble.Visible = true; }
+        else if (_menuBubble != null && _menuBubble.Visible) _menuBubble.Visible = false;
+        if (_wasMenuImmune && !mi) MenuBubbleBurst();   // falling edge: she confirmed her pick → the bubble pops outward
+        _wasMenuImmune = mi;
+    }
+    private void EnsureMenuBubble()
+    {
+        if (_menuBubble != null && GodotObject.IsInstanceValid(_menuBubble)) return;
+        _menuBubble = new MenuBubble(); AddChild(_menuBubble); _menuBubble.Build(DamageTypes.Col(WitchDamage));   // seen from inside, around the local witch
+    }
+    private void MenuBubbleBurst()
+    {
+        if (_menuBubble != null && GodotObject.IsInstanceValid(_menuBubble)) _menuBubble.Visible = false;
+        Vector3 pos = GlobalPosition; Color c = DamageTypes.Col(WitchDamage);
+        var net = Game.I.NetMgr;
+        if (net != null && net.Active) net.StormForce(pos, MenuNovaRadius, 3, 16f);   // routes client→host; mode 3 = fling outward + slight lift, NO damage
+        else
+            foreach (var e in Game.I.Enemies)
+            {
+                if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead) continue;
+                Vector3 fl = e.GlobalPosition - pos; fl.Y = 0f;
+                if (fl.Length() <= MenuNovaRadius + e.Radius) e.Knockback(pos, 2.4f);
+            }
+        Game.I.VfxRing(pos, c, MenuNovaRadius, 0.5f);
+        Game.I.NetMgr?.BroadcastVfx(0, pos, Vector3.Up, MenuNovaRadius, 0.5f, c);   // allies see the shove ring too
+        Game.I.Sfx?.WindRushBy(pos);   // a witchy whoomph (self-networked)
+    }
     private int _jumps = MaxJumps;
     private bool _grounded = true;
+    public bool Grounded => _grounded;   // (NEW) standing on solid ground/deck (used by sky-island vines: grabbable only while airborne)
     private float _flowerGlowCd = 0f;   // throttle for lighting flowers while walking (NEW)
     private float _wadeSndCd = 0f;       // throttle for the soft wade swish in water (NEW)
     public bool Airborne => !_grounded;
@@ -893,6 +1699,20 @@ public partial class Player : Node3D
         if (Downed || StunT > 0f) return;
         _vy = vy; _grounded = false; _jumps = JumpsMax;
         _noFall = Mathf.Max(_noFall, 2.5f);
+    }
+
+    // (GALE PAD) launched by a wind-pad: a 45° ballistic arc `dist` units in `dir`. Sets equal up + horizontal speed
+    // (v = sqrt(dist*g/2) each, g=18) so the arc covers `dist`; horizontal momentum persists via _launchVel until landing.
+    private Vector3 _launchVel = Vector3.Zero;
+    public void GaleLaunch(Vector3 dir, float dist)
+    {
+        if (Downed || StunT > 0f || GrabbedBy != 0) return;
+        dir.Y = 0f; if (dir.LengthSquared() < 0.001f) return; dir = dir.Normalized();
+        float comp = Mathf.Sqrt(dist * 18f * 0.5f);   // 45°: equal vertical + horizontal components
+        _vy = comp; _grounded = false; _jumps = JumpsMax; _launchVel = dir * comp;
+        _noFall = Mathf.Max(_noFall, 4f);              // no self-inflicted fall damage on the boosted descent
+        Game.I?.Sfx?.WindRushBy(GlobalPosition);
+        Game.I?.GlowFlowersNear(GlobalPosition, 3f);
     }
 
     private void UpdateVertical(float dt, bool floating = false)
@@ -937,6 +1757,7 @@ public partial class Player : Node3D
     {
         if (_beamT > 0) { Charging = false; ChargeAmt = 0; return; }
         if (HurricaneActive) { Charging = false; ChargeAmt = 0; return; }   // piloting the storm — no casting (NEW)
+        if (_specter) { Charging = false; ChargeAmt = 0; return; }          // (REWORK) immaterial Specter cannot attack or damage
 
         if (GaleWitch) { UpdateGaleCharge(dt); }   // Gale: chargeable ground/air slam punch (NEW)
         else if (EmberWitch) { UpdateEmberCharge(dt); }   // (NEW) Ember: chargeable aimed meteor (ground aim ring under the reticle)
@@ -948,7 +1769,7 @@ public partial class Player : Node3D
         else if (_charging)
         {
             _charging = false;
-            if (_charge > 0.12f || (ForsakenWitch && _charge > 0.02f))
+            if (_charge > 0.12f || ((ForsakenWitch || ArcaneWitch) && _charge > 0.02f))
             {
                 bool canFire = true;
                 if (CrimsonWitch)
@@ -959,8 +1780,8 @@ public partial class Player : Node3D
                 }
                 else
                 {
-                    if (Mana < 0.5f) { canFire = false; ResFail(); }   // half a mana to release
-                    else { Mana -= 0.5f; _chargedRefund = true; }        // refunds a full 1 when it connects
+                    if (Mana < 1f) { canFire = false; ResFail(); }       // (EXPERIMENT) a full mana to release a right-click
+                    else { Mana -= 1f; _chargedRefund = true; }          // …and it returns only 0.5 on a hit → net −0.5 (mana is a real resource, not a faucet)
                 }
                 if (canFire)
                 {
@@ -969,11 +1790,14 @@ public partial class Player : Node3D
                         ConsumeBloodStacks(_charge);                 // banked Blood Stacks heal on release
                         if (_charge >= 0.95f) AddBloodStack(1f);     // a full-charge hold banks a stack for next time
                     }
+                    _muzzleCharge = true;   // charge release fires from BOTH hands (3rd-person muzzle)
                     if (SecondaryType == DamageType.Holy) FireHolyRay(_charge);
                     else if (SecondaryType == DamageType.Blood) FireCrimsonTide(_charge);
                     else if (SecondaryType == DamageType.Frost) FireIcicleSpear(_charge);
                     else if (SecondaryType == DamageType.Curse) FireVoodooCrush(_charge);
+                    else if (SecondaryType == DamageType.Arcane) FireArcaneChain(_charge);   // (NEW) jagged arcane chain-lightning through her marked foes
                     else FireBolt(_charge);
+                    _muzzleCharge = false;
                     _fireCd = Mathf.Max(0.12f, S.FireCd) * 0.5f * StormFireMul * WindBoonFireMul;   // Stormform + Eyewall cast speed (NEW)
                     _kickL = 1; _kickR = 1;
                     FireHeat = Mathf.Min(1f, FireHeat + 0.14f);
@@ -999,6 +1823,22 @@ public partial class Player : Node3D
         {
             if (!_charging && Input.IsActionPressed("cast") && !(UltActive && Ult == UltKind.Crescent)) UpdateFlameCone(dt);
             else EndFlameCone();
+        }
+        else if (ArcaneWitch)   // (NEW) primary = a 3-round homing arcane-missile burst from the LEFT hand
+        {
+            if (_arcaneBurst > 0)   // mid-volley: fire the remaining missiles at a fixed cadence, then recover
+            {
+                _arcaneBurstT -= dt;
+                if (_arcaneBurstT <= 0f)
+                {
+                    FireArcaneMissile(_arcaneBurst == 3);   // only the first shot of the volley builds combo
+                    _arcaneBurst--;
+                    _arcaneBurstT = 0.085f;
+                    if (_arcaneBurst == 0) _fireCd = Mathf.Max(0.12f, S.FireCd) * 1.7f * StormFireMul * WindBoonFireMul;   // recovery between volleys
+                }
+            }
+            else if (!_charging && Input.IsActionPressed("cast") && _fireCd <= 0f && !(UltActive && Ult == UltKind.Crescent))
+                { _arcaneBurst = 3; SetArm("flick", 0.22f); }   // begin a volley — first missile fires next tick; hand flicks the magic out
         }
         else if (!_charging && Input.IsActionPressed("cast") && _fireCd <= 0f && !(UltActive && Ult == UltKind.Crescent))
         {
@@ -1056,7 +1896,7 @@ public partial class Player : Node3D
             {
                 float sx = (GD.Randf() - 0.5f) * 0.085f, sy = (GD.Randf() - 0.5f) * 0.07f;
                 var d = (fwd + right * sx + up * sy).Normalized() * 56f;
-                SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, d, per, pierce, 0.16f, pur, dtype,
+                SpawnBolt(FireOrigin(camFwd), d, per, pierce, 0.16f, pur, dtype,
                     normal: true, charged: false, combo: i == 0, full: false, poisonDps: PoisonDps() * 0.5f, style: 1);
             }
             return;
@@ -1074,7 +1914,7 @@ public partial class Player : Node3D
         {
             bool radiant = RadiantMote && Airborne;   // the airborne heal-through only comes online while she's aloft
             var tgt = AimTarget();
-            Vector3 origin = _cam.GlobalPosition + camFwd * 1.2f;
+            Vector3 origin = FireOrigin(camFwd);
             Vector3 dir = camFwd.Normalized();
             if (tgt == null && radiant && AimAllyPos(out var allyPos))   // no foe aimed → lock onto an ally to mend them (and hit whatever's behind)
                 dir = (allyPos - origin).Normalized();
@@ -1095,7 +1935,7 @@ public partial class Player : Node3D
         // Lunar full-charge: a wide horizontal crescent that grows as it flies, cleaving multiple foes
         if (dtype == DamageType.Lunar && full)
         {
-            SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd.Normalized() * 30f, dmg * 1.15f,
+            SpawnBolt(FireOrigin(camFwd), camFwd.Normalized() * 30f, dmg * 1.15f,
                 Mathf.Max(S.Pierce, 6) + CrescentPierceBonus, 1.1f * CrescentSizeMul, tint, dtype,
                 normal: false, charged: true, combo: true, full: true,
                 homing: false, life: 1.9f, fromCombo: false, horizontal: true, grow: 2.6f * CrescentSizeMul);
@@ -1103,7 +1943,7 @@ public partial class Player : Node3D
             return;
         }
 
-        SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd.Normalized() * 50f, dmg,
+        SpawnBolt(FireOrigin(camFwd), camFwd.Normalized() * 50f, dmg,
             pierce, radius, tint, dtype,
             normal: isNormal, charged: !isNormal, combo: true, full: full && !isNormal);
 
@@ -1115,7 +1955,7 @@ public partial class Player : Node3D
             foreach (float off in new[] { -0.14f, 0.14f })
             {
                 var d = (camFwd + right * off).Normalized() * 50f;
-                SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, d, dmg * 0.8f, 0, 0.4f, baseCol, PrimaryType, true, false, false, false);
+                SpawnBolt(FireOrigin(camFwd), d, dmg * 0.8f, 0, 0.4f, baseCol, PrimaryType, true, false, false, false);
             }
         }
     }
@@ -1209,6 +2049,15 @@ public partial class Player : Node3D
         return false;
     }
 
+    // (NEW) crosshair-aimed crit-zone test so MELEE/close attacks can crit hit-spots (boss head/upper body, sentinel core)
+    // the same way ranged bolts do — the vertical aim from AimHitOnEnemy is a real aim result, so pointing high crits the head.
+    private bool AimCritZone(Vector3 o, Vector3 fwd, Enemy e)
+    {
+        if (e == null) return false;
+        AimHitOnEnemy(o, fwd, e, out var hp, out _);
+        return e.IsCritZone(hp);
+    }
+
     private void FireBloodLash(float dmg, Color tint)
     {
         Vector3 o = _cam.GlobalPosition;
@@ -1222,10 +2071,11 @@ public partial class Player : Node3D
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             var to = e.GlobalPosition - o; float d = to.Length();
             if (d > reach + e.Radius) continue;
-            if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc) continue;
-            e.Hurt(dmg, DamageType.Blood, true, crit);
+            if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc && !e.RayHitsBody(o, fwd, reach + e.Radius, e.Radius, out _)) continue;   // (FIX) in the arc, OR the crosshair ray passes through the body (tall foes: aim at the head)
+            bool zone = AimCritZone(o, fwd, e); bool ecrit = crit || zone; float edmg = (zone && !crit) ? dmg * CritMult() : dmg;   // (NEW) aim at the boss head/core → this hit crits, even in melee
+            e.Hurt(edmg, DamageType.Blood, true, ecrit);
             e.Knockback(GlobalPosition, 0.6f);
-            OnHitDirect(e, e.Dead, dmg, DamageType.Blood);
+            OnHitDirect(e, e.Dead, edmg, DamageType.Blood);
             AimHitOnEnemy(o, fwd, e, out var hp, out var hn);   // (NEW) slash lands where the cursor hit him, at that height
             Game.I.SpawnImpactMark(hp, hn, e, DamageType.Blood, 0.7f);
         }
@@ -1273,16 +2123,18 @@ public partial class Player : Node3D
         Vector3 fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();
         float reach = 7.5f * S.SpellArea, cosArc = 0.55f;   // ~57-degree half-arc; SpellArea (area cards) scales reach
         bool crit = RollCrit();
-        float dmg = dmgBase * 1.3f * (crit ? CritMult() : 1f);   // (BUFF) Gale punches hit ~30% harder — she felt weak
+        float dmg = dmgBase * 1.3f * (Airborne ? 1.35f : 1f) * (crit ? CritMult() : 1f);   // (BUFF) +30% base; (NEW) +35% while SHE'S airborne — converts her mobility into damage & works vs knockback-immune bosses (target-airborne ×1.45 below still stacks)
         var col = DamageTypes.Col(DamageType.Wind);
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             var to = e.GlobalPosition - o; float d = to.Length();
             if (d > reach + e.Radius) continue;
-            if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc) continue;
+            if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc && !e.RayHitsBody(o, fwd, reach + e.Radius, e.Radius, out _)) continue;   // (FIX) in the arc, OR the crosshair ray passes through the body (tall foes: aim at the head)
+            bool zone = AimCritZone(o, fwd, e); bool ecrit = crit || zone;   // (NEW) melee can crit the boss crit-zone by aiming at it
             float fdmg = e.Thrown ? dmg * 1.45f : dmg;   // (BUFF) extra lethal to airborne foes — rewards her fling→punch combo
-            e.Hurt(fdmg, DamageType.Wind, true, crit);
+            if (zone && !crit) fdmg *= CritMult();
+            e.Hurt(fdmg, DamageType.Wind, true, ecrit);
             e.Knockback(GlobalPosition, 1.0f);                              // light shove on the basic punch
             OnHitDirectNormal(e, e.Dead, fdmg, DamageType.Wind);
             AimHitOnEnemy(o, fwd, e, out var hp, out var hn);   // (NEW) blow-mark lands where the cursor hit him, at that height
@@ -1348,15 +2200,17 @@ public partial class Player : Node3D
         float radius = (5f + c * 6f) * S.SpellArea * Mathf.Lerp(1f, GustPower, 0.5f);   // Crosswind nudges reach
         float knock = (3f + c * 6f) * GustPower;
         bool crit = RollCrit();
-        float dmg = Base() * (0.5f + c * 1.5f) * ComboMul() * (crit ? CritMult() : 1f);
+        float dmg = Base() * (0.5f + c * 1.9f) * ComboMul() * (Airborne ? 1.35f : 1f) * (crit ? CritMult() : 1f);   // (BUFF 1.5→1.9 + airborne self-bonus) her signature slam now converts mobility into damage — jump→slam is a boss-usable combo
         var col = DamageTypes.Col(DamageType.Wind);
         Vector3 center = new Vector3(at.X, at.Y, at.Z);
+        Vector3 co = _cam.GlobalPosition, cfwd = (-_cam.GlobalTransform.Basis.Z).Normalized();   // (NEW) crosshair, for boss crit-zone
         int hits = 0;
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             if (Flat(e, center) > radius + e.Radius) continue;
-            e.Hurt(dmg, DamageType.Wind, true, crit);
+            bool zone = AimCritZone(co, cfwd, e); bool ecrit = crit || zone; float edmg = (zone && !crit) ? dmg * CritMult() : dmg;   // (NEW) aim at the boss head/core → crit it
+            e.Hurt(edmg, DamageType.Wind, true, ecrit);
             e.Knockback(center, knock);
             OnHitDirect(e, e.Dead, dmg, DamageType.Wind);   // (FIX) build combo + charge finishers PER enemy hit (was ComboFromSource — 0.15s-throttled & never charged finishers; also handles kill/Stormform)
             hits++;
@@ -1368,8 +2222,9 @@ public partial class Player : Node3D
         if (full && TempestHeart)   // Tempest Heart legendary: a lingering whirlwind at the slam point
         {
             var cy = new Cyclone(); Game.I.AddChild(cy);
-            cy.Init(this, new Vector3(center.X, 0f, center.Z), 3.5f, 3f, Base() * 0.5f, false, false);
-            Game.I.NetMgr?.BroadcastVfx(11, new Vector3(center.X, 0f, center.Z), Vector3.Up, 3.5f, 3f, col);
+            float twr = 3.5f * S.SpellArea;   // Cyclone doesn't self-scale
+            cy.Init(this, new Vector3(center.X, 0f, center.Z), twr, 3f, Base() * 0.5f, false, false);
+            Game.I.NetMgr?.BroadcastVfx(11, new Vector3(center.X, 0f, center.Z), Vector3.Up, twr, 3f, col);
         }
         Game.I.NetMgr?.BroadcastVfx(6, center, Vector3.Up, radius, 0f, col);   // allies see the slam burst
         // (NEW visual — cosmetic) DOWNDRAFT PRESSURE-BURST (always) + WIND SIGIL (full charge only). A funnel of
@@ -1491,15 +2346,23 @@ public partial class Player : Node3D
             ? _handMeshL.GlobalPosition
             : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;
         Vector3 dir = AimDir().Normalized();
-        float reach = 12f * S.SpellArea * (PhoenixActive ? 1.7f : 1f);   // (NEW) reaches further; Phoenix Ascendant makes it huge
+        float reach = 12f * S.SpellArea * FlameReachMul * (PhoenixActive ? 1.7f : 1f);   // (NEW) reaches further; Phoenix Ascendant makes it huge; Cinderreach blessing extends it
         Game.I.SpawnFlameCone(o, dir, reach, DamageTypes.Col(DamageType.Ember));   // continuous flame VFX (local)
         _flameSndT -= dt; if (_flameSndT <= 0f) { _flameSndT = 0.25f; Game.I.Sfx?.Cast(DamageType.Ember); }
         _emberNetT -= dt; if (_emberNetT <= 0f) { _emberNetT = 0.12f; Game.I.NetMgr?.BroadcastVfx(66, o, dir, reach, 0f, DamageTypes.Col(DamageType.Ember)); }   // allies see the flame
         _flameTickT -= dt;
         if (_flameTickT <= 0f) { _flameTickT = Mathf.Max(0.08f, S.FireCd * 0.6f); FlameConeTick(o, dir, reach); }   // faster cast speed → faster ticks
+        _flameDecalT -= dt;   // (NEW) leave scorch marks on the ground the flame licks over (networked → kind 25)
+        if (_flameDecalT <= 0f)
+        {
+            _flameDecalT = 0.28f;
+            var gpt = o + dir * (reach * (0.35f + GD.Randf() * 0.55f));
+            float gy = Game.I.SurfaceHeight(gpt, gpt.Y);
+            Game.I.SpawnBurnMark(new Vector3(gpt.X, gy + 0.03f, gpt.Z), DamageTypes.Col(DamageType.Ember), (1.4f + GD.Randf() * 0.6f) * S.SpellArea, 4f);
+        }
         FireHeat = Mathf.Min(1f, FireHeat + 0.03f);
     }
-    private float _emberNetT = 0f;
+    private float _emberNetT = 0f, _flameDecalT = 0f;
     private void EndFlameCone() { }   // nothing to tear down — the flame VFX is fire-and-forget puffs
 
     private void FlameConeTick(Vector3 o, Vector3 dir, float reach)
@@ -1507,8 +2370,8 @@ public partial class Player : Node3D
         float pmul = PhoenixActive ? 1.6f : 1f;                // Phoenix Ascendant: harder-hitting flame
         float cosArc = PhoenixActive ? 0.78f : 0.85f;         // ...and a wider cone while ascended
         float dmg = Base() * 0.26f * pmul * ComboMul();        // small per-tick direct
-        float burnPer = Base() * 0.085f * pmul;                // burn dps PER stack (scales with base damage)
-        float bombFlat = Base() * 3.2f;                        // Living Bomb blast on reaching the threshold
+        float burnPer = Base() * 0.085f * pmul * EmberBurnMul; // burn dps PER stack (scales with base damage); Kindling boosts it
+        float bombFlat = Base() * 3.2f * LivingBombMul;        // Living Bomb blast on reaching the threshold; Detonator boosts it
         bool credited = false;
         foreach (var e in Game.I.Enemies.ToArray())
         {
@@ -1571,33 +2434,73 @@ public partial class Player : Node3D
     private void HideEmberAimRing() { if (_emberAimRing != null) _emberAimRing.Visible = false; }
 
     // ===================== EMBER ULTIMATES (NEW) =====================
-    private float MeteorUltRadius() => (10f + UltTier * 1.5f) * S.SpellArea;
+    private float MeteorUltRadius() => (13f + UltTier * 2f) * S.SpellArea;   // (REWORK) bigger base impact
     private Vector3 MeteorAimPoint() { var a = GroundAim(); return new Vector3(a.X, Game.I.SurfaceHeight(a, a.Y), a.Z); }
 
     // ULT 1 — Meteor Descent: rise invulnerable, aim a landing zone (5s or confirm), then SLAM.
     private void UpdateMeteorAscend(float dt)
     {
-        if (Downed || Game.I.State != GameState.Playing) { _meteorAscend = false; UltActive = false; HideEmberAimRing(); _iframe = 0.3f; _noFall = 2f; return; }
+        if (Downed || !Game.I.SimActive) { _meteorAscend = false; UltActive = false; HideEmberAimRing(); _iframe = 0.3f; _noFall = 2f; return; }
         _iframe = Mathf.Max(_iframe, 0.3f); Floating = false;
         float targetY = _meteorBaseY + 18f;
         GlobalPosition = new Vector3(GlobalPosition.X, Mathf.MoveToward(GlobalPosition.Y, targetY, 26f * dt), GlobalPosition.Z);
         _grounded = false; _vy = 0f;
         ShowEmberAimRing(MeteorAimPoint(), MeteorUltRadius());
         _meteorAscendT -= dt;
+        UltActiveT = _meteorAscendT;   // (REWORK) feed the aim-window duration meter
+        // (REWORK) meteors rain at random around her while she hangs aloft aiming
+        if (_meteorRainLeft > 0)
+        {
+            _meteorRainT -= dt;
+            if (_meteorRainT <= 0f)
+            {
+                _meteorRainLeft--; _meteorRainT = 0.5f + GD.Randf() * 0.4f;
+                int t = UltTier;
+                float a = GD.Randf() * Mathf.Tau, rr = (10f + GD.Randf() * 26f) * S.SpellArea;
+                var rp = new Vector3(GlobalPosition.X + Mathf.Cos(a) * rr, 0f, GlobalPosition.Z + Mathf.Sin(a) * rr);
+                float rgy = Game.I.SurfaceHeight(rp, 0f);
+                float rMeteorR = (5f + t * 0.8f) * S.SpellArea, rDmg = Base() * (3.5f + t * 1.2f) * ComboMul();
+                Game.I.SpawnEmberMeteor(new Vector3(rp.X, rgy, rp.Z), rMeteorR, rDmg, 2, Base() * 0.1f, Base() * 3.5f, this, 1.5f);
+            }
+        }
         bool canConfirm = _meteorAscendT < 4.7f;   // ignore the activation-frame [Q] press so she doesn't drop instantly
         if (_meteorAscendT <= 0f || (canConfirm && (Input.IsActionJustPressed("cast") || Input.IsActionJustPressed("ult")))) MeteorLand(MeteorAimPoint());
     }
-    private void MeteorLand(Vector3 target)
+    private void MeteorLand(Vector3 target)   // confirm: BEGIN the plummet (travel time). Impact/damage is deferred to MeteorImpact once she lands.
     {
-        _meteorAscend = false; HideEmberAimRing();
+        _meteorAscend = false;
+        float gy0 = Game.I.SurfaceHeight(target, target.Y);
+        _meteorDiveTarget = new Vector3(target.X, gy0, target.Z);
+        _meteorDiving = true; _iframe = Mathf.Max(_iframe, 0.5f);
+        Game.I.Sfx?.Whish(GlobalPosition);   // whoosh as she rockets down
+    }
+
+    private void UpdateMeteorDive(float dt)
+    {
+        if (Downed || !Game.I.SimActive) { _meteorDiving = false; UltActive = false; HideEmberAimRing(); _iframe = 0.3f; _noFall = 2f; return; }
+        _iframe = Mathf.Max(_iframe, 0.3f);
+        ShowEmberAimRing(_meteorDiveTarget, MeteorUltRadius());   // keep the landing telegraph up while she falls — a real dodge window for foes now
+        Vector3 land0 = _meteorDiveTarget, cur = GlobalPosition, to = land0 - cur; float dist = to.Length();
+        float step = 42f * dt;   // fast plummet, but it visibly TRAVELS now (was an instant teleport-slam)
+        if (dist <= step + 0.25f || cur.Y <= land0.Y + 0.25f) { _meteorDiving = false; MeteorImpact(land0); return; }
+        GlobalPosition = cur + to / Mathf.Max(dist, 0.001f) * step;
+        _grounded = false; _vy = 0f;
+        if (GD.Randf() < 0.6f) Game.I.SpawnEmberBurst(GlobalPosition, 1.3f);   // trailing fire streak down
+    }
+
+    private void MeteorImpact(Vector3 target)
+    {
+        HideEmberAimRing();
         float gy = Game.I.SurfaceHeight(target, target.Y);
         var land = new Vector3(target.X, gy, target.Z);
         GlobalPosition = ClampPos(land);
         _grounded = true; _vy = 0f; _jumps = JumpsMax; _iframe = 0.4f; _noFall = 0.5f;
         UltActive = false;
 
-        int t = UltTier; float radius = MeteorUltRadius();
-        float centerDmg = Base() * (10f + t * 3f) * ComboMul();   // huge at the core
+        int t = UltTier;
+        float radiusBase = (13f + t * 2f) * (ModMeteorDesc ? 1.35f : 1f);   // (REWORK) bigger base; raw (matches MeteorUltRadius pre-SpellArea); the GroundField auto-scales this
+        float radius = radiusBase * S.SpellArea;   // Extinction Event: wider; direct blast + satellites scale here
+        float centerDmg = Base() * (10f + t * 3f) * ComboMul() * (ModMeteorDesc ? 1.3f : 1f);   // …and harder at the core
         float edgeDmg = Base() * (2f + t * 0.6f) * ComboMul();    // still okay at the rim
         float burnPer = Base() * 0.1f, bombFlat = Base() * 3.5f;
         var col = DamageTypes.Col(DamageType.Ember);
@@ -1612,9 +2515,18 @@ public partial class Player : Node3D
             OnHitDirect(e, e.Dead, dmg, DamageType.Ember);
         }
         Game.I.DamageWorld(land, radius, centerDmg);
-        var field = new GroundField { Type = FieldType.Hex, DType = DamageType.Ember, Radius = radius, Dur = 6f, Power = Base() * 0.6f,
+        float infernoDur = 13f + t + (ModMeteorDesc ? 3f : 0f);   // (REWORK) the living inferno lasts 13s base, longer with tiers/Extinction Event
+        var field = new GroundField { Type = FieldType.Hex, DType = DamageType.Ember, Radius = radiusBase, Dur = infernoDur, Power = Base() * 0.6f,
             TintColor = col, BurnAdd = 1f, BurnPer = burnPer, BurnBomb = bombFlat, BurnOwner = Game.I.LocalPeer, Src = this };
-        Game.I.AddChild(field); field.GlobalPosition = new Vector3(land.X, 0.05f, land.Z);   // the 6s inferno keeps stacking burn
+        Game.I.AddChild(field); field.GlobalPosition = new Vector3(land.X, 0.05f, land.Z);   // the inferno keeps stacking burn for its whole duration
+        UltLingerT = infernoDur; UltMax = infernoDur;   // (REWORK) the living-inferno duration meter (also gates recharge until it burns out)
+        if (ModMeteorDesc)   // Extinction Event: satellite meteors rain around the impact
+            for (int i = 0; i < 3; i++)
+            {
+                float a = i / 3f * Mathf.Tau + GD.Randf();
+                var sat = new Vector3(land.X + Mathf.Cos(a) * radius * 0.8f, gy, land.Z + Mathf.Sin(a) * radius * 0.8f);
+                Game.I.SpawnEmberMeteor(sat, radius * 0.4f, centerDmg * 0.35f, 3, burnPer, bombFlat, this, 1.3f);
+            }
 
         Game.I.SpawnEmberBurst(land + Vector3.Up * 0.5f, radius * 1.2f);
         for (int i = 0; i < 3; i++) Game.I.SpawnEmberBurst(land + new Vector3((GD.Randf() - 0.5f) * radius, 0.5f, (GD.Randf() - 0.5f) * radius), radius * 0.5f);
@@ -1631,21 +2543,57 @@ public partial class Player : Node3D
         Vector3 dir = InputDir();
         if (dir == Vector3.Zero) { dir = -GlobalTransform.Basis.Z; dir.Y = 0; dir = dir.Normalized(); }
         float area = Mathf.Clamp(S.SpellArea, 1f, 2.5f);
-        float len = (13f + UltTier) * area, halfW = 4f * area;   // ~8u wide × 12-15u long, area cards enlarge it
+        float len = (13f + UltTier) * area * (ModWildfire ? 1.3f : 1f), halfW = 4f * area * (ModWildfire ? 1.4f : 1f);   // Firestorm: longer + wider
         _flameDashDir = dir; _flameDashDist = len; _flameDashDur = 0.24f; _flameDashT = _flameDashDur;
         _iframe = Mathf.Max(_iframe, 0.3f);
         Vector3 origin = new Vector3(GlobalPosition.X, Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y), GlobalPosition.Z);
         var trail = new EmberTrail { Origin = origin, Dir = dir, Length = len, HalfW = halfW, Dur = 10f,
-            BurnAdd = 1.2f, BurnPer = Base() * 0.11f, BurnBomb = Base() * 3.5f, HealPerSec = S.MaxHp * 0.02f, Caster = this, OwnerPeer = Game.I.LocalPeer };
+            BurnAdd = 1.2f, BurnPer = Base() * 0.11f, BurnBomb = Base() * 3.5f, HealPerSec = S.MaxHp * (ModWildfire ? 0.032f : 0.02f), Caster = this, OwnerPeer = Game.I.LocalPeer };
         Game.I.AddChild(trail);
         Game.I.NetMgr?.BroadcastEmberTrail(origin, dir, len, halfW, 10f);
+        _rushDashLingerT = 10f; _rushDashLingerMax = 10f;   // HUD: the flame trail burns 10s
         CamKick(0.3f); Game.I.Sfx?.Cast(DamageType.Ember);
+    }
+
+    // (STORMFORM REWORK) a WIND RUSH — a maxed wind-rush dash that leaves a ×3-speed wind area + air mines along its path.
+    private void WindRush()
+    {
+        if (_windCharges <= 0) return;
+        _windCharges--;
+        Vector3 dir = InputDir();
+        if (dir == Vector3.Zero) { dir = -GlobalTransform.Basis.Z; dir.Y = 0; dir = dir.Normalized(); }
+        float area = Mathf.Clamp(S.SpellArea, 1f, 2.5f);
+        float dist = (14f + UltTier * 1.5f) * area * (ModStorm ? 1.4f : 1f);   // (MOD) longer dash
+        _rushDir = dir; _rushDist = dist; _rushDur = 0.28f; _rushT = _rushDur; _rushWind = true; _windPuffCd = 0f;
+        if (_inWaterBody) { _rushT = 0f; _rushDist = 0f; _rushWind = false; }
+        _iframe = Mathf.Max(_iframe, _rushDur + 0.15f);
+        var wcol = DamageTypes.Col(DamageType.Wind);
+        float rad = 5f * area, dmg = Base() * (0.9f + UltTier * 0.2f);
+        Game.I.NetMgr?.StormForce(GlobalPosition, rad, 2, dmg);    // damage the lane
+        Game.I.NetMgr?.StormForce(GlobalPosition, rad, 3, 14f);    // fling foes aside (mass-scaled)
+        int drops = 4;
+        for (int i = 0; i < drops; i++)
+        {
+            var tp = GlobalPosition + dir * (dist * (i + 0.5f) / drops);
+            float gy = Game.I.SurfaceHeight(tp, tp.Y);
+            var gpos = new Vector3(tp.X, gy, tp.Z);
+            // a WIND AREA — ×3 move speed to any player inside (no damage, no heal)
+            var wf = new GroundField { Type = FieldType.Hex, Radius = 4.5f, Dur = 6f, Power = 0f, SpeedBoost = true, DType = DamageType.Wind, TintColor = wcol };
+            Game.I.AddChild(wf); wf.GlobalPosition = new Vector3(tp.X, 0.04f, tp.Z);
+            Game.I.NetMgr?.BroadcastWindZone(gpos, 4.5f, 6f);   // allies get the boost + see it
+            // and an AIR MINE that catches foes in range
+            var mine = new AirMine(); Game.I.AddChild(mine); mine.Init(this, gpos, Base() * 0.7f);
+        }
+        Game.I.SpawnWindBullet(GlobalPosition, dir, dist, _rushDur);
+        Game.I.NetMgr?.BroadcastVfx(32, GlobalPosition, dir, dist, _rushDur, wcol);   // allies see the wind streak
+        _rushDashLingerT = 6f; _rushDashLingerMax = 6f;   // HUD: the wind areas last 6s
+        CamKick(0.35f); Game.I.Sfx?.WindRushBy(GlobalPosition);
     }
 
     // ULT 3 — Phoenix Ascendant: free flight + immolation aura; flamethrower fires here (Combat is skipped while flying).
     private void UpdatePhoenix(float dt)
     {
-        if (Downed || Game.I.State != GameState.Playing) { EndPhoenix(); return; }
+        if (Downed || !Game.I.SimActive) { EndPhoenix(); return; }
         Floating = false;
         Vector3 dir = InputDir();
         Vector3 np = (dir != Vector3.Zero) ? GlobalPosition + dir * (S.Speed * 1.15f) * dt : GlobalPosition;
@@ -1665,7 +2613,7 @@ public partial class Player : Node3D
         if (_phoenixAuraT <= 0f)
         {
             _phoenixAuraT = 0.4f;
-            float ar = (7f + UltTier) * S.SpellArea, ad = Base() * (0.8f + UltTier * 0.2f);
+            float ar = (7f + UltTier) * S.SpellArea * (ModPhoenix ? 1.4f : 1f), ad = Base() * (0.8f + UltTier * 0.2f) * (ModPhoenix ? 1.4f : 1f);   // Immortal Phoenix: fiercer aura
             foreach (var e in Game.I.Enemies.ToArray())
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || Flat(e, GlobalPosition) >= ar + e.Radius) continue;
@@ -1682,9 +2630,10 @@ public partial class Player : Node3D
         _phoenix = false; UltActive = false; _noFall = 3f; _iframe = Mathf.Max(_iframe, 0.3f);
         if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) { _phoenixVfx.QueueFree(); _phoenixVfx = null; }
     }
-    private void PhoenixRebirth()   // cheat-death, once per Phoenix
+    private void PhoenixRebirth()   // cheat-death (once per Phoenix; twice with Immortal Phoenix)
     {
-        _phoenixRebirth = false;
+        _phoenixRebirths--;
+        _phoenixRebirth = _phoenixRebirths > 0;   // another life still banked?
         Hp = S.MaxHp * 0.6f; Shield = 0; _iframe = Mathf.Max(_iframe, 1.2f);
         float r = 12f * S.SpellArea;
         foreach (var e in Game.I.Enemies.ToArray())
@@ -1721,9 +2670,10 @@ public partial class Player : Node3D
     {
         float radius = EmberMeteorRadius(charge);
         float dmg = Base() * (1.8f + charge * 1.6f) * ComboMul();   // scales with hold
-        float burnPer = Base() * 0.085f, bombFlat = Base() * 3.2f;
+        float burnPer = Base() * 0.085f * EmberBurnMul, bombFlat = Base() * 3.2f * LivingBombMul;
         int burnStacks = 3 + Mathf.RoundToInt(charge * 3f);          // instant burn toward Living Bomb
         Game.I.SpawnEmberMeteor(at, radius, dmg, burnStacks, burnPer, bombFlat, this);
+        if (charge >= 0.95f) Game.I.SpawnGroundSigil(at, radius, DamageTypes.Col(DamageType.Ember));   // full-charge ground rune flourish (shared by every witch's charged right-click)
     }
 
     // rocket toward the aimed ground point; slam on arrival (NEW)
@@ -1805,7 +2755,7 @@ public partial class Player : Node3D
         var tint = full ? col.Lerp(Colors.White, 0.3f) : col;
         // a knotted-wood spike that flies forward with real travel time (slower than the primary needles).
         // NOTE: the thorn itself no longer roots — rooting now comes from the ENT EXPLOSIONS it sets off.
-        SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd * 32f, dmg, pierce, radius, tint, DamageType.Nature,
+        SpawnBolt(FireOrigin(camFwd), camFwd * 32f, dmg, pierce, radius, tint, DamageType.Nature,
             normal: false, charged: true, combo: true, full: full, life: 1.9f,
             style: 2, rootOnHit: 0f, detonatesEnts: full);   // detonates her ents ONLY at full charge
         CamKick(full ? 0.45f : 0.2f + 0.2f * c);
@@ -1821,15 +2771,17 @@ public partial class Player : Node3D
         float radius = (6.5f + c * 6f) * S.SpellArea;   // spell area
         bool full = c >= 0.95f;   // (NEW) the ritual SIGILS only manifest on a full charge
         bool crit = RollCrit();          // the burst's initial damage is direct → can crit
-        float dmg = Base() * (0.4f + c * 0.95f) * ComboMul() * (crit ? CritMult() : 1f);
+        float dmg = Base() * (0.4f + c * 1.3f) * ComboMul() * (crit ? CritMult() : 1f);   // (BUFF 0.95→1.3) the squishiest witch should out-burst up close — full Tide now Base×1.7
         float knock = 1.5f + c * 4f;
         var col = DamageTypes.Col(DamageType.Blood);
         bool killed = false;
+        Vector3 o = _cam.GlobalPosition, fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();   // (NEW) crosshair, for boss crit-zone
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
-            e.Hurt(dmg, DamageType.Blood, true, crit);
+            bool zone = AimCritZone(o, fwd, e); bool ecrit = crit || zone; float edmg = (zone && !crit) ? dmg * CritMult() : dmg;   // (NEW) aim at the boss head/core → crit it
+            e.Hurt(edmg, DamageType.Blood, true, ecrit);
             e.Knockback(GlobalPosition, knock);
             e.Slow(1.4f, 0.6f);
             ComboFromSource();
@@ -1893,9 +2845,7 @@ public partial class Player : Node3D
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-            var rel = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f - eye;
-            float proj = rel.Dot(dir); if (proj < 1f || proj > len) continue;
-            if ((rel - dir * proj).Length() < e.Radius + 1.1f && proj < bestT) { bestT = proj; hit = e; }
+            if (e.RayHitsBody(eye, dir, len, 1.1f, out float et) && et < bestT) { bestT = et; hit = e; }   // (FIX) whole-body ray test — was a sphere at mid-body, missing tall foes' heads
         }
         float beamLen = hit != null ? bestT : len;
         // when not locked on a foe, terminate the beam on the first surface (pumpkin/tree/wall/ground) so it stops there AND marks it
@@ -1905,6 +2855,15 @@ public partial class Player : Node3D
         {
             hit.Hurt(Base() * 1.4f * dt * ComboMul(), DamageType.Frost, true);
             if (!hit.Frozen) hit.AddFreeze(dt * FreezeRate, FreezeThreshMul, FrostDurBonus);   // thread this witch's frost profile (best-of on the enemy)
+            // (NEW) the beam bleeds cold onto the pack around its target — a light splash-freeze (no extra damage) so SWEEPING it
+            // chills a CROWD, not just the one locked foe. Entry-level version of Deep Winter (which cascades a COMPLETED freeze).
+            float splashR = 2.5f * S.SpellArea;
+            foreach (var o in Game.I.Enemies.ToArray())
+            {
+                if (o == null || o == hit || o.Dead || o.Frozen || !GodotObject.IsInstanceValid(o)) continue;
+                if (o.GlobalPosition.DistanceTo(hit.GlobalPosition) < splashR + o.Radius)
+                    o.AddFreeze(dt * FreezeRate * 0.35f, FreezeThreshMul, FrostDurBonus, canRadiate: false);   // splash chill can't itself spread (keeps Deep Winter meaningful)
+            }
             _beamHitT -= dt;
             if (_beamHitT <= 0f) { _beamHitT = Mathf.Max(0.12f, S.FireCd); OnHitDirectNormal(hit, hit.Dead, Base() * 1.4f * _beamHitT, DamageType.Frost); }   // combo + finisher charge + mana, ticked at the normal fire rate
         }
@@ -2192,12 +3151,178 @@ public partial class Player : Node3D
     }
     public void EndCurseBeam() { _curseSeg?.Free(); _curseSeg = null; _curseLight = null; }
 
+    // ===== ARCANE WITCH =====
+    // Primary: a 3-round arcane bolt burst from the LEFT hand (tight, gentle aim-assist; restores mana on hit). Landing all 3 on
+    // ONE foe (3 consecutive same-target hits) MARKS it. Marks are persistent, capped at 4 (FIFO — the oldest drops when a 5th is
+    // made), and cleared on death. Secondary (charged RMB): jagged arcane chain-lightning that bounces her → through each marked
+    // foe (piercing in-between foes), scaling with charge. No marks → a single hitscan at the reticle. −0.5 mana / +1 on hit.
+    // (OVERHAUL) marks are now UNCAPPED and TIME-LIMITED: every arcane bolt that hits marks its target, the mark ticks
+    // down over ArcaneMarkDur seconds (a blessing extends it), and the charged chain zaps EVERY live mark.
+    public float ArcaneMarkDur = 3f;         // base mark lifetime; "Lingering Sigils" blessings add to it
+    private int _arcaneBurst = 0; private float _arcaneBurstT = 0f;
+    private readonly System.Collections.Generic.List<Enemy> _arcaneMarks = new();
+    private readonly System.Collections.Generic.List<float> _markExpire = new();   // index-aligned countdown per mark
+    public int ArcaneMarkCount { get { int n = 0; foreach (var e in _arcaneMarks) if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) n++; return n; } }
+
+    private void FireArcaneMissile(bool combo)
+    {
+        Game.I.PlayerSound(GlobalPosition, 0.6f);
+        var basis = _cam.GlobalTransform.Basis;
+        Vector3 camFwd = (-basis.Z).Normalized();
+        Vector3 origin = (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))
+            ? _handMeshL.GlobalPosition
+            : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;   // fallback: a left-hand-ish offset
+        var tint = DamageTypes.Col(DamageType.Arcane);
+        float dmg = Base() * 0.5f * ComboMul() * ArcanePowerMul;
+        var tgt = AimTarget();   // gentle assist toward whatever's under the crosshair — tight, still responsive (not auto-pilot)
+        Bolt m;
+        if (tgt != null)
+        {
+            Vector3 dir = (tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f - origin).Normalized();
+            m = SpawnBolt(origin, dir * 54f, dmg, 0, 0.32f, tint, DamageType.Arcane, normal: true, charged: false, combo: combo, full: false, homing: true);
+            m.Target = tgt; m.SeekLockedOnly = true; m.HomeSpeed = 54f; m.Turn = 6f; m.HomeDelay = 0.04f;
+        }
+        else
+            m = SpawnBolt(origin, camFwd * 56f, dmg, 0, 0.32f, tint, DamageType.Arcane, normal: true, charged: false, combo: combo, full: false, homing: false);
+        m.ArcaneBurst = true;   // tracked in OnHit → 3-on-one-target marks it
+        _kickL = 1;
+        FireHeat = Mathf.Min(1f, FireHeat + 0.05f);
+        Game.I.Sfx?.Cast(DamageType.Arcane);
+    }
+
+    private void PruneArcaneMarks()
+    {
+        for (int i = _arcaneMarks.Count - 1; i >= 0; i--)
+        {
+            var e = _arcaneMarks[i];
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) { _arcaneMarks.RemoveAt(i); _markExpire.RemoveAt(i); }
+        }
+    }
+
+    // tick every mark's lifetime; a mark that runs out is cleared (unless Unstable Mind keeps it until death). Called each frame.
+    private void UpdateArcaneMarks(float dt)
+    {
+        for (int i = _arcaneMarks.Count - 1; i >= 0; i--)
+        {
+            var e = _arcaneMarks[i];
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) { _arcaneMarks.RemoveAt(i); _markExpire.RemoveAt(i); continue; }
+            if (ArcanePersistMarks) continue;                       // legendary: marks never time out
+            _markExpire[i] -= dt;
+            if (_markExpire[i] <= 0f) { e.SetArcaneMark(false); _arcaneMarks.RemoveAt(i); _markExpire.RemoveAt(i); }
+        }
+    }
+
+    // Mark a foe (or REFRESH an existing mark's timer). Uncapped — every hit marks. Lasts ArcaneMarkDur seconds.
+    private void MarkArcane(Enemy e)
+    {
+        if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) return;
+        int idx = _arcaneMarks.IndexOf(e);
+        if (idx >= 0) { _markExpire[idx] = ArcaneMarkDur; return; }   // already marked → just refresh the timer (quietly)
+        _arcaneMarks.Add(e); _markExpire.Add(ArcaneMarkDur);
+        e.SetArcaneMark(true);
+        Game.I.MyStats.Highlight++;   // "Foes Marked"
+    }
+
+    // greedy nearest-neighbor path through the live marks, starting from `from` — the zigzag order the bolt bounces in.
+    private System.Collections.Generic.List<Enemy> OrderedMarkChain(Vector3 from)
+    {
+        var pool = new System.Collections.Generic.List<Enemy>();
+        foreach (var e in _arcaneMarks) if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) pool.Add(e);
+        var ordered = new System.Collections.Generic.List<Enemy>();
+        Vector3 cur = from;
+        while (pool.Count > 0)
+        {
+            int best = 0; float bd = float.MaxValue;
+            for (int i = 0; i < pool.Count; i++) { float d = pool[i].GlobalPosition.DistanceSquaredTo(cur); if (d < bd) { bd = d; best = i; } }
+            var e = pool[best]; pool.RemoveAt(best); ordered.Add(e); cur = e.GlobalPosition;
+        }
+        return ordered;
+    }
+
+    private static float DistPointToSeg(Vector3 p, Vector3 a, Vector3 b)
+    {
+        var ab = b - a; float t = ab.LengthSquared() > 1e-6f ? Mathf.Clamp((p - a).Dot(ab) / ab.LengthSquared(), 0f, 1f) : 0f;
+        return (p - (a + ab * t)).Length();
+    }
+
+    // charge-release: jagged raw-arcane chain-lightning. Bounces her → through each marked foe (piercing in-between foes for
+    // normal dmg @ base crit; marked foes take normal dmg @ 2x crit CHANCE). No marks → a single hitscan at the reticle, no bounce.
+    private void FireArcaneChain(float charge)
+    {
+        PruneArcaneMarks();
+        float chargeMul = 1f + charge * (S.MaxCharge * 1.6f - 1f);   // power scales with charge (same ramp as a charged bolt)
+        float dmg = Base() * 1.4f * chargeMul * ComboMul() * ArcanePowerMul;
+        var col = DamageTypes.Col(DamageType.Arcane);
+        if (charge >= 0.95f) Game.I.SpawnGroundSigil(GlobalPosition, 4.5f * S.SpellArea, col);   // full-charge ground rune flourish (shared by every witch's charged right-click)
+        var basis = _cam.GlobalTransform.Basis;
+        Vector3 start = (_handMeshR != null && GodotObject.IsInstanceValid(_handMeshR)) ? _handMeshR.GlobalPosition : EyePos + basis.X * 0.3f - basis.Y * 0.4f;
+        var pts = new System.Collections.Generic.List<Vector3> { start };
+        bool hitAny = false, modsFired = false;
+        void Mods(Vector3 at) { if (!modsFired && charge >= 0.95f) { ApplyChargedMods(at); modsFired = true; } }   // charged-mod ability triggers on the FIRST foe hit only
+
+        var chain = OrderedMarkChain(start);
+        if (chain.Count > 0)
+        {
+            Vector3 prev = start;
+            foreach (var target in chain)
+            {
+                var tp = target.GlobalPosition + Vector3.Up * target.Radius * 0.5f;
+                foreach (var e in Game.I.Enemies.ToArray())   // pierce the foes the bolt zigzags THROUGH on the way to this mark
+                {
+                    if (e == null || e.Dead || e == target || _arcaneMarks.Contains(e) || !GodotObject.IsInstanceValid(e)) continue;
+                    var ep = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f;
+                    if (DistPointToSeg(ep, prev, tp) > e.Radius + 0.8f) continue;
+                    bool c1 = RollCrit(); float d1 = dmg; if (c1) d1 *= CritMult();
+                    e.Hurt(d1, DamageType.Arcane, true, c1);   // in-between: normal dmg, base crit
+                    OnHitDirect(e, e.Dead, d1, DamageType.Arcane, c1);   // every foe the chain touches builds combo + finisher charge + crit-heal
+                    hitAny = true; Mods(ep);
+                }
+                bool crit = RollCrit(); if (!crit) crit = RollCrit();   // marked endpoint: 2x crit CHANCE (two rolls)
+                float d = dmg; if (crit) d *= CritMult();
+                target.Hurt(d, DamageType.Arcane, true, crit);
+                OnHitDirect(target, target.Dead, d, DamageType.Arcane, crit);   // charged on-hit: combo, ult charge, the −0.5/+1 mana refund, crit-heal
+                hitAny = true; Mods(tp);
+                pts.Add(tp); prev = tp;
+            }
+            // the chain BURNS OFF the marks it bounced through — you have to re-mark for the next cast (unless Unstable Mind keeps them)
+            if (!ArcanePersistMarks)
+            {
+                foreach (var e in _arcaneMarks) if (e != null && GodotObject.IsInstanceValid(e)) e.SetArcaneMark(false);
+                _arcaneMarks.Clear(); _markExpire.Clear();
+            }
+        }
+        else   // no marks → single hitscan at the reticle
+        {
+            var tgt = AimTarget();
+            Vector3 endPt;
+            if (tgt != null)
+            {
+                endPt = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f;
+                bool crit = RollCrit(); float d = dmg; if (crit) d *= CritMult();
+                tgt.Hurt(d, DamageType.Arcane, true, crit);
+                OnHitDirect(tgt, tgt.Dead, d, DamageType.Arcane, crit);
+                hitAny = true; Mods(endPt);
+            }
+            else if (BeamSurfaceHit(EyePos, AimDir(), 40f * S.SpellRange, out var surf, out _)) endPt = surf;
+            else endPt = EyePos + AimDir() * (40f * S.SpellRange);
+            pts.Add(endPt);
+        }
+        if (!hitAny) _chargedRefund = false;   // whiffed: the 0.5 is spent, no refund (OnHitDirect refunds the +1 when it connects)
+
+        Game.I.SpawnArcaneLightning(pts, charge);
+        for (int i = 0; i + 1 < pts.Count; i++) { var d2 = pts[i + 1] - pts[i]; float l = d2.Length(); if (l > 0.1f) Game.I.NetMgr?.BroadcastVfx(78, pts[i], d2 / l, l, 0f, col); }
+        Game.I.Sfx?.Release(DamageType.Arcane);
+        _kickR = 1;
+        FireHeat = Mathf.Min(1f, FireHeat + 0.12f);
+    }
+
     // draw a faint curse link between each pair of tethered group members (local visual; refreshed each frame)
     private void DrawCurseTethers()
     {
+        if (TotalTethered() < 2) { if (_tetherVis.Count > 0) ClearTetherVis(); return; }   // (PERF) nothing tethered → bail BEFORE allocating the ToArray + Dictionary + Lists every frame (the common case)
         ClearTetherVis();
         var groups = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<Enemy>>();
-        foreach (var e in Game.I.Enemies.ToArray())
+        foreach (var e in Game.I.Enemies)   // (PERF) iterate directly — this loop only reads Enemies + spawns link nodes under Game.I, never mutates the list
             if (e != null && !e.Dead && e.CurseGroup != 0 && GodotObject.IsInstanceValid(e))
             { if (!groups.TryGetValue(e.CurseGroup, out var l)) { l = new(); groups[e.CurseGroup] = l; } l.Add(e); }
         var col = DamageTypes.Col(DamageType.Curse);
@@ -2331,7 +3456,7 @@ public partial class Player : Node3D
         float dmg = Base() * (0.4f + c * 1.1f) * ComboMul();   // base — SpawnBolt rolls its own crit
         int pierce = GlacialImpaler ? 20 : 3;
         bool shatterAny = GlacialImpaler || full;   // Glacial Impaler shatters frozen foes at ANY charge
-        var b = SpawnBolt(_cam.GlobalPosition + camFwd * 1.2f, camFwd * (46f + c * 20f), dmg,
+        var b = SpawnBolt(FireOrigin(camFwd), camFwd * (46f + c * 20f), dmg,
             pierce, 0.35f + c * 0.55f, DamageTypes.Col(DamageType.Frost), DamageType.Frost,
             normal: false, charged: true, combo: true, full: full, homing: false, style: 3);
         if (b != null)
@@ -2354,7 +3479,7 @@ public partial class Player : Node3D
         Game.I.NetMgr?.BroadcastVfx(33, new Vector3(o.X, 0f, o.Z), fwd, len, half, DamageTypes.Col(DamageType.Holy));   // allies see the descending holy ray sweep
 
         bool rayCrit = RollCrit();
-        float dmg = Base() * (0.3f + c * 0.7f) * ComboMul() * (rayCrit ? CritMult() : 1f);   // the per-foe sear the sweep's leading edge deals
+        float dmg = Base() * (0.4f + c * 2.0f) * ComboMul() * (rayCrit ? CritMult() : 1f);   // (BUFF 0.3+0.7→0.4+2.0) the sweep was Base×1.0 at full — absurdly weak; now Base×2.4, still the lowest charged burst but solo-viable
         // NOTE: the mana refund is NOT predicted here — it fires only when the sweep's edge actually hits a foe
         // (HolyGround -> OnHitDirect -> _chargedRefund). No hit → no refund.
 
@@ -2364,6 +3489,25 @@ public partial class Player : Node3D
         bool fullBless = c >= 0.95f;
         float blessDur = 2f * (S.MaxCharge / 3f) + BlessBonus;   // 2s at the default Overcharge stat; scales with Overcharge + Benediction
         if (fullBless) BlessedT = Mathf.Max(BlessedT, blessDur);   // the Divine caster always gets it on a full charge (no stacking)
+        if (fullBless && DivineWitch)   // (REWORK) RADIANT SMITE — a real finisher that scales with her damage: a hard pillar on
+        {                                //          the nearest foe that CHAINS to a second, each smite mending her.
+            var order = new List<Enemy>();
+            foreach (var e in Game.I.Enemies.ToArray())
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                if (Flat(e, GlobalPosition) < 40f * S.SpellRange) order.Add(e);
+            }
+            order.Sort((a, b) => Flat(a, GlobalPosition).CompareTo(Flat(b, GlobalPosition)));
+            int hit = 0;
+            for (int i = 0; i < order.Count && hit < 2; i++)
+            {
+                var tgt = order[i]; bool sc = RollCrit();
+                float sd = Base() * (hit == 0 ? 2.2f : 1.2f) * ComboMul() * (sc ? CritMult() : 1f);   // scales with her damage; chain hits softer
+                tgt.Hurt(sd, DamageType.Holy, true, sc); tgt.Slow(1.2f, 0.6f); Heal(S.MaxHp * 0.03f); hit++;
+                Game.I.NetMgr?.BroadcastVfx(33, tgt.GlobalPosition, Vector3.Up, 6f, 0.5f, DamageTypes.Col(DamageType.Holy));
+                Game.I.Sfx?.ModSmite(tgt.GlobalPosition);
+            }
+        }
         if (BlessBonus > 0f && c > 0.05f) Heal(S.MaxHp * 0.03f);    // Benediction mends you a little each cast
 
         // lingering consecrated strip. The ray SWEEPS forward (~1.2s): its leading edge deals the real sear hit
@@ -2460,7 +3604,8 @@ public partial class Player : Node3D
     {
         var at = GroundAim();
         float dmg = Base() * 3.2f * ComboMul() * (1f + UltTier * 0.25f) * (ModDivinity ? 1.35f : 1f);
-        float rad = 7f + UltTier * 0.8f;
+        float radBase = 7f + UltTier * 0.8f;   // raw base — the ModDivinity GroundField auto-scales this by SpellArea
+        float rad = radBase * S.SpellArea;     // the direct blast + VFX scale here
         foreach (var e in Game.I.Enemies.ToArray())
             if (!e.Dead && Flat(e, at) < rad) { e.Hurt(dmg, DamageType.Holy, true); ComboFromSource(); }
         Game.I.DamageWorld(at, rad, dmg);   // (FIX) AoE breaks props too
@@ -2471,7 +3616,7 @@ public partial class Player : Node3D
         Game.I.NetMgr?.BroadcastVfx(6, at, Vector3.Zero, rad, 0f, DamageTypes.Col(DamageType.Holy));   // (NEW) allies see the holy mote burst
         if (ModDivinity)   // lingering consecrated ground
         {
-            var f = new GroundField { Type = FieldType.Heal, HealAllies = true, EnemyDmg = dmg * 0.18f, Radius = rad * 0.6f, Dur = 3.5f, Power = S.MaxHp * 0.02f, DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true };
+            var f = new GroundField { Type = FieldType.Heal, HealAllies = true, EnemyDmg = dmg * 0.18f, Radius = radBase * 0.6f, Dur = 3.5f, Power = S.MaxHp * 0.02f, DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true };
             Game.I.AddChild(f); f.GlobalPosition = new Vector3(at.X, 0.04f, at.Z);
         }
         Game.I.Sfx?.Release(DamageType.Holy);
@@ -2480,31 +3625,53 @@ public partial class Player : Node3D
     // Radiant Halo: a holy nova around the witch — damages foes, heals her.
     private void FinHalo(float pow, int t)
     {
-        float rad = 8f + t * 1.2f, dmg = Base() * (1.4f + 0.3f * t) * pow;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float rad = (8f + 1.2f * s1) * S.SpellArea, dmg = Base() * 1.4f * (1f + 0.18f * s0);   // Stat① Radiance / Stat② Corona
         var col = DamageTypes.Col(DamageType.Holy);
-        foreach (var e in Game.I.Enemies.ToArray())
-            if (!e.Dead && Flat(e, GlobalPosition) < rad) { e.Hurt(dmg, DamageType.Holy, true); ComboFromSource(); }
-        Game.I.DamageWorld(GlobalPosition, rad, dmg);   // (FIX) AoE breaks props too
-        Heal(S.MaxHp * (0.06f + 0.02f * t));
-        BlessedT = Mathf.Max(BlessedT, 4f);
-        Ring(GlobalPosition, col, rad, 0.5f);
+        void Bloom(float r, float scl)
+        {
+            foreach (var e in Game.I.Enemies.ToArray())
+                if (!e.Dead && Flat(e, GlobalPosition) < r) { e.Hurt(dmg * scl, DamageType.Holy, true); ComboFromSource(); }
+            Game.I.DamageWorld(GlobalPosition, r, dmg * scl);   // (FIX) AoE breaks props too
+            Ring(GlobalPosition, col, r, 0.5f);
+        }
+        Bloom(rad, 1f);
+        for (int i = 1; i <= e0; i++) Bloom(rad * (1f + 0.35f * i), 0.6f);   // Epic Twin Halo: +1 concentric ring each stack
+        Heal(S.MaxHp * (0.06f + 0.02f * s2));         // Stat③ Benediction: heal
+        BlessedT = Mathf.Max(BlessedT, 4f + s2);       // Stat③ Benediction: Blessed duration
+        if (e1 > 0)   // Leg Sanctuary: raise a protective shield (self; allies via net later)
+        {
+            float amt = S.MaxHp * (0.05f + 0.03f * e1);
+            MaxShield = Mathf.Max(MaxShield, amt); Shield = Mathf.Max(Shield, amt);
+        }
     }
 
     // Heaven's Lances: a fan of plunging holy lances ahead of the aim, each a small holy burst.
     private void FinLance(float pow, int t)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         var at = GroundAim();
-        int n = 3 + t;
-        float dmg = Base() * (1.2f + 0.25f * t) * pow;
+        int n = 3 + s1;                                    // Stat② Legion
+        float dmg = Base() * 1.2f * (1f + 0.18f * s0);     // Stat① Judgement
+        float lr = (3f + 0.5f * s2) * S.SpellArea;         // Stat③ Wide Aim
         var right = new Vector3(-(_cam.GlobalTransform.Basis.Z).Z, 0, (_cam.GlobalTransform.Basis.Z).X).Normalized();
-        for (int i = 0; i < n; i++)
+        void Volley(float scl)
         {
-            float off = (i - (n - 1) / 2f) * 2.6f;
-            var spot = new Vector3(at.X + right.X * off, 0, at.Z + right.Z * off);
-            foreach (var e in Game.I.Enemies.ToArray())
-                if (!e.Dead && Flat(e, spot) < 3f) { e.Hurt(dmg, DamageType.Holy, true); ComboFromSource(); }
-            Game.I.DamageWorld(spot, 3f, dmg);   // (FIX) AoE breaks props too
-            Lance(spot);
+            for (int i = 0; i < n; i++)
+            {
+                float off = (i - (n - 1) / 2f) * 2.6f;
+                var spot = new Vector3(at.X + right.X * off, 0, at.Z + right.Z * off);
+                foreach (var e in Game.I.Enemies.ToArray())
+                    if (!e.Dead && Flat(e, spot) < lr) { e.Hurt(dmg * scl, DamageType.Holy, true); if (e0 > 0) e.Root(0.5f + 0.4f * e0); ComboFromSource(); }   // Epic Condemn: stun (root) struck foes
+                Game.I.DamageWorld(spot, lr, dmg * scl);   // (FIX) AoE breaks props too
+                Lance(spot);
+            }
+        }
+        Volley(1f);
+        for (int v = 1; v <= e1; v++)   // Leg Rain of Heaven: +1 delayed volley each stack
+        {
+            var tw = CreateTween(); tw.TweenInterval(0.28f * v);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Volley(0.7f); }));
         }
         Game.I.Sfx?.HolyLances(at);              // (NEW) sharp descending holy strike
     }
@@ -2512,8 +3679,10 @@ public partial class Player : Node3D
     // Blood Nova: a ring detonation around the witch — strong AoE + knockback. Scales with rarity (t) and pow.
     private void FinBloodNova(float pow, int t)
     {
-        float rad = 9f + t * 1.2f;
-        float dmg = Base() * (2.4f + 0.4f * t) * pow;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float rad = (9f + 1.2f * s1) * S.SpellArea;       // Stat② Spatter
+        float dmg = Base() * 2.4f * (1f + 0.18f * s0);    // Stat① Rupture
+        if (e1 > 0) { float missing = S.MaxHp > 0f ? Mathf.Clamp(1f - Hp / S.MaxHp, 0f, 1f) : 0f; dmg *= 1f + missing * 0.25f * e1; }   // Leg Sanguine Surge: scales with missing HP
         var col = DamageTypes.Col(DamageType.Blood);
         bool killed = false;
         foreach (var e in Game.I.Enemies.ToArray())
@@ -2521,7 +3690,8 @@ public partial class Player : Node3D
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             if (Flat(e, GlobalPosition) > rad + e.Radius) continue;
             e.Hurt(dmg, DamageType.Blood, true);
-            e.Knockback(GlobalPosition, 5f + t);
+            e.Knockback(GlobalPosition, 5f + 1.5f * s2);              // Stat③ Repel
+            if (e0 > 0) e.Bleed(Base() * 0.1f * e0, 3f, false);       // Epic Hemoclast: the nova applies bleed
             ComboFromSource();
             if (e.Dead) killed = true;
         }
@@ -2550,11 +3720,19 @@ public partial class Player : Node3D
     // barely rise) — a setup for air follow-ups (primary/charged/other combos mid-air).
     private void FinUpdraft(float pow, int t, Color col)
     {
-        _vy = 23f + t * 1.5f; _grounded = false; _jumps = JumpsMax; _noFall = Mathf.Max(_noFall, 3.5f);   // (BUFF) launches the caster notably higher — more air time for follow-ups
-        float rad = (6f + t) * S.SpellArea;
-        float up = 16f + t * 2f + pow * 2f;
-        Game.I.NetMgr?.StormForce(GlobalPosition, rad, 4, up);                 // lift small/medium foes straight up
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        _vy = 23f + 3f * s2; _grounded = false; _jumps = JumpsMax; _noFall = Mathf.Max(_noFall, 3.5f);   // Stat③ Ascend: self-launch height
+        float rad = (6f + s1) * S.SpellArea;                    // Stat② Wide Gust
+        float up = 16f + 3f * s0 + pow * 2f;                    // Stat① Squall: lift force
+        Game.I.NetMgr?.StormForce(GlobalPosition, rad, 4, up, 1f, e1 > 0 ? 0.6f + 0.4f * e1 : 0f);   // lift foes up; base does NO fall damage — Leg Tempest UNLOCKS it (stack1 ≈ 1×, scaling to 2.2× at ×4)
         Game.I.MyStats.Flings += Game.I.CountFlungNear(GlobalPosition, rad);   // (NEW) tally enemies flung
+        if (e0 > 0)   // Epic Cyclone Kick: the launch now deals damage
+        {
+            float kick = Base() * 0.3f * e0;
+            foreach (var e in Game.I.Enemies.ToArray())
+                if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < rad + e.Radius) e.Hurt(kick, DamageType.Wind, true);
+            Game.I.DamageWorld(GlobalPosition, rad, kick);
+        }
         Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Up, rad, 0.5f, col);
         Ring(GlobalPosition, col, rad, 0.45f);
         Ring(GlobalPosition, col.Lerp(Colors.White, 0.4f), rad * 0.6f, 0.35f);
@@ -2588,10 +3766,11 @@ public partial class Player : Node3D
     // harder, hits a bit harder, and rushes farther. Damage/fling route via StormForce (client-safe).
     private void FinWindRush(float pow, int t, Color col)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 fwd = -_cam.GlobalTransform.Basis.Z; fwd.Y = 0; fwd = fwd.Normalized();
-        float dist = 13f + t * 3f + pow * 2f;   // further base reach now (NEW)
-        float dmg = Base() * (0.35f + 0.1f * t) * pow;
-        float flingPow = 8f + t * 2.5f + pow * 2f;       // higher rarity → harder fling
+        float dist = 13f + 3f * s1 + pow * 2f;                  // Stat② Slipstream
+        float dmg = Base() * 0.35f * (1f + 0.18f * s0);         // Stat① Buffet
+        float flingPow = 8f + 2.5f * s2 + pow * 2f;             // Stat③ Uplift
         float rad = (dist * 0.7f) * Mathf.Max(1f, S.SpellArea * 0.6f + 0.4f);
         _rushDur = 0.36f; _rushDist = dist; _rushDir = fwd; _rushT = _rushDur; _rushWind = true; _windPuffCd = 0f;   // longer, visibly-gusty glide (NEW)
         if (_inWaterBody) { _rushT = 0f; _rushDist = 0f; _rushWind = false; }   // no movement-dash combos while wading/swimming (NEW)
@@ -2599,14 +3778,24 @@ public partial class Player : Node3D
         Game.I.NetMgr?.StormForce(GlobalPosition, rad, 2, dmg);               // light damage in the lane
         Game.I.NetMgr?.StormForce(GlobalPosition, rad, 3, flingPow);          // fling foes aside/back (mass-scaled)
         Game.I.MyStats.Flings += Game.I.CountFlungNear(GlobalPosition, rad);   // (NEW) tally enemies flung
-        // ~50% dash refund if an enemy is in the path (local check — works regardless of authority)
+        // dash refund if an enemy is in the path (local check — works regardless of authority)
         bool hit = false;
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             if (Flat(e, GlobalPosition) <= rad + e.Radius) { hit = true; break; }
         }
-        if (hit && GD.Randf() < 0.5f) DashStock = S.DashCharges;             // reset dashes to max
+        if (hit && GD.Randf() < 0.5f + 0.15f * e0) DashStock = S.DashCharges;   // Epic Second Wind: refund chance grows → guaranteed
+        if (e1 > 0)   // Leg Gale Force: leaves a damaging gust trail along the dash
+        {
+            int drops = 2 + e1;
+            for (int i = 0; i < drops; i++)
+            {
+                var tp = GlobalPosition + fwd * (dist * (i + 0.5f) / drops);
+                var gf = new GroundField { Type = FieldType.Hex, Radius = 2.5f, Dur = 1.6f + 0.2f * e1, Power = Base() * 0.1f * e1, DType = DamageType.Wind, TintColor = DamageTypes.Col(DamageType.Wind), FromCombo = true };
+                Game.I.AddChild(gf); gf.GlobalPosition = new Vector3(tp.X, 0.04f, tp.Z);
+            }
+        }
         Game.I.NetMgr?.BroadcastVfx(6, GlobalPosition, fwd, rad, 0f, col);
         Game.I.NetMgr?.BroadcastVfx(32, GlobalPosition, fwd, dist, _rushDur, col);   // (NEW) allies see the wind bullet streak past
         Ring(GlobalPosition, col, rad * 0.7f, 0.4f);
@@ -2619,17 +3808,22 @@ public partial class Player : Node3D
     // Wind Slice: hurl a travelling X of wind forward that pierces and damages every foe in its path.
     private void FinWindSlice(float pow, int t, Color col)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();   // (NEW) full aim incl. pitch → flies through the crosshair
-        var ws = new WindSlice
+        float dmg = Base() * 0.7f * (1f + 0.18f * s0);          // Stat① Edge
+        float width = (4.5f + 0.8f * s1) * S.SpellArea;         // Stat② Broad Cut
+        float range = (30f + 6f * s2) * S.SpellRange;           // Stat③ Far Throw: range
+        float speed = 34f * (1f + 0.1f * s2) * S.ProjSpeed;     // Stat③ Far Throw: speed
+        float pull = e1 > 0 ? 2.5f + 1.5f * e1 : 0f;           // Leg Vortex Edge: drags foes together in its wake
+        int slices = 1 + e0;                                    // Epic Cross Cut: +1 slice / stack (fans into an X-cross)
+        for (int i = 0; i < slices; i++)
         {
-            Dir = fwd,
-            Dmg = Base() * (0.7f + 0.18f * t) * pow,
-            Width = (4.5f + t * 0.8f) * S.SpellArea,
-            Range = 30f + t * 6f,
-            Speed = 34f,
-        };
-        Game.I.AddChild(ws);
-        ws.GlobalPosition = EyePos + fwd * 1.4f;                      // (NEW) start at the eye so it tracks the reticle
+            float ang = i == 0 ? 0f : ((i + 1) / 2) * 0.7f * ((i % 2 == 1) ? -1f : 1f);
+            var dir = fwd.Rotated(Vector3.Up, ang);
+            var ws = new WindSlice { Dir = dir, Dmg = dmg, Width = width, Range = range, Speed = speed, Pull = pull };
+            Game.I.AddChild(ws);
+            ws.GlobalPosition = EyePos + dir * 1.4f;                  // (NEW) start at the eye so it tracks the reticle
+        }
         Ring(GlobalPosition, col, 3f, 0.35f);
         CamKick(0.4f);
         Game.I.Sfx?.WindSlash(EyePos + fwd * 2f);                     // (NEW) sharp wind woosh
@@ -2640,19 +3834,22 @@ public partial class Player : Node3D
     // Ice Spikes: a cone of ice erupts ahead (~12u), damaging foes and flinging the small/medium ones up.
     private void FinIceSpike(float pow, int t, Color col)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 o = GlobalPosition, fwd = AimDir(); fwd.Y = 0; fwd = fwd.LengthSquared() > 0.001f ? fwd.Normalized() : Vector3.Forward;
-        float reach = 12f * S.SpellArea, cosArc = 0.5f;   // ~60° half-cone
-        float dmg = Base() * (1.6f + 0.4f * t) * pow;
+        float reach = (12f + 1.5f * s1) * S.SpellArea, cosArc = Mathf.Max(0.35f, 0.5f - 0.035f * s1);   // Stat② Wide Cone: reach & angle
+        float dmg = Base() * (1.6f * (1f + 0.18f * s0));   // Stat① Frostbite
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             var to = e.GlobalPosition - o; float d = to.Length(); to.Y = 0f;
             if (d > reach + e.Radius || to.LengthSquared() < 0.001f) continue;
             if (fwd.Dot(to.Normalized()) < cosArc) continue;
-            e.Hurt(dmg, DamageType.Frost, true);
+            e.Hurt(dmg * (e.Frozen && e1 > 0 ? 1f + 0.25f * e1 : 1f), DamageType.Frost, true);   // Evo B Impaler: bonus vs frozen
+            if (e0 > 0) e.AddFreeze(0.5f + 0.5f * e0, FreezeThreshMul, FrostDurBonus);            // Evo A Rime: freeze stacks
+            if (e1 > 0 && e.Frozen) e.ShatterFreeze(true);                                        // Evo B Impaler: shatter frozen
             ComboFromSource();
         }
-        Game.I.NetMgr?.StormForce(o + fwd * (reach * 0.5f), reach * 0.6f, 4, 13f + t * 2f);   // fling small/medium foes up (host-authoritative / client-safe)
+        Game.I.NetMgr?.StormForce(o + fwd * (reach * 0.5f), reach * 0.6f, 4, 13f + 3f * s2);   // Stat③ Upheaval: fling force
         Game.I.MyStats.Flings += Game.I.CountFlungNear(o + fwd * (reach * 0.5f), reach * 0.6f);   // (NEW) tally enemies flung
         Game.I.DamageWorld(o + fwd * (reach * 0.5f), reach * 0.6f, dmg);
         SpawnIceSpikeCone(o, fwd, reach, col);
@@ -2695,22 +3892,67 @@ public partial class Player : Node3D
     // Frost Vault: kick off an icicle to launch UP + BACK to safety; the icicle stays and bursts to slow the foes left behind.
     private void FinFrostVault(float pow, int t, Color col)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 launchPos = GlobalPosition;
         Vector3 fwd = AimDir(); fwd.Y = 0; fwd = fwd.LengthSquared() > 0.001f ? fwd.Normalized() : Vector3.Forward;
-        float up = 13f + t * 1.5f + pow * 2f;
-        float back = 8f + t * 2f + pow;
+        float up = 13f + pow * 2f, back = 8f + pow;
         _vy = up; _grounded = false; _jumps = JumpsMax; _noFall = Mathf.Max(_noFall, 2.6f);
         _rushDir = -fwd; _rushDist = back; _rushDur = 0.32f; _rushT = _rushDur; _rushWind = false;   // glide up-and-back
-        float rad = (6f + t) * S.SpellArea;
-        float dmg = Base() * (0.7f + 0.2f * t) * pow;
-        SpawnVaultIcicle(launchPos, rad, dmg, col);
+        float rad = (6f + 0.8f * s1) * S.SpellArea;                        // Stat② Fracture
+        float dmg = Base() * (0.7f * (1f + 0.18f * s0));                   // Stat① Shard
+        float slowF = Mathf.Max(0.25f, 0.45f - 0.05f * s2);               // Stat③ Numb: stronger slow
+        float freeze = e0 > 0 ? 0.8f + 0.6f * e0 : 0f;                    // Evo A Flash Freeze
+        SpawnVaultIcicle(launchPos, rad, dmg, col, false, slowF, freeze);
+        for (int i = 1; i <= e1; i++)   // Evo B Avalanche: +1 icicle / stack
+        {
+            float a = i / (float)Mathf.Max(1, e1) * Mathf.Tau;
+            SpawnVaultIcicle(launchPos + new Vector3(Mathf.Cos(a) * rad * 0.8f, 0, Mathf.Sin(a) * rad * 0.8f), rad * 0.7f, dmg * 0.7f, col, false, slowF, freeze);
+        }
         Game.I.NetMgr?.BroadcastVfx(55, launchPos, Vector3.Up, rad, 0f, col);   // allies see the icicle + burst ring
         CamKick(0.5f);
         Game.I.Sfx?.Freeze(launchPos);
     }
 
+    // ===== Frost Wall charged modifier (NEW) =====
+    // Raise a persistent frost wall that BLOCKS enemies and shatters (for area damage) after a few seconds.
+    // Live-wall limit grows with rarity (1 → 4); casting past the limit shatters the OLDEST wall early.
+    private int _frostWallSeq = 0;
+    private readonly System.Collections.Generic.List<FrostWall> _frostWalls = new();
+    private void SpawnFrostWallMod(Vector3 pos, Modifier m)
+    {
+        int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+        int limit = 1 + s2 / 2;                                      // Stat③ Permafrost: +live-wall count (0→1, 2→2, 4→3)
+        float dur = 5f + s2;                                        // …and +duration
+        // drop any freed refs, then evict the oldest if we're already at the limit (its shatter damages nearby foes)
+        _frostWalls.RemoveAll(w => w == null || !GodotObject.IsInstanceValid(w));
+        while (_frostWalls.Count >= limit && _frostWalls.Count > 0)
+        {
+            var oldest = _frostWalls[0];
+            _frostWalls.RemoveAt(0);
+            if (GodotObject.IsInstanceValid(oldest)) oldest.Shatter(true);
+        }
+        // orient the wall across the approach line (perpendicular to caster → cast point)
+        Vector3 toWall = pos - GlobalPosition; toWall.Y = 0f;
+        Vector3 facing = toWall.LengthSquared() > 0.01f ? toWall.Normalized() : -GlobalTransform.Basis.Z;
+        Vector3 along = new Vector3(-facing.Z, 0f, facing.X);
+        float halfLen = (3.6f + 0.5f * s1) * S.SpellArea;           // Stat② Rampart: +wall length
+        float gy = Game.I.SurfaceHeight(pos, GlobalPosition.Y);
+        var center = new Vector3(pos.X, gy, pos.Z);
+        float shatterDmg = Base() * (1.3f * (1f + 0.18f * s0)) * ComboMul();   // Stat① Shatter
+        float shatterRad = halfLen + 3f;
+        int id = ++_frostWallSeq;
+        var wall = new FrostWall(); Game.I.AddChild(wall);
+        wall.Init(this, center, along, halfLen, dur, shatterDmg, shatterRad, id, false);
+        wall.Chill = e0; wall.Pulse = e1;   // Evo A Frostbite Wall (chills nearby) / Evo B Glacier (pulses frost)
+        _frostWalls.Add(wall);
+        SetArm("ward", 0.4f);
+        Game.I.Sfx?.Freeze(center); Game.I.Sfx?.ModFrost(center);
+        Game.I.NetMgr?.BroadcastVfx(81, center, along, halfLen, dur, DamageTypes.Col(DamageType.Frost));   // allies get a remote copy (visual + obstacle)
+    }
+    public void OnFrostWallGone(FrostWall w) { _frostWalls.Remove(w); }
+
     // the vault icicle: erupts where she kicked off, holds ~0.7s, then bursts (host applies the slow + light frost). (NEW)
-    public void SpawnVaultIcicle(Vector3 at, float rad, float dmg, Color col, bool remote = false)
+    public void SpawnVaultIcicle(Vector3 at, float rad, float dmg, Color col, bool remote = false, float slowFactor = 0.45f, float freezeAmt = 0f)
     {
         float gy = Game.I.SurfaceHeight(at, at.Y);
         var ice = Game.Emissive(col, 2.4f);
@@ -2725,7 +3967,7 @@ public partial class Player : Node3D
             if (!remote && Game.I != null)
                 foreach (var e in Game.I.Enemies.ToArray())
                     if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, at) < rad + e.Radius)
-                    { e.Hurt(dmg, DamageType.Frost, true); e.Slow(2.5f, 0.45f); }
+                    { e.Hurt(dmg, DamageType.Frost, true); e.Slow(2.5f, slowFactor); if (freezeAmt > 0f) e.AddFreeze(freezeAmt, FreezeThreshMul, FrostDurBonus); }
             if (!remote) Game.I?.DamageWorld(at, rad, dmg);
             Game.I?.SpawnFrostShatter(new Vector3(at.X, gy + 0.5f, at.Z), rad);
             Game.I?.VfxRing(new Vector3(at.X, gy + 0.06f, at.Z), col, rad, 0.4f);
@@ -2737,11 +3979,14 @@ public partial class Player : Node3D
     // Glacial Vise: clap two ice walls together over a 10×10 square ahead, crushing foes between them for % of their max HP.
     private void FinFrostWalls(float pow, int t, Color col)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 fwd = AimDir(); fwd.Y = 0; fwd = fwd.LengthSquared() > 0.001f ? fwd.Normalized() : Vector3.Forward;
         var right = new Vector3(fwd.Z, 0, -fwd.X).Normalized();
-        float half = 5f * S.SpellArea;                  // a 10×10 square (scaled by area cards)
+        float half = (5f + 0.6f * s1) * S.SpellArea;                          // Stat② Wide Vise
         Vector3 center = GlobalPosition + fwd * (half + 1.5f);
-        float pct = Mathf.Min(0.07f, 0.02f + t * 0.012f);   // 2% (common) → ~7% (legendary) of max HP
+        float pct = Mathf.Min(0.12f, 0.02f + 0.008f * s0);                    // Stat① Crush: +0.8% max-HP / stack
+        float slowF = Mathf.Max(0.25f, 0.5f - 0.05f * s2);                    // Stat③ Rimebite
+        float clapBonus = e0 > 0 ? Base() * (0.6f + 0.6f * e0) : 0f;          // Evo A Shatter Clap
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
@@ -2749,12 +3994,13 @@ public partial class Player : Node3D
             float af = Mathf.Abs(rel.Dot(fwd)), ar = Mathf.Abs(rel.Dot(right));
             if (af < half + e.Radius && ar < half + e.Radius)
             {
-                e.Hurt(e.MaxHp * pct + Base() * 0.5f * pow, DamageType.Frost, true);   // % max HP + a small flat floor
-                e.Slow(2f, 0.5f);
+                if (e1 > 0) e.AddFreeze(e.FreezeThreshold * (0.6f + 0.15f * e1), FreezeThreshMul, FrostDurBonus);   // Evo B Absolute Vise: freeze trapped foes
+                e.Hurt(e.MaxHp * pct + Base() * 0.5f + clapBonus, DamageType.Frost, true);   // % max HP + flat floor (+ clap bonus)
+                e.Slow(2f, slowF);
                 ComboFromSource();
             }
         }
-        Game.I.DamageWorld(center, half, Base() * 0.5f * pow);
+        Game.I.DamageWorld(center, half, Base() * 0.5f);
         SpawnFrostWalls(center, fwd, right, half, col);
         Game.I.NetMgr?.BroadcastVfx(56, center, fwd, half, 0f, col);   // allies see the walls slam
         CamKick(0.6f);
@@ -2787,22 +4033,43 @@ public partial class Player : Node3D
 
     private void FinCrimsonRush(float pow, int t)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 fwd = -_cam.GlobalTransform.Basis.Z; fwd.Y = 0; fwd = fwd.Normalized();
-        float dist = 9f + t * 2.5f + pow * 2f;
-        float dmg = Base() * (0.6f + 0.15f * t) * pow;
+        float dist = 9f + 2.5f * s1 + pow * 2f;            // Stat② Momentum: distance
+        float dmg = Base() * 0.6f * (1f + 0.18f * s0);     // Stat① Onslaught
         _rushDur = 0.30f; _rushDist = dist; _rushDir = fwd; _rushT = _rushDur; _rushWind = false;   // glide forward over the duration (no wind gusts — this is blood) (NEW)
         if (_inWaterBody) { _rushT = 0f; _rushDist = 0f; }   // no movement-dash combos while wading/swimming (NEW)
         _iframe = Mathf.Max(_iframe, _rushDur + 0.15f);                          // immune while riding the wave
         // the wave itself carries the damage + knockback, travelling with her
-        var wave = new BloodWave
+        void Wave(Vector3 at, float scl)
         {
-            Dir = fwd, Dmg = dmg, Knock = 2.5f + 0.6f * t,
-            Width = (5f + t) * S.SpellArea, Speed = dist / _rushDur, Range = dist + 1f, SlowDur = 1.2f, BanksStack = true,
-            ShieldChance = Mathf.Min(0.75f, 0.20f + 0.15f * t),   // (NEW) per foe struck: 20% common → 35% uncommon → 50% rare (returns a blood shield)
-            Gush = true                                            // (NEW) blood gush on each hit + splatter at the end of the ride
-        };
-        Game.I.AddChild(wave);
-        wave.GlobalPosition = new Vector3(GlobalPosition.X, 0.5f, GlobalPosition.Z) + fwd * 1.5f;
+            var wave = new BloodWave
+            {
+                Dir = fwd, Dmg = dmg * scl, Knock = 2.5f + 0.6f * s1,
+                Width = (5f + s1) * S.SpellArea, Speed = dist / _rushDur, Range = dist + 1f, SlowDur = 1.2f, BanksStack = true,
+                ShieldChance = Mathf.Min(0.75f, 0.20f + 0.11f * s2),   // Stat③ Bulwark: blood-shield return chance
+                Gush = true                                            // blood gush on each hit + splatter at the end of the ride
+            };
+            Game.I.AddChild(wave);
+            wave.GlobalPosition = new Vector3(at.X, 0.5f, at.Z) + fwd * 1.5f;
+        }
+        Wave(GlobalPosition, 1f);
+        for (int i = 1; i <= e1; i++)   // Leg Tsunami: +1 chasing wave each stack
+        {
+            var origin = GlobalPosition;
+            var tw = CreateTween(); tw.TweenInterval(0.22f * i);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Wave(origin, 0.7f); }));
+        }
+        if (e0 > 0)   // Epic Gore Trail: a bleeding trail laid along the dash line
+        {
+            int drops = 2 + e0;
+            for (int i = 0; i < drops; i++)
+            {
+                var tp = GlobalPosition + fwd * (dist * (i + 0.5f) / drops);
+                var gf = new GroundField { Type = FieldType.Hex, Radius = 1.8f, Dur = 2f + 0.3f * e0, Power = Base() * 0.12f * e0, DType = DamageType.Blood, TintColor = DamageTypes.Col(DamageType.Blood), FromCombo = true, RotDps = Base() * 0.06f * e0 };
+                Game.I.AddChild(gf); gf.GlobalPosition = new Vector3(tp.X, 0.04f, tp.Z);
+            }
+        }
         Ring(GlobalPosition, DamageTypes.Col(DamageType.Blood), 4f, 0.4f);
         CamKick(0.5f);
     }
@@ -2811,10 +4078,13 @@ public partial class Player : Node3D
     // Each hex applied banks a Blood Stack.
     private void FinBloodCurse(float pow, int t)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         Vector3 o = _cam.GlobalPosition;
         Vector3 fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();
-        float reach = 12f, cosArc = 0.6f;
-        int jumps = t;   // common (t=0) = no bounce
+        float reach = 12f * S.SpellArea, cosArc = Mathf.Max(0.35f, 0.6f - 0.04f * s1);   // Stat② Wide Maw
+        int jumps = s2 + (e0 > 0 ? e0 : 0);                            // Stat③ Contagion (+ Epic Plague spread range)
+        float markAmp = S.MarkAmp * (e0 > 0 ? 1f + 0.15f * e0 : 1f);   // Epic Plague: hex potency
+        float cdmg = Base() * 0.8f * (1f + 0.18f * s0);                // Stat① Miasma
         int hexed = 0;
         bool curseKill = false;
         foreach (var e in Game.I.Enemies.ToArray())
@@ -2823,8 +4093,9 @@ public partial class Player : Node3D
             var to = e.GlobalPosition - o; float d = to.Length();
             if (d > reach + e.Radius) continue;
             if (fwd.Dot(to / Mathf.Max(d, 0.001f)) < cosArc) continue;
-            e.Hurt(Base() * (0.8f + 0.15f * t) * pow, DamageType.Blood, true);
-            e.Mark(3f, S.MarkAmp, jumps);
+            e.Hurt(cdmg, DamageType.Blood, true);
+            e.Mark(3f, markAmp, jumps);
+            if (e1 > 0) Heal(cdmg * 0.03f * e1);   // Leg Exsanguinate: cursed foes bleed HP into your pool
             ComboFromSource();
             hexed++;
             if (e.Dead) curseKill = true;
@@ -2882,6 +4153,7 @@ public partial class Player : Node3D
     public int GrabbedBy = 0;   // (NEW) Taker NetId holding this player (0 = free); locks input + snaps to the grasp
     public void Stun(float dur, Vector3? src = null)
     {
+        if (MenuShielded || FullyImmune) return;   // (MP) no stun-lock while menuing in the bubble; Divinity/Faith Shield are total immunity
         StunT = Mathf.Max(StunT, dur);
         HurtT = 0.7f;
         if (src.HasValue) { DmgDirWorld = src.Value - GlobalPosition; DmgDirWorld.Y = 0; DmgDirT = 1.2f; }
@@ -2895,6 +4167,7 @@ public partial class Player : Node3D
         Shield = Mathf.Max(0f, Shield - MaxShield * frac);
         _shieldT = (Shield <= 0.01f) ? S.ShieldDelay * 2.4f : S.ShieldDelay;
         HurtT = 0.7f;
+        if (Shield <= 0.01f) { ShieldBreakT = 0.6f; HurtFlash = Mathf.Max(HurtFlash, 0.45f); Game.I.Sfx?.ShieldBreak(); }   // (NEW) dispel emptied the shield
         if (src.HasValue) { DmgDirWorld = src.Value - GlobalPosition; DmgDirWorld.Y = 0; DmgDirT = 1.2f; }
         Game.I.Sfx?.Thunder();
     }
@@ -2902,7 +4175,8 @@ public partial class Player : Node3D
     public void OnHit(Enemy e, bool killed, Bolt b)
     {
         if (b == null) return;
-        OnHitCore(e, killed, b.Dmg, b.DType, b.Normal, b.Charged, b.ComboShot);
+        OnHitCore(e, killed, b.Dmg, b.DType, b.Normal, b.Charged, b.ComboShot, b.Crit);
+        if (b.ArcaneBurst && ArcaneWitch && e != null) MarkArcane(e);   // (OVERHAUL) EVERY arcane bolt marks its target — up to 3 foes per left-click
         // Divine "Twin Light": a Holy mote forks to nearby foes on hit (forked motes don't re-fork)
         if (MoteFork > 0 && DivineWitch && b.Normal && b.DType == DamageType.Holy && !b.Forked && Game.I != null)
         {
@@ -2922,22 +4196,23 @@ public partial class Player : Node3D
     }
 
     // bolt-free hit (used by the holy ray and other non-projectile attacks)
-    public void OnHitDirect(Enemy e, bool killed, float dmg, DamageType dt)
-        => OnHitCore(e, killed, dmg, dt, normal: false, charged: true, combo: true);
+    public void OnHitDirect(Enemy e, bool killed, float dmg, DamageType dt, bool crit = false)
+        => OnHitCore(e, killed, dmg, dt, normal: false, charged: true, combo: true, crit: crit);
 
     // bolt-free NORMAL hit — for melee/instant primaries (e.g. the Gale punch). Registers as a normal attack so it
     // restores mana on hit (S.ManaGain) just like every other witch's primary, instead of being treated as charged. (NEW)
     public void OnHitDirectNormal(Enemy e, bool killed, float dmg, DamageType dt)
         => OnHitCore(e, killed, dmg, dt, normal: true, charged: false, combo: true);
 
-    private void OnHitCore(Enemy e, bool killed, float dmg, DamageType dt, bool normal, bool charged, bool combo)
+    private void OnHitCore(Enemy e, bool killed, float dmg, DamageType dt, bool normal, bool charged, bool combo, bool crit = false)
     {
         DmgWindow += dmg;   // shared with allies as ult charge
+        if (FervorWildfire > 0 && EmberFervorT > 0f && e != null && !e.Dead) e.AddBurn(1f, Base() * 0.05f * FervorWildfire, Base() * 3.2f, 0f, Game.I.LocalPeer);   // (OVERHAUL) Ember Fervor · Wildfire: your hits ignite
         var _st = Game.I.MyStats;   // (NEW) end-of-run tally (kills are host-authoritative — tracked in Enemy.Die, not here)
         _st.DamageDealt += dmg;
         if (dmg > _st.BiggestHit) _st.BiggestHit = dmg;
         if (e != null && e.IsBoss) _st.BossDamage += dmg;
-        if (Ult != UltKind.None && !UltActive)
+        if (Ult != UltKind.None && !UltActive && UltLingerT <= 0f && _rushDashLingerT <= 0f)   // no recharge while a lingering ult effect is up (fields, transforms) OR a rush-dash field still burns — avoids the recharge-mid-ult feedback loop
         {
             float k = Mathf.Min(0.022f, dmg * 0.0004f);   // capped per hit — no longer runs away with damage scaling
             if (dt == DamageType.Lunar && Game.I.IsNight && NightAffinity) k *= 1.6f;   // her lunar ult also charges faster at night
@@ -2955,6 +4230,7 @@ public partial class Player : Node3D
             _eclipseMax = Mathf.Max(_eclipseMax, UltActiveT);
         }
         if (killed) StormformOnKill();   // a kill while Stormform is up extends it (NEW)
+        if (killed && OverchargeActive && ModArcUnbound) UltActiveT = Mathf.Min(22f, UltActiveT + 0.5f);   // Unbound: kills extend Overcharge
         // (NEW) on-kill legendary bursts — throttled so an AoE-clear frame can't spam StormForce
         if (killed && _killProcCd <= 0f && e != null && GodotObject.IsInstanceValid(e) && (GravityWell || Bloodbath))
         {
@@ -2977,8 +4253,24 @@ public partial class Player : Node3D
         }
         if (normal) AddMana(S.ManaGain);
         if (killed && charged) AddMana(0.5f);
-        if (_chargedRefund && charged) { AddMana(1f); _chargedRefund = false; }   // right-click pays back a mana when it connects
+        if (_chargedRefund && charged) { AddMana(0.5f); _chargedRefund = false; }   // (EXPERIMENT) right-click returns 0.5 on connect (net −0.5 vs the 1 it cost)
         if (S.Lifesteal > 0) { Heal(dmg * S.Lifesteal); if (CrimsonWitch) _st.Highlight += dmg * S.Lifesteal; }   // Crimson highlight = health leeched
+        if (crit && ArcaneWitch && dmg > 0f && !Downed) Heal(dmg * (ArcaneCritHeal + ArcaneCritHealBonus));   // (NEW) Arcane passive: her crits heal her a slice of the damage
+        if (killed && ArcaneChainReaction && ArcaneWitch && dt == DamageType.Arcane && !_inArcaneNova && e != null && GodotObject.IsInstanceValid(e))   // legendary: an arcane kill bursts in a nova
+        {
+            _inArcaneNova = true;   // guard: a nova's own kills can't spawn nested novas (bounds the cascade)
+            float nr = 5.5f * S.SpellArea, nd = Base() * 1.2f * ComboMul() * ArcanePowerMul; var np = e.GlobalPosition;
+            foreach (var o in Game.I.Enemies.ToArray())
+            {
+                if (o == null || o.Dead || o == e || !GodotObject.IsInstanceValid(o) || Flat(o, np) > nr + o.Radius) continue;
+                bool nc = RollCrit(); float d = nd; if (nc) d *= CritMult();
+                o.Hurt(d, DamageType.Arcane, true, nc); OnHitDirect(o, o.Dead, d, DamageType.Arcane, nc);
+            }
+            Game.I.DamageWorld(np, nr, nd);
+            Game.I.SpawnArcaneRupture(np + Vector3.Up * 0.5f, nr);
+            Game.I.NetMgr?.BroadcastVfx(79, np + Vector3.Up * 0.5f, Vector3.Zero, nr, 0f, DamageTypes.Col(DamageType.Arcane));
+            _inArcaneNova = false;
+        }
         if (CrimsonWitch && Game.I != null && dmg > 0f)   // (NEW) lone-target sustain: if only ONE enemy is in her aura, damaging it heals 10%→(scales w/ level) of the damage
         {
             int inAura = 0;
@@ -2997,6 +4289,7 @@ public partial class Player : Node3D
             {
                 if (FinMeta.Passive(f.Type) || f.Armed) continue;
                 if (f.Type == FinType.EmberFervor && EmberFervorActive) { f.Charge = 0; continue; }   // (NEW) can't rebuild Ember Fervor while its buff is up
+                if (f.Type == FinType.FireWall && FireWallT > 0f) { f.Charge = 0; continue; }          // (NEW) can't rebuild Ring of Fire until the active wall expires
                 f.Charge++;
                 if (f.Charge >= f.Every) { f.Armed = true; f.Window = 3.2f; ProcFlash = 0.3f; }
             }
@@ -3024,6 +4317,23 @@ public partial class Player : Node3D
         if (t == ModType.HexMark) { S.MarkJumps = (int)r + 1; S.MarkAmp = 1.25f + 0.03f * mag; }
     }
 
+    // ===== (OVERHAUL) per-ability upgrade trees — path 0-2 = the 3 stat paths, 3-4 = the 2 evolutions; each stacks to UpgCap =====
+    public const int UpgCap = 4;
+    public void UpgradeMod(ModType t, int path)
+    {
+        var m = Mods.Find(x => x.Type == t); if (m == null) return;
+        if (path >= 0 && path < 3) m.Stat[path] = Mathf.Min(UpgCap, m.Stat[path] + 1);
+        else if (path >= 3 && path < 5) m.Evo[path - 3] = Mathf.Min(UpgCap, m.Evo[path - 3] + 1);
+    }
+    public void UpgradeFin(FinType t, int path)
+    {
+        var f = Fin.Find(x => x.Type == t); if (f == null) return;
+        if (path >= 0 && path < 3) f.Stat[path] = Mathf.Min(UpgCap, f.Stat[path] + 1);
+        else if (path >= 3 && path < 5) f.Evo[path - 3] = Mathf.Min(UpgCap, f.Evo[path - 3] + 1);
+    }
+    public int ModUpg(ModType t, int path) { var m = Mods.Find(x => x.Type == t); if (m == null) return 0; return path < 3 ? m.Stat[path] : m.Evo[path - 3]; }
+    public int FinUpg(FinType t, int path) { var f = Fin.Find(x => x.Type == t); if (f == null) return 0; return path < 3 ? f.Stat[path] : f.Evo[path - 3]; }
+
     public void ApplyChargedMods(Vector3 pos)
     {
         Game.I.PlayerSound(pos, 2.4f);   // charged right-click noise (2nd loudest)
@@ -3032,109 +4342,400 @@ public partial class Player : Node3D
             float mag = m.Mag;
             switch (m.Type)
             {
-                case ModType.Frost:
-                    foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, pos) < 8f) e.Slow(3f, Mathf.Clamp(0.6f - 0.05f * mag, 0.3f, 0.6f));
-                    Ring(pos, DamageTypes.Col(DamageType.Frost), 7f, 0.4f);
-                    Game.I.SpawnGroundSpikes(pos, 7f, 12, DamageTypes.Col(DamageType.Frost), 1.4f); Game.I.Sfx?.ModFrost(pos); break;
+                case ModType.FrostWall:
+                    SpawnFrostWallMod(pos, m); break;
                 case ModType.Bramble:
-                    foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, pos) < 7f) e.Root(1.6f + 0.3f * mag);
-                    Ring(pos, DamageTypes.Col(DamageType.Nature), 6f, 0.45f);
-                    Game.I.SpawnBramblePatch(pos, 6.5f, 3f); Game.I.Sfx?.ModBramble(pos); break;
-                case ModType.Sunder:
-                    float d = Base() * 0.9f * (0.8f + 0.1f * mag), rad = 7f + mag;
-                    foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, pos) < rad && !Game.I.SightBlocked(pos, e.GlobalPosition)) e.Hurt(d, DamageType.Ember, false);
-                    Game.I.DamageWorld(pos, rad, d);   // (NEW) AoE breaks props too
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float rootDur = 1.6f + 0.4f * s0;                  // Stat① Snare
+                    float patchR = (6.5f + 0.8f * s1) * S.SpellArea;   // Stat② Thornfield
+                    float patchDur = 3f + s2;                          // Stat③ Persistence
+                    foreach (var e in Game.I.Enemies.ToArray())
+                        if (!e.Dead && Flat(e, pos) < patchR) { e.Root(rootDur); if (e0 > 0) e.Hurt(Base() * (0.5f + 0.4f * e0), DamageType.Nature, false); }   // Epic Thorn Snap: burst on spawn
+                    Ring(pos, DamageTypes.Col(DamageType.Nature), patchR, 0.45f);
+                    Game.I.SpawnBramblePatch(pos, patchR, patchDur);
+                    for (int i = 1; i <= e1; i++)   // Leg Overgrowth: the patch spreads over time
+                    {
+                        float gr = patchR * (1f + 0.35f * i);
+                        var tw = CreateTween(); tw.TweenInterval(0.4f * i);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) { Game.I.SpawnBramblePatch(pos, gr, patchDur * 0.7f); foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, pos) < gr) e.Root(rootDur * 0.7f); } }));
+                    }
+                    Game.I.Sfx?.ModBramble(pos);
+                    break;
+                }
+                case ModType.Sunder:   // (OVERHAUL) stack-driven: cleave / shockwave / cinders + Shatter / Detonation
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float d = Base() * 0.9f * (0.8f * (1f + 0.2f * s0)), rad = (7f + 0.8f * s1) * S.SpellArea;   // Stat① Cleave / ② Shockwave
+                    float sBurn = Base() * 0.06f * s2 + (e0 > 0 ? Base() * 0.08f * (1f + 0.4f * e0) : 0f);          // Stat③ Cinders + Evo A Shatter (adds burn)
+                    foreach (var e in Game.I.Enemies.ToArray())
+                    {
+                        if (e.Dead || Flat(e, pos) >= rad || Game.I.SightBlocked(pos, e.GlobalPosition)) continue;
+                        e.Hurt(d, DamageType.Ember, false);
+                        if (sBurn > 0f) e.AddBurn(1f, sBurn, Base() * 3.2f, 0f, Game.I.LocalPeer);
+                        if (e1 > 0) e.AddBurn(e.LivingBombThreshold, Mathf.Max(sBurn, Base() * 0.08f), Base() * 3.2f * (1f + 0.3f * e1), 0f, Game.I.LocalPeer);   // Evo B Detonation: instant Living Bomb
+                    }
+                    Game.I.DamageWorld(pos, rad, d);
                     Ring(pos, DamageTypes.Col(DamageType.Ember), rad, 0.4f);
                     Game.I.SpawnEmberBurst(pos, rad); Game.I.Sfx?.ModEmber(pos); break;
+                }
                 case ModType.Moonbeam:
-                    var f = new GroundField { Type = FieldType.Moon, Radius = 3.2f, Dur = 6f, Power = Base() * 0.8f, DType = DamageType.Lunar };
-                    Game.I.AddChild(f); f.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
-                    Game.I.SpawnLightPillar(pos, DamageTypes.Col(DamageType.Lunar).Lerp(Colors.White, 0.3f), 3.2f, 16f, 0.6f); Game.I.Sfx?.ModChime(pos); break;
-                case ModType.HexMark:
-                    Enemy best = null; float bd = 1e9f;
-                    foreach (var e in Game.I.Enemies.ToArray()) { if (e.Dead) continue; float dd = Flat(e, pos); if (dd < 8f && dd < bd) { bd = dd; best = e; } }
-                    best?.Mark(3f, S.MarkAmp, S.MarkJumps);
-                    Game.I.SpawnGroundSigil(pos, 4f, DamageTypes.Col(DamageType.Curse)); Ring(pos, DamageTypes.Col(DamageType.Curse), 4f, 0.4f); Game.I.Sfx?.ModCurse(pos); break;
-                case ModType.Consecrate:
-                    var cf = new GroundField { Type = FieldType.Heal, HealAllies = true, EnemyDmg = Base() * (0.4f + 0.08f * mag), Radius = 3.4f, Dur = 5f, Power = S.MaxHp * 0.02f, DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true };
-                    Game.I.AddChild(cf); cf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
-                    Game.I.SpawnGroundSigil(pos, 3.4f, DamageTypes.Col(DamageType.Holy)); Game.I.SpawnLightPillar(pos, DamageTypes.Col(DamageType.Holy), 3.4f, 13f, 0.55f); Game.I.Sfx?.ModHoly(pos); break;
-                case ModType.Smite:
-                    Enemy sm = null; float sd = 1e9f;
-                    foreach (var e in Game.I.Enemies.ToArray()) { if (e.Dead) continue; float dd = Flat(e, pos); if (dd < 10f && dd < sd) { sd = dd; sm = e; } }
-                    if (sm != null)
-                    {
-                        sm.Hurt(Base() * (1.4f + 0.2f * mag), DamageType.Holy, false);
-                        sm.Slow(2f, 0.5f);
-                        Lance(sm.GlobalPosition);
-                        Game.I.Sfx?.ModSmite(sm.GlobalPosition);
-                        Heal(S.MaxHp * 0.015f);
-                    }
-                    break;
-                case ModType.Hemorrhage:
-                    foreach (var e in Game.I.Enemies.ToArray())
-                        if (!e.Dead && Flat(e, pos) < 6.5f && !Game.I.SightBlocked(pos, e.GlobalPosition)) e.Bleed(Base() * (0.25f + 0.05f * mag), 4f, false);
-                    Ring(pos, DamageTypes.Col(DamageType.Blood), 6f, 0.4f);
-                    Game.I.SpawnBloodMist(pos, 6.5f); Game.I.Sfx?.ModBlood(pos); break;
-                case ModType.CrimsonPool:
-                    var cp = new GroundField { Type = FieldType.Hex, Radius = 4f + 0.3f * mag, Dur = 5f, Power = Base() * (0.4f + 0.06f * mag), DType = DamageType.Blood, TintColor = DamageTypes.Col(DamageType.Blood), FromCombo = true, SlowMul = 0.6f, GrantsBlood = true };
-                    Game.I.AddChild(cp); cp.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
-                    Game.I.SpawnBloodMist(pos, 4f); Game.I.Sfx?.ModPour(pos); break;
-                case ModType.SanguineSpikes:
-                    float sr = 6f + mag, sdmg = Base() * (0.7f + 0.1f * mag);
-                    int sgHits = 0;
-                    foreach (var e in Game.I.Enemies.ToArray())
-                        if (!e.Dead && Flat(e, pos) < sr && !Game.I.SightBlocked(pos, e.GlobalPosition)) { e.Hurt(sdmg, DamageType.Blood, false); BloodReward(0.34f); sgHits++; }
-                    Game.I.DamageWorld(pos, sr, sdmg);   // (FIX) AoE breaks props too
-                    if (sgHits > 0) Game.I.NetMgr?.BloodAlliesNear(pos, 9999f, 0.34f * sgHits);   // blood AoE shares stacks with all wardens
-                    Ring(pos, DamageTypes.Col(DamageType.Blood), sr, 0.4f);
-                    Game.I.SpawnGroundSpikes(pos, sr, 14, DamageTypes.Col(DamageType.Blood), 1.1f); Game.I.Sfx?.ModSpike(pos); break;
-                case ModType.Implosion:   // a lingering vortex that drags survivors in over a few seconds — less burst, much stronger pull (NEW)
                 {
-                    float irad = 8f + mag;
-                    float idmg = Base() * (0.35f + 0.06f * mag);   // reduced initial hit (was 0.8 + 0.1*mag)
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float mpow = Base() * 0.8f * (1f + 0.18f * s0);   // Stat① Radiance
+                    float mrad = 3.2f + 0.6f * s1;                     // Stat② Wellspring (×SpellArea applied in field _Ready)
+                    float mdur = 6f + 1.2f * s2;                       // Stat③ Waning
+                    float pull = e1 > 0 ? 1.6f + 0.8f * e1 : 0f;      // Leg Lunar Tide: drag foes to centre
+                    void Well(Vector3 wp)
+                    {
+                        var wf = new GroundField { Type = FieldType.Moon, Radius = mrad, Dur = mdur, Power = mpow, DType = DamageType.Lunar, Pull = pull };
+                        Game.I.AddChild(wf); wf.GlobalPosition = new Vector3(wp.X, 0.04f, wp.Z);
+                        Game.I.SpawnLightPillar(wp, DamageTypes.Col(DamageType.Lunar).Lerp(Colors.White, 0.3f), mrad, 16f, 0.6f);
+                    }
+                    Well(pos);
+                    for (int i = 1; i <= e0; i++)   // Epic Twin Wells: +1 well each stack
+                    {
+                        float a = i / (float)Mathf.Max(1, e0) * Mathf.Tau;
+                        Well(pos + new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a)) * (mrad * 1.3f));
+                    }
+                    Game.I.Sfx?.ModChime(pos);
+                    break;
+                }
+                case ModType.HexMark:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float amp = 1.25f + 0.1f * s0;                 // Stat① Vulnerability
+                    int jumps = 1 + s1;                            // Stat② Contagion
+                    float mrange = (8f + 2f * s2) * S.SpellRange;  // Stat③ Far Curse: range
+                    float mdur = 3f + s2;                          // Stat③ Far Curse: duration
+                    float doom = e1 > 0 ? Base() * (0.8f + 0.5f * e1) : 0f;   // Leg Doombrand: on-death detonation
+                    int marks = 1 + e0;                            // Epic Spreading Mark: also mark extra nearby foes
+                    var pool = new System.Collections.Generic.List<Enemy>();
+                    foreach (var e in Game.I.Enemies.ToArray()) if (e != null && !e.Dead && Flat(e, pos) < mrange) pool.Add(e);
+                    pool.Sort((a, b) => Flat(a, pos).CompareTo(Flat(b, pos)));
+                    for (int i = 0; i < marks && i < pool.Count; i++) pool[i].Mark(mdur, amp, jumps, doom);
+                    Game.I.SpawnGroundSigil(pos, 4f, DamageTypes.Col(DamageType.Curse)); Ring(pos, DamageTypes.Col(DamageType.Curse), 4f, 0.4f); Game.I.Sfx?.ModCurse(pos);
+                    break;
+                }
+                case ModType.Consecrate:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float crad = 3.4f + 0.6f * s1;   // Stat② Sanctum (×SpellArea in field _Ready)
+                    var cf = new GroundField { Type = FieldType.Heal, HealAllies = true,
+                        EnemyDmg = Base() * 0.4f * (1f + 0.18f * s0),   // Stat① Wrath
+                        Radius = crad, Dur = 5f,
+                        Power = S.MaxHp * 0.02f * (1f + 0.15f * s2),    // Stat③ Grace: ally-heal power
+                        DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true,
+                        DeathBurst = e1 > 0 ? Base() * (0.8f + 0.5f * e1) : 0f };   // Leg Sanctified: foes dying on it burst
+                    Game.I.AddChild(cf); cf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    if (e0 > 0) { HolyEmpowerT = 5f; HolyEmpowerAmt = 0.07f * e0; }   // Epic Hallowed: consecration empowers your damage
+                    Game.I.SpawnGroundSigil(pos, crad, DamageTypes.Col(DamageType.Holy)); Game.I.SpawnLightPillar(pos, DamageTypes.Col(DamageType.Holy), crad, 13f, 0.55f); Game.I.Sfx?.ModHoly(pos);
+                    break;
+                }
+                case ModType.Smite:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    int targets = 1 + e1;                             // Leg Wrath of Heaven: +1 target each stack
+                    float range = (10f + 1.5f * s1) * S.SpellRange;   // Stat② Far Reach
+                    float smiteDmg = Base() * 1.4f * (1f + 0.18f * s0);   // Stat① Verdict
+                    float slowF = Mathf.Max(0.3f, 0.5f - 0.05f * s2); // Stat③ Retribution: stronger slow
+                    var pool = new System.Collections.Generic.List<Enemy>();
+                    foreach (var e in Game.I.Enemies.ToArray()) if (e != null && !e.Dead && Flat(e, pos) < range) pool.Add(e);
+                    pool.Sort((a, b) => Flat(a, pos).CompareTo(Flat(b, pos)));
+                    for (int i = 0; i < targets && i < pool.Count; i++)
+                    {
+                        var e = pool[i];
+                        e.Hurt(smiteDmg, DamageType.Holy, false);
+                        e.Slow(2f, slowF);
+                        if (e0 > 0) e.Mark(2f * e0, 1.25f, 0);   // Epic Condemn: vuln window (+2s/stack → 8s)
+                        Lance(e.GlobalPosition);
+                    }
+                    if (pool.Count > 0) { Game.I.Sfx?.ModSmite(pool[0].GlobalPosition); Heal(S.MaxHp * (0.015f + 0.005f * s2)); }   // Stat③ Retribution: self-heal
+                    break;
+                }
+                case ModType.Hemorrhage:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float hDps = Base() * 0.25f * (1f + 0.18f * s0);   // Stat① Laceration
+                    float hRad = (6.5f + 0.8f * s1) * S.SpellArea;      // Stat② Spray
+                    float hDur = 4f + s2;                               // Stat③ Festering
+                    float burstMul = 1f + 0.4f * e0;                    // Epic Rupture: death-bursts hit harder
+                    foreach (var e in Game.I.Enemies.ToArray())
+                        if (!e.Dead && Flat(e, pos) < hRad && !Game.I.SightBlocked(pos, e.GlobalPosition)) e.Bleed(hDps, hDur, e1 > 0, 0, burstMul);   // Leg Crimson Plague: rot bleed spreads on death
+                    Ring(pos, DamageTypes.Col(DamageType.Blood), hRad, 0.4f);
+                    Game.I.SpawnBloodMist(pos, hRad); Game.I.Sfx?.ModBlood(pos);
+                    break;
+                }
+                case ModType.CrimsonPool:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    var cpField = new GroundField { Type = FieldType.Hex, Radius = 4f + 0.6f * s1, Dur = 5f,   // Stat② Flood
+                        Power = Base() * 0.4f * (1f + 0.18f * s0),                  // Stat① Coagulate
+                        DType = DamageType.Blood, TintColor = DamageTypes.Col(DamageType.Blood), FromCombo = true,
+                        SlowMul = Mathf.Max(0.35f, 0.6f - 0.05f * s2),              // Stat③ Mire: stronger slow
+                        GrantsBlood = true,
+                        BloodBankMul = 1f + 0.3f * e0,                              // Epic Deep Well: banks/heals faster
+                        RotDps = e1 > 0 ? Base() * 0.1f * e1 : 0f };                // Leg Bloodmire: foes in the pool take bleed
+                    Game.I.AddChild(cpField); cpField.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    Game.I.SpawnBloodMist(pos, 4f); Game.I.Sfx?.ModPour(pos);
+                    break;
+                }
+                case ModType.SanguineSpikes:
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float ssRad = (6f + 0.8f * s1) * S.SpellArea, ssDmg = Base() * 0.7f * (1f + 0.18f * s0);   // Stat②/Stat①
+                    float bloodPer = 0.34f + 0.08f * s2;   // Stat③ Harvest
+                    void Impale(float scl)
+                    {
+                        int hits = 0;
+                        foreach (var e in Game.I.Enemies.ToArray())
+                            if (!e.Dead && Flat(e, pos) < ssRad && !Game.I.SightBlocked(pos, e.GlobalPosition)) { e.Hurt(ssDmg * scl, DamageType.Blood, false); if (e0 > 0) e.Root(0.4f + 0.3f * e0); BloodReward(bloodPer); hits++; }   // Epic Barbs: spikes root
+                        Game.I.DamageWorld(pos, ssRad, ssDmg * scl);
+                        if (hits > 0) Game.I.NetMgr?.BloodAlliesNear(pos, 9999f, bloodPer * hits);
+                        Game.I.SpawnGroundSpikes(pos, ssRad, 14, DamageTypes.Col(DamageType.Blood), 1.1f);
+                    }
+                    Impale(1f);
+                    for (int i = 1; i <= e1; i++)   // Leg Crimson Garden: the spikes persist & re-trigger
+                    {
+                        var tw = CreateTween(); tw.TweenInterval(0.5f * i);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Impale(0.7f); }));
+                    }
+                    Ring(pos, DamageTypes.Col(DamageType.Blood), ssRad, 0.4f); Game.I.Sfx?.ModSpike(pos);
+                    break;
+                }
+                case ModType.Implosion:   // (OVERHAUL) stack-driven vortex: Rend/Event Horizon/Sustained + Crush / Singularity
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float irad = (8f + 0.8f * s1) * S.SpellArea;               // Stat② Event Horizon
+                    float idmg = Base() * 0.35f * (1f + 0.3f * e0);           // opening hit (Epic Crush amplifies)
+                    float idps = Base() * 0.45f * (1f + 0.18f * s0);         // Stat① Rend
+                    float idur = 2.6f + 0.4f * s2;                           // Stat③ Sustained
+                    float pullMul = 2.2f * (e1 > 0 ? 1f + 0.3f * e1 : 1f);   // Leg Singularity: pulls harder
                     var icol = DamageTypes.Col(DamageType.Wind);
-                    Game.I.NetMgr?.StormForce(pos, irad, 2, idmg);                 // a light opening hit (host-authoritative; routes for clients)
-                    // the implosion lingers as a vortex: continuous, extra-strong drag + light grind for its duration
-                    float idur = 2.6f + mag * 0.15f, idps = Base() * (0.45f + 0.05f * mag);
+                    Game.I.NetMgr?.StormForce(pos, irad, 2, idmg);
                     var cyI = new Cyclone(); Game.I.AddChild(cyI);
-                    cyI.Init(this, new Vector3(pos.X, 0f, pos.Z), irad, idur, idps, true, false, 2.2f, suppressVisual: true);   // mechanics only — WindOrb is the look now (NEW LOOK)
+                    cyI.Init(this, new Vector3(pos.X, 0f, pos.Z), irad, idur, idps, true, false, pullMul, suppressVisual: true);
                     var orb = new WindOrb(); Game.I.AddChild(orb);
-                    orb.Init(new Vector3(pos.X, 0f, pos.Z), irad, idur);   // rasengan sphere at center + inward-spiraling gusts across the AoE
-                    Game.I.NetMgr?.BroadcastVfx(15, new Vector3(pos.X, 0f, pos.Z), Vector3.Up, irad, idur, icol);   // allies see the wind orb
+                    orb.Init(new Vector3(pos.X, 0f, pos.Z), irad, idur);
+                    Game.I.NetMgr?.BroadcastVfx(15, new Vector3(pos.X, 0f, pos.Z), Vector3.Up, irad, idur, icol);
+                    if (e1 > 0)   // Leg Singularity: the vortex collapses into a final burst
+                    {
+                        var here = pos; float burst = Base() * (0.8f + 0.6f * e1);
+                        var tw = CreateTween(); tw.TweenInterval(idur);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) { foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, here) < irad) e.Hurt(burst, DamageType.Wind, false); Game.I.DamageWorld(here, irad, burst); Game.I.VfxRing(here, icol, irad, 0.4f); } }));
+                    }
                     Ring(pos, icol, irad, 0.4f);
                     Game.I.Sfx?.ModWind(pos);
                     break;
                 }
-                case ModType.Whirlwind:   // spawn a stationary tornado: grinds foes + jump-pad for all players (NEW)
+                case ModType.Whirlwind:   // (OVERHAUL) stack-driven tornado: Shred/Funnel/Enduring + Launch Pad / Roaming Twister
                 {
-                    float wrad = 3.2f + mag * 0.25f, wdur = 6f + mag * 0.5f, wdps = Base() * (0.5f + 0.08f * mag);
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float wrad = (3.2f + 0.4f * s1) * S.SpellArea;                                   // Stat② Funnel
+                    float wdur = 6f + s2 + (e1 > 0 ? e1 : 0);                                        // Stat③ Enduring (+ Roaming Twister duration)
+                    float wdps = Base() * 0.5f * (1f + 0.18f * s0) * (e0 > 0 ? 1f + 0.15f * e0 : 1f);   // Stat① Shred (+ Launch Pad damage)
                     var pad = new WindPad(); Game.I.AddChild(pad);
                     pad.Init(this, new Vector3(pos.X, 0f, pos.Z), wrad, wdur, wdps, false);
-                    Game.I.NetMgr?.BroadcastVfx(12, new Vector3(pos.X, 0f, pos.Z), Vector3.Up, wrad, wdur, DamageTypes.Col(DamageType.Wind));   // allies get a visual + jump-pad copy
+                    pad.LaunchMul = e0 > 0 ? 1f + 0.25f * e0 : 1f;      // Epic Launch Pad: higher launch
+                    pad.Roam = e1 > 0 ? 2.5f + 1.5f * e1 : 0f;         // Leg Roaming Twister: wanders toward foes
+                    Game.I.NetMgr?.BroadcastVfx(12, new Vector3(pos.X, 0f, pos.Z), Vector3.Up, wrad, wdur, DamageTypes.Col(DamageType.Wind));
                     Ring(pos, DamageTypes.Col(DamageType.Wind), wrad, 0.5f);
                     Game.I.Sfx?.ModWind(pos);
                     break;
                 }
-                case ModType.Meteor:   // (NEW Ember) call down a meteor where the charge lands (Ember witch → two meteors)
+                case ModType.Meteor:   // (OVERHAUL) always-Common base; the upgrade tree's stacks drive damage / blast / descent + the 2 evolutions
                 {
-                    float mrad = 6f + mag, mdmg = Base() * (2.2f + 0.3f * mag) * ComboMul();
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float mrad = (6f + 0.8f * s1) * S.SpellArea;                       // Stat② Blast: +0.8 radius / stack
+                    float mdmg = Base() * (2.2f * (1f + 0.18f * s0)) * ComboMul();      // Stat① Impact: +18% / stack
+                    float fall = Mathf.Max(1.2f, 2.9f - 0.35f * s2);                    // Stat③ Descent: −0.35s fall / stack (snappier)
                     var at = new Vector3(pos.X, Game.I.SurfaceHeight(pos, pos.Y), pos.Z);
-                    Game.I.SpawnEmberMeteor(at, mrad, mdmg, 3 + (int)mag, Base() * 0.09f, Base() * 3.2f, this);   // host-authoritative + broadcasts a ghost (kind 67)
+                    Game.I.SpawnEmberMeteor(at, mrad, mdmg, 3, Base() * 0.09f, Base() * 3.2f, this, fall);   // host-authoritative + broadcasts a ghost (kind 67)
+                    for (int i = 0; i < e0; i++)   // Evo A — Meteor Shower: +1 satellite meteor / stack
+                    {
+                        float a = (i + 0.5f) / e0 * Mathf.Tau + GD.Randf();
+                        var sat = new Vector3(at.X + Mathf.Cos(a) * mrad * 0.8f, at.Y, at.Z + Mathf.Sin(a) * mrad * 0.8f);
+                        Game.I.SpawnEmberMeteor(sat, mrad * 0.5f, mdmg * 0.5f, 2, Base() * 0.09f, Base() * 3.2f, this, fall * 0.9f);
+                    }
+                    if (e1 > 0)   // Evo B — Cataclysm: a lingering re-igniting ember field; damage & duration scale with stacks
+                    {
+                        var field = new GroundField { Type = FieldType.Hex, DType = DamageType.Ember, Radius = mrad * 0.7f,
+                            Dur = 3f + e1 * 1.5f, Power = Base() * (0.3f + 0.15f * e1), TintColor = DamageTypes.Col(DamageType.Ember),
+                            BurnAdd = 1f, BurnPer = Base() * 0.08f, BurnBomb = Base() * 3.2f, BurnOwner = Game.I.LocalPeer, Src = this };
+                        Game.I.AddChild(field); field.GlobalPosition = new Vector3(at.X, 0.05f, at.Z);
+                    }
                     break;
                 }
                 case ModType.Eruption:   // (NEW Ember) molten upheaval + flame ring; knocks back, higher rarity flings the small ones skyward
                 {
-                    float erad = 7f + mag, edmg = Base() * (1.2f + 0.15f * mag), power = 8f + mag * 3f;
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float erad = (7f + 0.8f * s1) * S.SpellArea;                    // Stat② Caldera: +0.8 r / stack
+                    float edmg = Base() * (1.2f * (1f + 0.18f * s0));              // Stat① Magma: +18% / stack
+                    float power = 8f + 2f * s2, flingChance = Mathf.Min(0.9f, 0.2f + 0.18f * s2);   // Stat③ Upthrust: +knockback & fling / stack
+                    void Erupt(Vector3 p)
+                    {
+                        foreach (var e in Game.I.Enemies.ToArray())
+                            if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, p) < erad && !Game.I.SightBlocked(p, e.GlobalPosition))
+                            { e.Hurt(edmg, DamageType.Ember, false); e.AddBurn(1f, Base() * 0.08f, Base() * 3.2f, 0f, Game.I.LocalPeer); }
+                        Game.I.NetMgr?.StormForce(p, erad, 1, power, flingChance);
+                        Game.I.DamageWorld(p, erad, edmg);
+                        Game.I.SpawnMoltenEruption(p, erad);
+                    }
+                    Erupt(pos);
+                    if (e0 > 0)   // Evo A Fissure: a lingering burning crack
+                    {
+                        var fissure = new GroundField { Type = FieldType.Hex, DType = DamageType.Ember, Radius = erad * 0.6f,
+                            Dur = 3f + e0 * 1.2f, Power = Base() * (0.25f + 0.12f * e0), TintColor = DamageTypes.Col(DamageType.Ember),
+                            BurnAdd = 1f, BurnPer = Base() * 0.08f, BurnBomb = Base() * 3.2f, BurnOwner = Game.I.LocalPeer, Src = this };
+                        Game.I.AddChild(fissure); fissure.GlobalPosition = new Vector3(pos.X, 0.05f, pos.Z);
+                    }
+                    for (int i = 1; i <= e1; i++)   // Evo B Volcano: +1 delayed re-eruption / stack
+                    {
+                        var tw = CreateTween(); tw.TweenInterval(0.5f * i);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Erupt(pos); }));
+                    }
+                    break;
+                }
+                case ModType.FrostNova:   // (OVERHAUL) stack-driven: coldsnap / whiteout / deep freeze + Bitter Cold / Flash Freeze
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float nr = (6f + 0.8f * s1) * S.SpellArea;                     // Stat② Whiteout
+                    float ndmg = Base() * (0.6f * (1f + 0.18f * s0));             // Stat① Coldsnap
+                    float freeze = e1 > 0 ? 100f : (1f + 0.6f * s2);             // Stat③ Deep Freeze; Evo B Flash Freeze → instant freeze
+                    void Nova(Vector3 p, float scl)
+                    {
+                        foreach (var e in Game.I.Enemies.ToArray())
+                            if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, p) < nr && !Game.I.SightBlocked(p, e.GlobalPosition))
+                            { e.Hurt(ndmg * scl, DamageType.Frost, false); e.AddFreeze(freeze, FreezeThreshMul, FrostDurBonus); e.Slow(2.5f, 0.5f); }
+                        Game.I.DamageWorld(p, nr, ndmg * scl);
+                        Ring(p, DamageTypes.Col(DamageType.Frost), nr, 0.45f);
+                    }
+                    Nova(pos, 1f);
+                    for (int i = 1; i <= e0; i++)   // Evo A Bitter Cold: +1 delayed pulse / stack
+                    {
+                        var tw = CreateTween(); tw.TweenInterval(0.35f * i);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Nova(pos, 0.6f); }));
+                    }
+                    Game.I.Sfx?.Cast(DamageType.Frost);
+                    break;
+                }
+                case ModType.Spore:   // (OVERHAUL) stack-driven poison cloud + field: Toxin/Billow/Lingering + Bursting Spores/Fungal Bloom
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float pr = 6f + 0.8f * s1;               // Stat② Billow (raw; field _Ready ×SpellArea)
+                    float phit = pr * S.SpellArea;
+                    float pdps = Base() * 0.3f * (1f + 0.18f * s0);   // Stat① Toxin
                     foreach (var e in Game.I.Enemies.ToArray())
-                        if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, pos) < erad && !Game.I.SightBlocked(pos, e.GlobalPosition))
-                        { e.Hurt(edmg, DamageType.Ember, false); e.AddBurn(1f, Base() * 0.08f, Base() * 3.2f, 0f, Game.I.LocalPeer); }
-                    Game.I.NetMgr?.StormForce(pos, erad, 1, power);   // host-authoritative outward+up fling (mass-scaled: small foes fly, big resist)
-                    Game.I.DamageWorld(pos, erad, edmg);
-                    Game.I.SpawnGroundSpikes(pos, erad, 16, new Color(0.32f, 0.13f, 0.06f), 1.6f);   // molten rock heaving up
-                    Game.I.SpawnEmberBurst(pos, erad);   // flame ring bursting outward
-                    Ring(pos, DamageTypes.Col(DamageType.Ember), erad * 1.2f, 0.4f);
-                    Game.I.Sfx?.ModEmber(pos);
+                        if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, pos) < phit && !Game.I.SightBlocked(pos, e.GlobalPosition))
+                        { e.Hurt(Base() * 0.4f, DamageType.Nature, false); e.Poison(pdps, 4f, Game.I.LocalPeer); }
+                    var pf = new GroundField { Type = FieldType.Hex, Radius = pr, Dur = 4f + s2, Power = pdps, DType = DamageType.Nature, TintColor = DamageTypes.Col(DamageType.Nature), FromCombo = true };   // Stat③ Lingering
+                    Game.I.AddChild(pf); pf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    if (e0 > 0)   // Epic Bursting Spores: the cloud detonates when it ends
+                    {
+                        float detR = phit, detDmg = Base() * (0.6f + 0.5f * e0);
+                        var tw = CreateTween(); tw.TweenInterval(4f + s2);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) { foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, pos) < detR) e.Hurt(detDmg, DamageType.Nature, false); Game.I.DamageWorld(pos, detR, detDmg); Game.I.VfxRing(pos, DamageTypes.Col(DamageType.Nature), detR, 0.4f); } }));
+                    }
+                    for (int i = 0; i < e1 && CountEnts() < MaxEnts; i++) SummonEnt();   // Leg Fungal Bloom: spawn sporelings that fight for you
+                    Ring(pos, DamageTypes.Col(DamageType.Nature), phit, 0.4f); Game.I.Sfx?.Cast(DamageType.Nature);
+                    break;
+                }
+                case ModType.Cursefield:   // (OVERHAUL) stack-driven cursed field: Blight/Pall/Enfeeble + Deep Curse / Withering Field
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float cr = 5.5f + 0.8f * s1;             // Stat② Pall (raw; field _Ready ×SpellArea)
+                    float chit = cr * S.SpellArea;
+                    float cdps = Base() * 0.4f * (1f + 0.18f * s0);   // Stat① Blight
+                    var curf = new GroundField { Type = FieldType.Hex, Radius = cr, Dur = 5f, Power = cdps, DType = DamageType.Curse, TintColor = DamageTypes.Col(DamageType.Curse), FromCombo = true,
+                        SlowMul = Mathf.Max(0.3f, 0.7f - 0.06f * s2),         // Stat③ Enfeeble: stronger slow
+                        RotDps = e1 > 0 ? Base() * 0.1f * e1 : 0f };          // Leg Withering Field: foes inside rot
+                    Game.I.AddChild(curf); curf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    float markAmp = e0 > 0 ? 1.2f + 0.1f * e0 : 1f;   // Epic Deep Curse: mark for amplified damage
+                    foreach (var e in Game.I.Enemies.ToArray())
+                        if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, pos) < chit && !Game.I.SightBlocked(pos, e.GlobalPosition))
+                        { e.Hurt(Base() * 0.5f, DamageType.Curse, false); if (e0 > 0) e.Mark(3f, markAmp, 0); }
+                    Ring(pos, DamageTypes.Col(DamageType.Curse), chit, 0.4f); Game.I.Sfx?.Cast(DamageType.Curse);
+                    break;
+                }
+                case ModType.Moonfall:   // (OVERHAUL) stack-driven Lunar nova: Crater/Impact/Moonlight + Afterglow/Nightfall
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float mrBase = 6.5f + 0.8f * s1, mr = mrBase * S.SpellArea;                 // Stat② Impact
+                    float mdmg = Base() * 1.0f * (1f + 0.18f * s0) * (1f + LunarBonus);         // Stat① Crater
+                    void Crater(Vector3 cp, float scl)
+                    {
+                        foreach (var e in Game.I.Enemies.ToArray())
+                            if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, cp) < mr && !Game.I.SightBlocked(cp, e.GlobalPosition))
+                            { bool crit = RollCrit() || GD.Randf() < 0.12f * s2; e.Hurt(mdmg * scl, DamageType.Lunar, true, crit); e.Slow(1.5f, 0.6f); }   // Stat③ Moonlight: extra crit chance
+                        Game.I.DamageWorld(cp, mr, mdmg * scl);
+                        Ring(cp, DamageTypes.Col(DamageType.Lunar), mr, 0.55f);
+                    }
+                    Crater(pos, 1f);
+                    if (e0 > 0)   // Epic Afterglow: leaves a lingering lunar scorch
+                    {
+                        var sf = new GroundField { Type = FieldType.Moon, Radius = mrBase * 0.7f, Dur = 2f + 0.8f * e0, Power = mdmg * (0.1f + 0.05f * e0), DType = DamageType.Lunar, FromCombo = true };
+                        Game.I.AddChild(sf); sf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    }
+                    for (int i = 1; i <= e1 && Game.I.IsNight; i++)   // Leg Nightfall: at night it craters again
+                    {
+                        var tw = CreateTween(); tw.TweenInterval(0.3f * i);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Crater(pos, 0.7f); }));
+                    }
+                    Game.I.Sfx?.Cast(DamageType.Lunar);
+                    break;
+                }
+                case ModType.ArcaneVortex:   // (OVERHAUL) stack-driven vortex: Maelstrom/Expanse/Drag + Singularity / Unstable Core
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float vr = 5f + 0.8f * s1;                         // Stat② Expanse (raw; field _Ready ×SpellArea)
+                    float vdps = Base() * 0.5f * (1f + 0.18f * s0);   // Stat① Maelstrom
+                    var vf = new GroundField { Type = FieldType.Hex, Radius = vr, Dur = 5f, Power = vdps, DType = DamageType.Arcane, TintColor = DamageTypes.Col(DamageType.Arcane), FromCombo = true,
+                        SlowMul = Mathf.Max(0.3f, 0.5f - 0.04f * s2),          // Stat③ Drag
+                        Pull = e0 > 0 ? 2f + 1f * e0 : 0f };                   // Epic Singularity: pulls foes inward
+                    Game.I.AddChild(vf); vf.GlobalPosition = new Vector3(pos.X, 0.04f, pos.Z);
+                    var vv = new ArcaneVortexVfx(); Game.I.AddChild(vv); vv.Init(new Vector3(pos.X, 0.04f, pos.Z), vr * S.SpellArea, 5f);   // the swirling lightning look, matched to the field's real radius
+                    if (e1 > 0)   // Leg Unstable Core: collapses into a nova when it ends
+                    {
+                        var here = pos; float nova = Base() * (1.0f + 0.6f * e1), nr = vr * S.SpellArea;
+                        var tw = CreateTween(); tw.TweenInterval(5f);
+                        tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) { foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, here) < nr) e.Hurt(nova, DamageType.Arcane, true); Game.I.DamageWorld(here, nr, nova); Game.I.VfxRing(here, DamageTypes.Col(DamageType.Arcane), nr, 0.4f); } }));
+                    }
+                    Ring(pos, DamageTypes.Col(DamageType.Arcane), vr, 0.4f); Game.I.Sfx?.Release(DamageType.Arcane);
+                    break;
+                }
+                case ModType.ArcStorm:   // (OVERHAUL) stack-driven chain lightning: Voltage/Arc/Conductance + Overcharge / Chain Reaction
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    int jumps = 2 + s1 + e0;                               // Stat② Arc (+ Epic Overcharge: +1 jump / stack)
+                    float stormDmg = Base() * 1.4f * (1f + 0.18f * s0);   // Stat① Voltage
+                    float forkRange = (14f + 2f * s2) * S.SpellRange;      // Stat③ Conductance: fork range
+                    var vis = new System.Collections.Generic.List<Enemy>();
+                    foreach (var e in Game.I.Enemies.ToArray())
+                        if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && GlobalPosition.DistanceTo(e.GlobalPosition) < 45f * S.SpellRange && !Game.I.SightBlocked(EyePos, e.GlobalPosition + Vector3.Up)) vis.Add(e);
+                    if (vis.Count == 0) break;
+                    var cur = vis[Mathf.Clamp((int)(GD.Randf() * vis.Count), 0, vis.Count - 1)];
+                    var visited = new System.Collections.Generic.HashSet<ulong>();
+                    Vector3 from = (_handMeshR != null && GodotObject.IsInstanceValid(_handMeshR)) ? _handMeshR.GlobalPosition : EyePos;
+                    var acol = DamageTypes.Col(DamageType.Arcane);
+                    for (int j = 0; j < jumps && cur != null; j++)
+                    {
+                        visited.Add(cur.GetInstanceId());
+                        var hitPt = cur.GlobalPosition + Vector3.Up * cur.Radius * 0.5f;
+                        bool crit = RollCrit(); float d2 = stormDmg; if (crit) d2 *= CritMult();
+                        cur.Hurt(d2, DamageType.Arcane, true, crit); OnHitDirect(cur, cur.Dead, d2, DamageType.Arcane, crit);
+                        if (e1 > 0) cur.Mark(3f, 1.2f + 0.1f * e1, 0);   // Leg Chain Reaction: struck foes marked for extra chains
+                        Game.I.SpawnArcaneLightning(new System.Collections.Generic.List<Vector3> { from, hitPt }, 0.8f);
+                        Game.I.NetMgr?.BroadcastVfx(78, from, (hitPt - from).Normalized(), (hitPt - from).Length(), 0f, acol);
+                        from = hitPt;
+                        Enemy next = null; float nd = forkRange;
+                        foreach (var e in Game.I.Enemies.ToArray())
+                        {
+                            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || visited.Contains(e.GetInstanceId())) continue;
+                            float dd = e.GlobalPosition.DistanceTo(cur.GlobalPosition); if (dd < nd) { nd = dd; next = e; }
+                        }
+                        cur = next;
+                    }
+                    Game.I.Sfx?.Cast(DamageType.Arcane); Game.I.Sfx?.Thunder();
                     break;
                 }
             }
@@ -3167,7 +4768,7 @@ public partial class Player : Node3D
         ComboT = Now;
         _lastAct = act;                                              // (NEW) so the NEXT hit can see this source
         if (Combo > BestCombo) BestCombo = Combo;
-        if (Ult != UltKind.None && !UltActive) UltCharge = Mathf.Min(1f, UltCharge + 0.004f * UltChargeMul);   // combo also charges the ult
+        if (Ult != UltKind.None && !UltActive && UltLingerT <= 0f && _rushDashLingerT <= 0f) UltCharge = Mathf.Min(1f, UltCharge + 0.004f * UltChargeMul);   // combo also charges the ult (not while a lingering ult effect / rush-dash field is up)
         Game.I?.AccrueCombo(gain);
         if (fresh) { FreshHit = true; FreshT = 0.5f; Game.I.Sfx?.Chord(Combo); Game.I.Hud?.ComboFlourish(act); }
     }
@@ -3309,8 +4910,10 @@ public partial class Player : Node3D
 
     private void SetArm(string kind, float dur) { _animKind = kind; _animT = 0; _animDur = dur; Game.I.NetMgr?.BroadcastArm(kind, dur); }   // (NEW) broadcast → all cast poses sync in MP
 
+    private FinisherSlot _curFin;   // (OVERHAUL) slot currently executing — converted Fin* methods read its Stat/Evo stacks
     private void Execute(FinisherSlot f)
     {
+        _curFin = f;
         int t = Tier(f.Rarity); float pow = f.Pow;
         var col = FinMeta.Col(f.Type);
         switch (f.Type)
@@ -3343,26 +4946,154 @@ public partial class Player : Node3D
             case FinType.FireWall: FinFireWall(pow, t, col); SetArm("raise", 0.45f); break;          // (NEW Ember)
             case FinType.Fireball: FinFireball(pow, t, col); SetArm("thrust", 0.4f); break;          // (NEW Ember)
             case FinType.EmberFervor: FinEmberFervor(pow, t); SetArm("together", 0.45f); break;      // (NEW Ember)
+            case FinType.LunarNova: FinLunarNova(pow, t, col); SetArm("raise", 0.45f); break;          // (NEW Lunar)
+            case FinType.CrescentStorm: FinCrescentStorm(pow, t, col); SetArm("thrust", 0.5f); break;  // (NEW Lunar)
+            case FinType.ArcaneBlink: FinArcaneBlink(pow, t, col); SetArm("flick", 0.3f); break;        // (NEW Arcane)
+            case FinType.ArcaneBlast: FinArcaneBlast(pow, t, col); SetArm("channel", 0.85f); break;      // (NEW Arcane)
         }
+    }
+
+    // ===== Arcane finishers (NEW) — universal =====
+    // A blink: teleport in your move direction (reach 9u common → 23u legendary), leaving a rift at BOTH ends that erupts ~1s later.
+    private void FinArcaneBlink(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float maxDist = 9f + 3f * s2;   // Stat③ Phase: blink distance
+        Vector3 startPos = GlobalPosition;
+        Vector3 dir = InputDir();                                              // blink in the direction you're MOVING
+        if (dir.LengthSquared() < 0.01f) dir = -GlobalTransform.Basis.Z;       // standing still → blink the way you're facing
+        dir.Y = 0f; dir = dir.LengthSquared() > 0.001f ? dir.Normalized() : Vector3.Forward;
+        float dist = maxDist;
+        if (BeamSurfaceHit(GlobalPosition + Vector3.Up * 1.0f, dir, maxDist, out var surf, out _))   // stop just short of a wall in the way
+            dist = Mathf.Max(0f, new Vector2(surf.X - GlobalPosition.X, surf.Z - GlobalPosition.Z).Length() - 0.6f);
+        Vector3 dest = GlobalPosition + dir * dist;
+        float gy = Game.I.SurfaceHeight(dest, GlobalPosition.Y);
+        dest = ClampPos(new Vector3(dest.X, gy, dest.Z));
+        GlobalPosition = dest; _iframe = Mathf.Max(_iframe, 0.3f); _grounded = true; _vy = 0f; _jumps = JumpsMax; _noFall = 0.5f;
+        float rdmg = Base() * 2.2f * (1f + 0.18f * s0) * ComboMul(), rrad = (4f + 0.6f * s1) * S.SpellArea;   // Stat① Rift / Stat② Warp
+        float pull = e1 > 0 ? 3f + 1.5f * e1 : 0f;   // Leg Implode: rifts pull foes in first
+        SpawnArcaneRift(startPos, rrad, rdmg, pull);
+        SpawnArcaneRift(dest, rrad, rdmg, pull);
+        for (int i = 1; i <= e0; i++)   // Epic Triple Rift: extra rifts bloom mid-blink
+        {
+            var mid = startPos.Lerp(dest, i / (float)(e0 + 1));
+            SpawnArcaneRift(mid, rrad * 0.85f, rdmg * 0.8f, pull);
+        }
+        Game.I.SpawnArcaneLightning(new System.Collections.Generic.List<Vector3> { startPos + Vector3.Up, dest + Vector3.Up }, 1f);
+        CamKick(0.4f); Game.I.Sfx?.Cast(DamageType.Arcane);
+    }
+    private void SpawnArcaneRift(Vector3 pos, float radius, float dmg, float pull = 0f) { var r = new ArcaneRift(); Game.I.AddChild(r); r.Init(this, pos, radius, dmg, 1f); r.Pull = pull; }
+    public void ArcaneRiftHit(Enemy e, float dmg)   // called by an ArcaneRift when it detonates
+    {
+        bool crit = RollCrit(); float d = dmg; if (crit) d *= CritMult();
+        e.Hurt(d, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, d, DamageType.Arcane, crit);
+    }
+
+    // Arcane Torrent: a wide raw-arcane beam-burst straight ahead — hits everything in a broad corridor + shoves them back.
+    private void FinArcaneBlast(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        Vector3 eye = EyePos, dir = AimDir();
+        float len = (26f + 4f * s2) * S.SpellRange, halfW = (2.0f + 0.3f * s1) * S.SpellArea;   // Stat③ Distance / Stat② Breadth
+        float dmg = Base() * 3.0f * (1f + 0.18f * s0) * ComboMul(), push = 0.8f + 0.25f * s2;   // Stat① Surge
+        float critBonus = 0.12f * e0, critMulBonus = e0 > 0 ? 1f + 0.1f * e0 : 1f;              // Epic Overcharge: crit ramps
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (!e.RayHitsBody(eye, dir, len, halfW, out _)) continue;   // (FIX) whole-body ray test — was a sphere at mid-body, missing tall foes' heads
+            bool crit = RollCrit() || (critBonus > 0f && GD.Randf() < critBonus); float d = dmg; if (crit) d *= CritMult() * critMulBonus;
+            e.Hurt(d, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, d, DamageType.Arcane, crit);
+            e.Knockback(GlobalPosition, push);
+            if (e1 > 0 && e.MarkT > 0f)   // Leg Cataclysm: chains through conduit-marked foes
+            {
+                int chained = 0;
+                foreach (var o in Game.I.Enemies.ToArray())
+                {
+                    if (chained >= e1) break;
+                    if (o == null || o == e || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
+                    if (e.GlobalPosition.DistanceTo(o.GlobalPosition) < 10f) { o.Hurt(dmg * 0.6f, DamageType.Arcane, true); chained++; }
+                }
+            }
+        }
+        Vector3 start = (_handMeshR != null && GodotObject.IsInstanceValid(_handMeshR)) ? _handMeshR.GlobalPosition : eye + dir * 0.5f;
+        Game.I.SpawnArcaneKamehameha(start, dir, len, halfW, col);
+        Game.I.SpawnArcaneRupture(start + dir * 1.5f, halfW * 1.6f);   // muzzle flare
+        Game.I.NetMgr?.BroadcastVfx(80, start, dir, len, halfW, col);
+        CamKick(0.9f); Game.I.Sfx?.ArcaneBlast(start);   // electric arcane thunder-zap
+    }
+
+    // ===== Lunar finishers (NEW) — Lunar only had Fullmod; these lean into the moon/crescent fantasy =====
+    private void FinLunarNova(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float dmg = Base() * 2.6f * (1f + 0.18f * s0) * (1f + LunarBonus);   // Stat① Waxing
+        float radius = (9f + 1.5f * s1) * S.SpellArea;                        // Stat② Full Moon
+        if (e1 > 0 && Game.I.IsNight) { radius *= 1f + 0.15f * e1; dmg *= 1f + 0.2f * e1; }   // Leg Blood Moon: swells at night
+        float slowDur = 1.6f + 0.3f * s2, slowF = Mathf.Max(0.3f, 0.6f - 0.06f * s2);          // Stat③ Deep Chill
+        void Pulse(float scl)
+        {
+            foreach (var e in Game.I.Enemies.ToArray())
+                if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < radius && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition))
+                { e.Hurt(dmg * scl, DamageType.Lunar, true, RollCrit()); e.Slow(slowDur, slowF); }
+            Game.I.DamageWorld(GlobalPosition, radius, dmg * scl);
+            Ring(GlobalPosition, col, radius * 0.95f, 0.55f);
+        }
+        Pulse(1f);
+        if (e0 > 0)   // Epic Eclipse Echo: a delayed second pulse, stronger per stack
+        {
+            float escl = 0.3f + 0.15f * e0;
+            var tw = CreateTween(); tw.TweenInterval(0.3f);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Pulse(escl); }));
+        }
+        Game.I.Sfx?.Cast(DamageType.Lunar); CamKick(0.5f);
+    }
+    private void FinCrescentStorm(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        int baseCount = 6 + s1, count = baseCount + e1; var aim = AimDir();   // Stat② Gibbous + Leg Waxing Horde orbiters
+        var alive = new System.Collections.Generic.List<Enemy>();
+        foreach (var e in Game.I.Enemies.ToArray()) if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) alive.Add(e);
+        float bladeDmg = Base() * 1.5f * (1f + 0.18f * s0) * (1f + LunarBonus);   // Stat① Keen Edge
+        int pierce = CrescentPierceBonus + s2;                                    // Stat③ Sickle: pierce
+        float size = 0.55f * CrescentSizeMul * (1f + 0.15f * s2);                 // Stat③ Sickle: blade size
+        for (int i = 0; i < count; i++)
+        {
+            bool orbiter = i >= baseCount;   // the extra Waxing Horde blades orbit before loosing
+            float a = (i / (float)count) * Mathf.Tau + 0.3f;
+            var horiz = new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a));
+            var start = GlobalPosition + new Vector3(0, 2.2f, 0) + horiz * 0.6f;
+            var launch = orbiter ? new Vector3(-horiz.Z, 0.4f, horiz.X).Normalized() * 16f : (Vector3.Up * 1.5f + horiz * 1.6f).Normalized() * 20f;
+            var b = SpawnBolt(start, launch, bladeDmg, pierce, size, col, DamageType.Lunar, false, false, false, false, life: 3.6f, fromCombo: true);
+            b.Homing = true; b.HomeSpeed = 34f; b.Turn = 8f; b.HomeDelay = orbiter ? 0.55f : 0.18f + (i % 3) * 0.03f;
+            b.Target = alive.Count > 0 ? alive[i % alive.Count] : null; b.AimFallback = aim;
+            if (e0 > 0) { b.Splinter = e0; b.SplinterDmg = bladeDmg * 0.5f; }   // Epic Splintering Moon: shards on first hit
+        }
+        Ring(GlobalPosition, col, 2.5f, 0.3f); Game.I.Sfx?.Cast(DamageType.Lunar);
     }
 
     // ===== Curse finishers (NEW) — witch-agnostic, but they lean into the curse fantasy =====
     // Soul Reap: a cursed reaping nova that bites harder the more wounded each foe is, and siphons souls to mend you.
     private void FinSoulReap(float pow, int t, Color col)
     {
-        float radius = 8f + t * 0.8f, baseDmg = Base() * 1.2f * pow, healTotal = 0f;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (8f + 0.8f * s1) * S.SpellArea, baseDmg = Base() * 1.2f * (1f + 0.18f * s0), healTotal = 0f;   // Stat②/①
+        float exec = 1.6f + 0.5f * s2;                     // Stat③ Execution: missing-HP scaling
+        float steal = 0.05f * (1f + 0.6f * e0);            // Epic Glut: stronger lifesteal
+        bool killed = false;
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             if (Flat(e, GlobalPosition) >= radius || Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) continue;
             float missing = e.MaxHp > 0f ? Mathf.Clamp(1f - e.Hp / e.MaxHp, 0f, 1f) : 0f;
-            float dmg = baseDmg * (1f + 1.6f * missing);   // reaps the wounded — up to 2.6× on the nearly-dead
+            float dmg = baseDmg * (1f + exec * missing);   // reaps the wounded harder (Execution scales the bonus)
             e.Hurt(dmg, DamageType.Curse, true);
-            healTotal += dmg * 0.05f;
+            healTotal += dmg * steal;
+            if (e.Dead) killed = true;
             SpawnSoulWisp(e.GlobalPosition + Vector3.Up * 0.9f, col);
         }
         Game.I.DamageWorld(GlobalPosition, radius, baseDmg);
-        if (healTotal > 0f) Heal(Mathf.Min(healTotal, S.MaxHp * 0.18f));   // soul harvest, capped
+        if (healTotal > 0f) Heal(Mathf.Min(healTotal, S.MaxHp * (0.18f + 0.1f * e0)));   // soul harvest, capped (Glut raises the cap)
+        if (e1 > 0 && killed && _curFin != null && GD.Randf() < 0.25f * e1) { _curFin.Charge = _curFin.Every; _curFin.Armed = true; }   // Leg Harvest: kills refund the finisher's charge
         Game.I.SpawnScytheVfx(GlobalPosition, AimDir(), radius, col);
         Ring(GlobalPosition, col, radius, 0.5f);
         Game.I.NetMgr?.BroadcastVfx(63, GlobalPosition, new Vector3(AimDir().X, 0f, AimDir().Z), radius, 0f, col);
@@ -3372,24 +5103,28 @@ public partial class Player : Node3D
     // Hex Chains: bind the nearest foes into a temporary shared-pain web — a share of ALL damage any of them takes bleeds to the rest.
     private void FinHexChains(float pow, int t, Color col)
     {
-        float radius = 10f + t * 1f; int maxLinks = 4 + t;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (10f + 1f * s1) * S.SpellArea; int maxLinks = 4 + s1;   // Stat② Weave: reach + link count
+        float share = Mathf.Min(0.85f, 0.4f + 0.08f * s2 + (e1 > 0 ? 0.1f * e1 : 0f));   // Stat③ Sympathy (+ Leg Torment)
+        float slowF = e0 > 0 ? Mathf.Max(0.3f, 0.7f - 0.08f * e0) : 0f;   // Epic Bind: chained foes slowed
         var links = new System.Collections.Generic.List<Enemy>();
         foreach (var e in Game.I.Enemies.ToArray())
             if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < radius && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) links.Add(e);
         links.Sort((a, b) => Flat(a, GlobalPosition).CompareTo(Flat(b, GlobalPosition)));
         if (links.Count > maxLinks) links.RemoveRange(maxLinks, links.Count - maxLinks);
         int group = ++_curseGroupSeq;
-        float burst = Base() * 1.4f * pow;
+        float burst = Base() * 1.4f * (1f + 0.18f * s0);   // Stat① Lash
         foreach (var e in links)
         {
-            e.AddCurse(2f, group, DamageType.Curse, 1.35f, 0.4f);   // tether into a shared-pain group (40% of damage bleeds across)
+            e.AddCurse(2f, group, DamageType.Curse, 1.35f, share);   // tether into a shared-pain group (share of damage bleeds across)
             e.Hurt(burst, DamageType.Curse, true);
+            if (slowF > 0f) e.Slow(2f, slowF);
             SpawnCurseChain(GlobalPosition + Vector3.Up * 1.1f, e.GlobalPosition + Vector3.Up * 0.9f, col);
         }
         Game.I.SpawnGroundSigil(GlobalPosition, radius * 0.8f, col);
         Ring(GlobalPosition, col, radius, 0.5f);
         Game.I.NetMgr?.BroadcastVfx(64, GlobalPosition, Vector3.Zero, radius, 0f, col);
-        Game.I.Sfx?.WitchCackle(GlobalPosition);
+        Game.I.Sfx?.ArcaneBlast(GlobalPosition);   // (was the scratchy WitchCackle) — an electric arcane thunder-zap
     }
 
     // Doom Sigil: brand nearby foes, then a delayed cursed detonation (bigger the more branded). Deferred blast = DoomSigil node.
@@ -3399,15 +5134,17 @@ public partial class Player : Node3D
         flat = flat.LengthSquared() > 0.001f ? flat.Normalized() : Vector3.Forward;
         var at = GlobalPosition + flat * 6f;
         at = new Vector3(at.X, Game.I.SurfaceHeight(at, 1e9f) + 0.05f, at.Z);
-        float radius = 6f + t * 0.7f, dmg = Base() * 2.4f * pow;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (6f + 0.7f * s1) * S.SpellArea, dmg = Base() * 2.4f * (1f + 0.18f * s0);   // Stat②/①
         int branded = 0;
         foreach (var e in Game.I.Enemies.ToArray())
             if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && new Vector2(e.GlobalPosition.X - at.X, e.GlobalPosition.Z - at.Z).Length() < radius + e.Radius)
             { e.AddCurse(1.5f, 0, DamageType.Curse, 1.35f, 0f); branded++; }
-        float mul = 1f + 0.12f * Mathf.Max(0, branded - 1);
-        var sig = new DoomSigil(); Game.I.AddChild(sig); sig.Init(at, radius, dmg * mul, col, this);
+        float mul = 1f + (0.12f + 0.06f * s2) * Mathf.Max(0, branded - 1);   // Stat③ Compounding: per-brand bonus
+        float fuse = Mathf.Max(0.5f, 1.35f - 0.2f * e0);                     // Epic Quickdoom: shorter detonation delay
+        var sig = new DoomSigil(); Game.I.AddChild(sig); sig.Init(at, radius, dmg * mul, col, this, fuse, e1);   // Leg Cataclysm Sigil: chain generations
         Game.I.NetMgr?.BroadcastVfx(65, at, Vector3.Zero, radius, 0f, col);   // allies spawn a Remote ghost sigil (visual only)
-        Game.I.Sfx?.WitchCackle(GlobalPosition);
+        Game.I.Sfx?.ArcaneBlast(at);   // (was the scratchy WitchCackle) — an electric arcane thunder-zap
     }
 
     private void SpawnSoulWisp(Vector3 at, Color col)   // a soul mote drawn back to the caster (Soul Reap heal visual)
@@ -3438,34 +5175,55 @@ public partial class Player : Node3D
     // Ring of Fire: a planted ring of flame that EATS incoming enemy projectiles and burns foes standing in it.
     private void FinFireWall(float pow, int t, Color col)
     {
-        float radius = 5f + t * 0.5f, dur = 4f + t * 0.6f, dps = Base() * 0.5f * pow;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (5f + 0.7f * s1) * S.SpellArea, dur = 2.5f + 0.4f * s2, dps = Base() * 0.5f * (1f + 0.18f * s0);   // Stat① Blaze / ② Wide Ring / ③ Everburn
+        float burnPer = Base() * 0.08f * (1f + 0.4f * e0);   // Evo A Roaring Flames: +40% burn / stack
+        FireWallT = dur;   // block re-arming until the wall burns out
         var center = new Vector3(GlobalPosition.X, Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y) + 0.05f, GlobalPosition.Z);
-        var w = new FireWall { Center = center, Radius = radius, Dur = dur, Dps = dps, BurnPer = Base() * 0.08f, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer };
-        Game.I.AddChild(w); w.GlobalPosition = center;
-        Game.I.RegisterFireRing(center, radius, dur);   // host-side zone that eats enemy projectiles (a client routes it to the host)
-        Game.I.NetMgr?.BroadcastVfx(72, center, Vector3.Zero, radius, dur, col);   // allies render the ring
-        Ring(center, col, radius, 0.5f);
+        void SpawnRing(float r, float d)
+        {
+            var w = new FireWall { Center = center, Radius = r, Dur = dur, Dps = d, BurnPer = burnPer, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer };
+            Game.I.AddChild(w); w.GlobalPosition = center;
+            Game.I.RegisterFireRing(center, r, dur);
+            Game.I.NetMgr?.BroadcastVfx(72, center, Vector3.Zero, r, dur, col);
+            Ring(center, col, r, 0.5f);
+        }
+        SpawnRing(radius, dps);
+        for (int i = 1; i <= e1; i++) SpawnRing(radius * (1f + 0.35f * i), dps * 0.7f);   // Evo B Expanding Inferno: +1 concentric outer ring / stack
         Game.I.Sfx?.Release(DamageType.Ember);
     }
 
     // Fireball: hurl a med-speed fireball at the cursor — heavy direct hit + a medium blast on impact.
     private void FinFireball(float pow, int t, Color col)
     {
-        Vector3 dir = AimDir().Normalized();
-        Vector3 origin = EyePos + dir * 0.6f;
-        float directDmg = Base() * 3.2f * pow * ComboMul(), blastDmg = Base() * 1.6f * pow * ComboMul(), blastR = 4.5f + t * 0.5f;
-        var fb = new Fireball { Dir = dir, Speed = 22f, DirectDmg = directDmg, BlastDmg = blastDmg, BlastRadius = blastR, BurnPer = Base() * 0.09f, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer, Src = this };
-        Game.I.AddChild(fb); fb.GlobalPosition = origin;
-        Game.I.NetMgr?.BroadcastVfx(73, origin, dir, 22f, blastR, col);   // allies render a visual ghost fireball
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float dmgMul = 1f + 0.18f * s0;                                          // Stat① Scorch: +18% direct+blast / stack
+        float directDmg = Base() * 3.2f * dmgMul * ComboMul(), blastDmg = Base() * 1.6f * dmgMul * ComboMul();
+        float blastR = (4.5f + 0.6f * s1) * S.SpellArea;                         // Stat② Detonation: +0.6 radius / stack
+        float burnPer = Base() * 0.09f * (1f + 0.25f * s2);                      // Stat③ Ignition: +25% burn / stack
+        float fbSpeed = 22f * S.ProjSpeed;
+        int shots = 1 + e0;                                                      // Evo A Split Shot: +1 fireball / stack
+        Vector3 baseDir = AimDir().Normalized();
+        for (int i = 0; i < shots; i++)
+        {
+            Vector3 dir = shots == 1 ? baseDir : baseDir.Rotated(Vector3.Up, (i - (shots - 1) * 0.5f) * 0.14f).Normalized();
+            Vector3 origin = EyePos + dir * 0.6f;
+            var fb = new Fireball { Dir = dir, Speed = fbSpeed, DirectDmg = directDmg, BlastDmg = blastDmg, BlastRadius = blastR, BurnPer = burnPer, BurnBomb = Base() * 3.2f, OwnerPeer = Game.I.LocalPeer, Src = this, Cataclysm = e1 };   // Evo B Cataclysm: lingering field on impact
+            Game.I.AddChild(fb); fb.GlobalPosition = origin;
+            Game.I.NetMgr?.BroadcastVfx(73, origin, dir, fbSpeed, blastR, col);
+        }
         Game.I.Sfx?.Cast(DamageType.Ember);
     }
 
     // Ember Fervor: self-buff — crit + move speed for a few seconds; fists/feet blaze; can't recharge until it fades.
     private void FinEmberFervor(float pow, int t)
     {
-        float dur = 5f + t * 0.8f;
-        _emberFervorCrit = (0.1f + t * 0.03f) * pow;    // ~+10% → +22% crit
-        _emberFervorSpeed = (0.15f + t * 0.03f) * pow;  // ~+15% → +27% move
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float dur = 5f + 0.9f * s0;                      // Stat① Frenzy: +0.9s / stack
+        _emberFervorCrit = 0.10f + 0.03f * s1;          // Stat② Fervour: +3% crit / stack
+        _emberFervorSpeed = 0.15f + 0.03f * s2;         // Stat③ Swiftness: +3% move / stack
+        FervorWildfire = e0;                            // Evo A Wildfire: your hits ignite (potency scales with stacks)
+        FervorPhoenix = e1;                             // Evo B Phoenix Heart: heal over the buff (rate scales)
         EmberFervorT = dur; _fervorNetT = 0f;
         ShowFervorFlames(true);
         Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 3f, 0.5f);
@@ -3499,6 +5257,120 @@ public partial class Player : Node3D
         }
     }
 
+    // Arcane witch: raw plasma crackling around her view-model hands at all times — little emissive shards that jitter, flicker,
+    // and tumble, plus a soft arcane glow on each hand. Built lazily on first use; local-view only (first-person hands).
+    private readonly System.Collections.Generic.List<MeshInstance3D> _arcaneHandFx = new();
+    private readonly System.Collections.Generic.List<Vector3> _arcaneHandBase = new();
+    private void UpdateArcaneHandFx(float dt)
+    {
+        if (_arcaneHandFx.Count == 0)
+        {
+            var col = DamageTypes.Col(DamageType.Arcane);
+            foreach (var hand in new[] { _handMeshL, _handMeshR })
+            {
+                if (hand == null || !GodotObject.IsInstanceValid(hand)) continue;
+                hand.AddChild(new OmniLight3D { OmniRange = 1.6f, LightColor = col, LightEnergy = 1.2f, ShadowEnabled = false });
+                for (int i = 0; i < 4; i++)
+                {
+                    var b = new Vector3((GD.Randf() - 0.5f) * 0.16f, (GD.Randf() - 0.5f) * 0.16f, (GD.Randf() - 0.5f) * 0.16f);
+                    var sp = new MeshInstance3D { Mesh = new BoxMesh { Size = Vector3.One * 0.03f }, MaterialOverride = Game.Emissive(col.Lerp(Colors.White, 0.2f), 2.4f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+                    hand.AddChild(sp); sp.Position = b;
+                    _arcaneHandFx.Add(sp); _arcaneHandBase.Add(b);
+                }
+            }
+            if (_arcaneHandFx.Count == 0) return;
+        }
+        for (int i = 0; i < _arcaneHandFx.Count; i++)
+        {
+            var sp = _arcaneHandFx[i];
+            if (sp == null || !GodotObject.IsInstanceValid(sp)) continue;
+            sp.Position = _arcaneHandBase[i] + new Vector3((GD.Randf() - 0.5f) * 0.05f, (GD.Randf() - 0.5f) * 0.05f, (GD.Randf() - 0.5f) * 0.05f);   // crackle jitter
+            sp.Scale = Vector3.One * (GD.Randf() < 0.22f ? 0f : 0.6f + GD.Randf() * 0.9f);   // flicker on/off + size
+            sp.RotationDegrees = new Vector3(GD.Randf() * 360f, GD.Randf() * 360f, GD.Randf() * 360f);
+        }
+    }
+    private void ClearArcaneHandFx()
+    {
+        foreach (var sp in _arcaneHandFx) if (sp != null && GodotObject.IsInstanceValid(sp)) sp.QueueFree();
+        _arcaneHandFx.Clear(); _arcaneHandBase.Clear();
+    }
+
+    // Arcane charge: a growing, crackling orb of raw arcane held between her palms, spitting tiny sparks at her hands + the
+    // air around it — bigger and more violent the longer she charges. Positioned at the midpoint of her two view-model hands.
+    private Node3D _arcaneOrb, _arcaneOrbShards; private StandardMaterial3D _arcaneOrbHalo; private float _arcaneOrbArcT;
+    private void UpdateArcaneChargeOrb(float dt, float amt)
+    {
+        if (amt < 0.02f) { ClearArcaneChargeOrb(); return; }
+        var col = DamageTypes.Col(DamageType.Arcane);
+        if (_arcaneOrb == null || !GodotObject.IsInstanceValid(_arcaneOrb))
+        {
+            _arcaneOrb = new Node3D(); Game.I.AddChild(_arcaneOrb);
+            _arcaneOrb.AddChild(new MeshInstance3D { Mesh = new SphereMesh { Radius = 1f, Height = 2f }, MaterialOverride = Game.ArcaneEnergyMat(), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off });   // shader-driven plasma core
+            var halo = new MeshInstance3D { Mesh = new SphereMesh { Radius = 1.6f, Height = 3.2f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+            _arcaneOrbHalo = new StandardMaterial3D { AlbedoColor = new Color(col.R, col.G, col.B, 0.25f), EmissionEnabled = true, Emission = col, EmissionEnergyMultiplier = 1.6f, Transparency = BaseMaterial3D.TransparencyEnum.Alpha, ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded, CullMode = BaseMaterial3D.CullModeEnum.Disabled };
+            halo.MaterialOverride = _arcaneOrbHalo; _arcaneOrb.AddChild(halo);
+            _arcaneOrbShards = new Node3D(); _arcaneOrb.AddChild(_arcaneOrbShards);
+            var smat = Game.Emissive(col.Lerp(Colors.White, 0.2f), 2.2f);
+            for (int i = 0; i < 6; i++) { var sp = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.12f, Height = 1.8f + GD.Randf(), RadialSegments = 4 }, MaterialOverride = smat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off }; sp.RotationDegrees = new Vector3(GD.Randf() * 360f, GD.Randf() * 360f, GD.Randf() * 360f); _arcaneOrbShards.AddChild(sp); }
+            _arcaneOrb.AddChild(new OmniLight3D { OmniRange = 3f, LightColor = col, LightEnergy = 1.6f, ShadowEnabled = false });
+        }
+        Vector3 pos = (_handMeshL != null && _handMeshR != null && GodotObject.IsInstanceValid(_handMeshL) && GodotObject.IsInstanceValid(_handMeshR))
+            ? (_handMeshL.GlobalPosition + _handMeshR.GlobalPosition) * 0.5f : EyePos + AimDir() * 0.6f;
+        _arcaneOrb.GlobalPosition = pos;
+        _arcaneOrb.Scale = Vector3.One * (0.04f + amt * 0.13f);   // grows with charge
+        if (_arcaneOrbShards != null)
+        {
+            _arcaneOrbShards.RotationDegrees += new Vector3(dt * (120f + amt * 220f), dt * (160f + amt * 260f), dt * (90f + amt * 180f));
+            float j = 0.85f + amt * 0.35f * Mathf.Sin(_ht * 40f) + (GD.Randf() - 0.5f) * (0.1f + amt * 0.3f);
+            _arcaneOrbShards.Scale = Vector3.One * Mathf.Clamp(j, 0.5f, 1.5f);
+        }
+        if (_arcaneOrbHalo != null) _arcaneOrbHalo.EmissionEnergyMultiplier = 1.2f + amt * 1.0f + 0.5f * Mathf.Abs(Mathf.Sin(_ht * 22f));
+        _arcaneOrbArcT -= dt;
+        if (_arcaneOrbArcT <= 0f)
+        {
+            _arcaneOrbArcT = Mathf.Max(0.03f, 0.09f - amt * 0.05f);   // faster crackle as it grows
+            float pick = GD.Randf();
+            Vector3 tgt = (pick < 0.4f && _handMeshL != null) ? _handMeshL.GlobalPosition
+                : (pick < 0.8f && _handMeshR != null) ? _handMeshR.GlobalPosition
+                : pos + new Vector3(GD.Randf() - 0.5f, GD.Randf() - 0.5f, GD.Randf() - 0.5f) * (0.3f + amt * 0.55f);   // …or arc into the air around it
+            Game.I.SpawnArcaneSpark(pos, tgt);
+        }
+    }
+    private void ClearArcaneChargeOrb()
+    {
+        if (_arcaneOrb != null && GodotObject.IsInstanceValid(_arcaneOrb)) _arcaneOrb.QueueFree();
+        _arcaneOrb = null; _arcaneOrbShards = null; _arcaneOrbHalo = null;
+    }
+
+    // Fade her view-model arms/hands (incl. their ink-outline next_pass) translucent as the globe-charge nears full, so they
+    // stop blocking the crosshair; eased back to solid on release as the pose returns to normal. `fade`: 0 solid → 1 invisible.
+    private float _armFade;
+    private void SetArmFade(float fade)
+    {
+        foreach (var arm in new[] { _armL, _armR })
+        {
+            if (arm == null || !GodotObject.IsInstanceValid(arm)) continue;
+            foreach (var c in arm.GetChildren())
+            {
+                if (c is MeshInstance3D mi && mi.MaterialOverride is StandardMaterial3D sm)
+                {
+                    FadeMat(sm, fade);
+                    if (sm.NextPass is StandardMaterial3D np) FadeMat(np, fade);   // the ink outline too, else it lingers as a floating silhouette
+                }
+            }
+        }
+    }
+    private static void FadeMat(StandardMaterial3D m, float fade)
+    {
+        if (fade <= 0.002f)
+        {
+            if (m.Transparency != BaseMaterial3D.TransparencyEnum.Disabled) { m.Transparency = BaseMaterial3D.TransparencyEnum.Disabled; var a0 = m.AlbedoColor; a0.A = 1f; m.AlbedoColor = a0; }
+            return;
+        }
+        m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
+        var a = m.AlbedoColor; a.A = 1f - fade; m.AlbedoColor = a;
+    }
+
     private void Ring(Vector3 at, Color col, float grow, float life)
     {
         Game.I.VfxRing(at, col, grow, life);
@@ -3507,17 +5379,40 @@ public partial class Player : Node3D
 
     private void FinWave(float pow, int t, Color col)
     {
-        float dmg = Base() * 2.4f * pow, radius = 10f + t * 1.5f;
-        foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, GlobalPosition) < radius && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) e.Hurt(dmg, DamageType.Curse, true);
-        Game.I.DamageWorld(GlobalPosition, radius, dmg);   // (FIX) AoE breaks props too
-        Ring(GlobalPosition, col, radius * 0.95f, 0.5f);
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float dmg = Base() * 2.4f * (1f + 0.18f * s0);      // Stat① Wither
+        float radius = (10f + 1.5f * s1) * S.SpellArea;     // Stat② Expanse
+        float markAmp = 1.15f + 0.12f * s2;                 // Stat③ Malediction: curse potency applied
+        void Pulse(float r, float scl)
+        {
+            foreach (var e in Game.I.Enemies.ToArray())
+                if (!e.Dead && Flat(e, GlobalPosition) < r && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition))
+                {
+                    bool wasCursed = e.MarkT > 0f;
+                    e.Hurt(dmg * scl, DamageType.Curse, true);
+                    e.Mark(3f, markAmp, 0);
+                    if (e1 > 0 && wasCursed && !e.Dead) e.Hurt(Base() * (0.6f + 0.4f * e1), DamageType.Curse, false);   // Leg Doom Wave: cursed foes caught explode
+                }
+            Game.I.DamageWorld(GlobalPosition, r, dmg * scl);   // (FIX) AoE breaks props too
+            Ring(GlobalPosition, col, r * 0.95f, 0.5f);
+        }
+        Pulse(radius, 1f);
+        for (int i = 1; i <= e0; i++)   // Epic Echo Pulse: +1 ring each stack, rippling outward
+        {
+            float rr = radius * (1f + 0.4f * i);
+            var tw = CreateTween(); tw.TweenInterval(0.2f * i);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Pulse(rr, 0.7f); }));
+        }
     }
 
     private void StartBeam(float pow, int t)
     {
-        _beamPow = Base() * 7f * pow;
-        _beamWidth = 2.2f + t * 0.3f;
-        _beamT = 0.9f + t * 0.25f;
+        int s0 = _curFin != null ? _curFin.Stat[0] : 0, s1 = _curFin != null ? _curFin.Stat[1] : 0, s2 = _curFin != null ? _curFin.Stat[2] : 0;
+        _beamOverload = _curFin != null ? _curFin.Evo[0] : 0; int prism = _curFin != null ? _curFin.Evo[1] : 0;   // Epic Overload / Leg Prism
+        _beamPow = Base() * 7f * (1f + 0.18f * s0);      // Stat① Bore
+        _beamWidth = (2.2f + 0.3f * s1) * S.SpellArea;   // Stat② Beamwidth
+        _beamLen = BeamLen * S.SpellRange;
+        _beamT = 0.9f + 0.25f * s2; _beamHeld = 0f;      // Stat③ Channel
         // lock direction now: toward the enemy under the cursor, otherwise straight ahead (flattened)
         var flat = AimDir(); flat.Y = 0; flat = flat.LengthSquared() > 0.001f ? flat.Normalized() : Vector3.Forward;
         var tgt = AimTarget();
@@ -3549,26 +5444,54 @@ public partial class Player : Node3D
             _beamLight = new OmniLight3D { OmniRange = 10f, LightColor = arc, LightEnergy = 3.5f };
             _beamSeg.Root.AddChild(_beamLight);
         }
-        Game.I.NetMgr?.BroadcastVfx(1, EyePos, _beamDir, BeamLen, _beamWidth, DamageTypes.Col(DamageType.Arcane));
+        while (_prismSegs.Count < prism)   // (OVERHAUL) Prism: build the extra fanned beams
+        {
+            var pcol = DamageTypes.Col(DamageType.Arcane);
+            var pseg = new SegBeam(SpellLanceSegs);
+            pseg.Build(Game.I, s =>
+            {
+                var mi = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.9f, 1f, 0.9f) } };
+                var m = Game.Emissive(pcol.Lerp(Colors.White, 0.4f), 3.2f); m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; var ac = m.AlbedoColor; ac.A = 0.65f; m.AlbedoColor = ac;
+                mi.MaterialOverride = m; mi.RotationDegrees = new Vector3(90, 0, 0); s.AddChild(mi);
+            });
+            _prismSegs.Add(pseg);
+        }
+        Game.I.NetMgr?.BroadcastVfx(1, EyePos, _beamDir, _beamLen, _beamWidth, DamageTypes.Col(DamageType.Arcane));
     }
 
     private void UpdateBeam(float dt)
     {
-        _beamT -= dt;
+        _beamT -= dt; _beamHeld += dt;
+        float beamCrit = _beamOverload > 0 ? Mathf.Min(0.8f, 0.08f * _beamOverload + 0.12f * _beamOverload * _beamHeld) : 0f;   // Overload: crit chance climbs while held
         var dir = _beamDir; var eye = EyePos;
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e.Dead) continue;
             var rel = e.GlobalPosition - eye;
             float proj = rel.X * dir.X + rel.Z * dir.Z;
-            if (proj < 0 || proj > BeamLen) continue;
+            if (proj < 0 || proj > _beamLen) continue;
             float px = eye.X + dir.X * proj, pz = eye.Z + dir.Z * proj;
-            if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius) e.Hurt(_beamPow * dt, DamageType.Arcane, true);
+            if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius) { bool bc = beamCrit > 0f && GD.Randf() < beamCrit; float bd = _beamPow * dt; if (bc) bd *= CritMult(); e.Hurt(bd, DamageType.Arcane, true, bc); }
+        }
+        for (int pi = 0; pi < _prismSegs.Count; pi++)   // (OVERHAUL) Prism: damage + place each fanned extra beam
+        {
+            float ang = (pi / 2 + 1) * 0.2f * ((pi % 2 == 0) ? 1f : -1f);
+            var pdir = dir.Rotated(Vector3.Up, ang);
+            foreach (var e in Game.I.Enemies.ToArray())
+            {
+                if (e.Dead) continue;
+                var rel = e.GlobalPosition - eye; float proj = rel.X * pdir.X + rel.Z * pdir.Z;
+                if (proj < 0 || proj > _beamLen) continue;
+                float px = eye.X + pdir.X * proj, pz = eye.Z + pdir.Z * proj;
+                if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius) e.Hurt(_beamPow * dt, DamageType.Arcane, true);
+            }
+            var ps = _prismSegs[pi];
+            if (ps != null) { Vector3 o = eye + new Vector3(0, -0.25f, 0), tg = eye + pdir * _beamLen + new Vector3(0, -0.25f, 0); ps.Place(o, tg, dt, 8f, 24f, 1f); }
         }
         if (_beamSeg != null)
         {
             Vector3 origin = eye + new Vector3(0, -0.25f, 0);
-            Vector3 target = eye + dir * BeamLen + new Vector3(0, -0.25f, 0);
+            Vector3 target = eye + dir * _beamLen + new Vector3(0, -0.25f, 0);
             float pl = 1f + 0.18f * Mathf.Sin(Now * 40f) + (GD.Randf() - 0.5f) * 0.12f;   // pulse + plasma flicker
             _beamSeg.Place(origin, target, dt, 8f, 24f, pl);
             if (_beamLight != null) _beamLight.GlobalPosition = _beamSeg.End;
@@ -3583,7 +5506,7 @@ public partial class Player : Node3D
             int drips = 1 + (GD.Randf() < 0.5f ? 1 : 0);
             for (int i = 0; i < drips; i++)
             {
-                float ss = GD.Randf() * BeamLen;
+                float ss = GD.Randf() * _beamLen;
                 var p = eye + dir * ss + new Vector3((GD.Randf() - 0.5f) * 0.6f, -0.25f, (GD.Randf() - 0.5f) * 0.6f);
                 var drop = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.12f, Height = 0.24f }, MaterialOverride = Game.Emissive(arc.Lerp(Colors.White, 0.3f), 3.5f) };
                 Game.I.AddChild(drop);
@@ -3603,14 +5526,14 @@ public partial class Player : Node3D
         {
             _beamBurnT = 0.12f;
             var arc = DamageTypes.Col(DamageType.Arcane);
-            Game.I.SpawnBurnMark(eye + dir * BeamLen, arc, _beamWidth * 1.6f, 2.5f);
+            Game.I.SpawnBurnMark(eye + dir * _beamLen, arc, _beamWidth * 1.6f, 2.5f);
             int stamped = 0;
             foreach (var e in Game.I.Enemies.ToArray())
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                 var rel = e.GlobalPosition - eye;
                 float proj = rel.X * dir.X + rel.Z * dir.Z;
-                if (proj < 0 || proj > BeamLen) continue;
+                if (proj < 0 || proj > _beamLen) continue;
                 float px = eye.X + dir.X * proj, pz = eye.Z + dir.Z * proj;
                 if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius)
                 {
@@ -3619,45 +5542,61 @@ public partial class Player : Node3D
                 }
             }
         }
-        if (_beamT <= 0 && _beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; }
+        if (_beamT <= 0 && _beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; foreach (var ps in _prismSegs) ps?.Free(); _prismSegs.Clear(); }
     }
 
     private void FinVolley(float pow, int t, Color col)
     {
-        int count = 5 + t; var dir = AimDir(); var eye = EyePos; var right = new Vector3(-dir.Z, 0, dir.X).Normalized();
-        for (int i = 0; i < count; i++)
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        int count = 5 + s1 + e0;                            // Stat② Salvo (+ Seeking adds a bolt)
+        float bdmg = Base() * 1.4f * (1f + 0.18f * s0);     // Stat① Volley
+        float speed = 48f * (1f + 0.15f * s2);              // Stat③ Velocity
+        var dir = AimDir(); var eye = EyePos; var right = new Vector3(-dir.Z, 0, dir.X).Normalized();
+        void Salvo()
         {
-            float off = (i - (count - 1) / 2f) * 0.1f;
-            var d = (dir + right * off).Normalized() * 48f;
-            SpawnBolt(eye + dir * 1.2f, d, Base() * 1.4f * pow, 0, 0.5f, col, DamageType.Arcane, false, false, false, false, fromCombo: true);
+            for (int i = 0; i < count; i++)
+            {
+                float off = (i - (count - 1) / 2f) * 0.1f;
+                var d = (dir + right * off).Normalized() * speed;
+                var b = SpawnBolt(eye + dir * 1.2f, d, bdmg, 0, 0.5f, col, DamageType.Arcane, false, false, false, false, fromCombo: true);
+                if (e0 > 0) { b.Homing = true; b.HomeSpeed = speed; b.Turn = 3f + 1.5f * e0; }   // Epic Seeking: bolts gain homing
+            }
+            Ring(eye + dir * 1.2f, col, 2.2f, 0.3f);
         }
-        Ring(eye + dir * 1.2f, col, 2.2f, 0.3f);          // (NEW) arcane muzzle flash
-        Game.I.Sfx?.ArcaneBlast(eye + dir * 1.5f);         // (NEW) thunderous arcane blast on fire
+        Salvo();
+        for (int v = 1; v <= e1; v++)   // Leg Barrage: +1 delayed volley each stack
+        {
+            var tw = CreateTween(); tw.TweenInterval(0.18f * v);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Salvo(); }));
+        }
+        Game.I.Sfx?.ArcaneBlast(eye + dir * 1.5f);
     }
 
     private void FinSwarm(float pow, int t, Color col)
     {
-        int count = 7 + t;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        int count = 7 + s1;                                // Stat② Coven
+        float bdmg = Base() * 1.2f * (1f + 0.18f * s0);    // Stat① Spellbite
         var aim = AimDir();
-
         var alive = new System.Collections.Generic.List<Enemy>();
         foreach (var e in Game.I.Enemies.ToArray())
             if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) alive.Add(e);
-
         for (int i = 0; i < count; i++)
         {
             float a = (i / (float)count) * Mathf.Pi * 2f + 0.4f;
             var horiz = new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a));
             var start = GlobalPosition + new Vector3(0, 2.4f, 0) + horiz * 0.7f;
             var launch = (Vector3.Up * 2.3f + horiz * 1.3f).Normalized() * 17f;   // pop up into an arch
-            var b = SpawnBolt(start, launch, Base() * 1.2f * pow, 0, 0.45f, col, DamageType.Arcane, false, false, false, false, life: 3.8f, fromCombo: true);
+            var b = SpawnBolt(start, launch, bdmg, 0, 0.45f, col, DamageType.Arcane, false, false, false, false, life: 3.8f, fromCombo: true);
             b.Homing = true;
             b.HomeSpeed = 33f;
-            b.Turn = 7.5f;
+            b.Turn = 7.5f + 1.5f * s2;                             // Stat③ Tracking: sharper homing
             b.HomeDelay = 0.22f + (i % 3) * 0.04f;                 // arch first, then seek
             b.Gravity = 26f;                                       // gives the arch its hang
             b.Target = alive.Count > 0 ? alive[i % alive.Count] : null;   // spread across distinct foes
             b.AimFallback = aim;                                   // no foes -> streak toward the cursor
+            if (e0 > 0) b.MarkOnHit = 1.15f + 0.1f * e0;           // Epic Conduit Swarm: bolts leave conduit marks
+            if (e1 > 0) { b.Arc = e1; b.ArcDmg = bdmg * 0.6f; }    // Leg Living Current: bolts arc to another foe on hit
         }
     }
 
@@ -3673,14 +5612,16 @@ public partial class Player : Node3D
 
     private void FinHeal(float pow, int t)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         var f = new GroundField {
             Type = FieldType.Heal, HealAllies = true,
-            Radius = 5f + t * 0.8f,
-            Dur = 4f + t,
-            Power = S.MaxHp * 0.028f * pow,
-            EnemyDmg = Mathf.Min(5, t + 1),   // common 1 → legendary 5 dmg/sec
+            Radius = 5f + 0.8f * s1,                                          // Stat② Grove
+            Dur = 4f + s2,                                                    // Stat③ Evergreen
+            Power = S.MaxHp * 0.028f * (1f + 0.18f * s0) * (e1 > 0 ? 1f + 0.2f * e1 : 1f),   // Stat① Blessing (+ Leg Wellspring heal power)
+            EnemyDmg = 1f + (e0 > 0 ? Base() * (0.2f + 0.1f * e0) : 0f),      // Epic Consecrated: foes inside take searing damage
             FromCombo = true,
-            Cap = Mathf.Clamp(t, 1, 4),       // 1 / 1 / 2 / 3 / 4 on screen by rarity
+            Cap = 4,
+            Follow = e1 > 0,                                                  // Leg Wellspring: the field follows you
             DType = DamageType.Holy
         };
         Game.I.AddChild(f); f.GlobalPosition = new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z);
@@ -3700,29 +5641,42 @@ public partial class Player : Node3D
         Game.I.RegisterComboField(f);
         Game.I.NetMgr?.BroadcastField((int)FieldType.Hex, new Vector3(at.X, 0.04f, at.Z), f.Radius, f.Dur, false, DamageTypes.Col(DamageType.Curse), (int)DamageType.Curse);   // (NEW) allies see the field
         Game.I.SpawnGroundSigil(GlobalPosition, f.Radius * 1.2f, DamageTypes.Col(PrimaryType));   // (NEW) sigil flares around the caster in her element
-        Game.I.Sfx?.WitchCackle(GlobalPosition);                                                  // (NEW) witch cackle on cast
+        Game.I.Sfx?.HexWeave(GlobalPosition);                                                     // dark curse incantation (was the scratchy WitchCackle record-scratch)
     }
 
     private void FinRoot(float pow, int t, Color col)
     {
-        float radius = 12f + t * 2f, dur = 2.4f + t * 0.5f, dmg = Base() * 1.0f * pow;
-        foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, GlobalPosition) < radius && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) { e.Root(dur); e.Hurt(dmg, DamageType.Nature, true); }
-        Game.I.DamageWorld(GlobalPosition, radius, dmg);   // (FIX) AoE breaks props too
-        Ring(GlobalPosition, col, radius, 0.6f);
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (12f + 2f * s1) * S.SpellArea, dur = 2.4f + 0.5f * s2, dmg = Base() * 1.0f * (1f + 0.18f * s0);   // Stat②/③/①
+        void Snare(float r, float scl)
+        {
+            foreach (var e in Game.I.Enemies.ToArray()) if (!e.Dead && Flat(e, GlobalPosition) < r && !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) { e.Root(dur); e.Hurt(dmg * scl, DamageType.Nature, true); if (e0 > 0) e.Poison(Base() * 0.1f * e0, 3f, Game.I.LocalPeer); }   // Epic Thornburst: rooted foes take poison
+            Game.I.DamageWorld(GlobalPosition, r, dmg * scl);   // (FIX) AoE breaks props too
+            Ring(GlobalPosition, col, r, 0.6f);
+        }
+        Snare(radius, 1f);
+        for (int i = 1; i <= e1; i++)   // Leg Ensnaring Grove: roots ripple outward
+        {
+            float rr = radius * (1f + 0.3f * i);
+            var tw = CreateTween(); tw.TweenInterval(0.18f * i);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Snare(rr, 0.5f); }));
+        }
     }
 
     // Creeping Blight: a poison field at your feet that keeps stacking additive poison on whoever stands in it.
     private void FinPoisonField(float pow, int t)
     {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
         var f = new GroundField
         {
             Type = FieldType.Hex,
             TintColor = DamageTypes.Col(DamageType.Nature),
-            Radius = 5.5f + t * 0.8f,
-            Dur = 5f + t,
-            Power = Base() * 0.12f * pow,               // small direct dmg/sec
-            PoisonAdd = (1.5f + t * 1.2f) * pow,         // additive poison each 0.4s — ramps the longer they stand
-            SlowMul = ModPoisonField ? 0.55f : 0f,       // legendary: also slows
+            Radius = 5.5f + 0.8f * s1,                                        // Stat② Overgrowth
+            Dur = 5f + s2,                                                    // Stat③ Perennial
+            Power = Base() * 0.12f,                                          // small direct dmg/sec
+            PoisonAdd = 1.5f * (1f + 0.3f * s0),                             // Stat① Virulence: poison ramp
+            SlowMul = e0 > 0 ? Mathf.Max(0.35f, 0.65f - 0.06f * e0) : 0f,    // Epic Toxic Bloom: also slows
+            Creep = e1 > 0 ? 1.2f + 0.6f * e1 : 0f,                          // Leg Miasma: creeps toward enemies
             FromCombo = true,
             DType = DamageType.Nature,
             Src = this
@@ -3738,14 +5692,17 @@ public partial class Player : Node3D
     // Seed Mines: scatter proximity mines that detonate when a foe steps near. Count + damage scale with rarity.
     private void FinSeedMine(float pow, int t)
     {
-        int count = 4 + t * 2;                          // common 6 → legendary 14
-        float dmg = Base() * (1.4f + 0.3f * t) * pow;
-        float spread = 2f + 4.5f + t;
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        int count = 4 + 2 * s1;                          // Stat② Sowing
+        float dmg = Base() * 1.4f * (1f + 0.18f * s0);   // Stat① Yield
+        float spread = 2f + 4.5f + s1;
+        float blast = (4.5f + 0.6f * s2) * S.SpellArea;  // Stat③ Blast Cap
         for (int i = 0; i < count; i++)
         {
             float a = GD.Randf() * Mathf.Tau, r = 2f + GD.Randf() * spread;
             var pos = GlobalPosition + new Vector3(Mathf.Cos(a) * r, 0, Mathf.Sin(a) * r);
-            var m = new SeedMine { Caster = this, Damage = dmg, Chain = ModSeedMine, Poison = Base() * 0.15f };
+            var m = new SeedMine { Caster = this, Damage = dmg, Chain = e0 > 0, Poison = Base() * 0.15f, Blast = blast,
+                CloudPoison = e1 > 0 ? Base() * 0.12f * e1 : 0f, CloudRadius = e1 > 0 ? 3f + 0.6f * e1 : 0f };   // Epic Chain Bloom / Leg Spore Mines
             Game.I.AddChild(m);
             float surf = Game.I.SurfaceHeight(pos, GlobalPosition.Y);        // (NEW) anchor to terrain so the husk sits ON the ground, not through it
             m.GlobalPosition = new Vector3(pos.X, surf + 0.12f, pos.Z);
@@ -3759,7 +5716,13 @@ public partial class Player : Node3D
     // BURSTS for Nature damage around you when it pops (see Hurt). Mirrors the Crimson blood-shield pattern.
     private void FinThornSkin(float pow, int t)
     {
-        AddArmor(true, Base() * (1.6f + 0.4f * t) * pow);   // a green (thorn) armor charge — bursts Nature on break
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        _thornBurstRad = 5f + 0.8f * s1;                        // Stat② Bramble: burst radius
+        _thornRoot = e0 > 0 ? 0.8f + 0.4f * e0 : 0f;            // Epic Snare Bark: the burst roots
+        if (e1 > 0) { _thornResistT = 6f; _thornResistAmt = 0.08f * e1; }   // Leg Ironbark: briefly gain damage resist
+        int barkGrants = 1 + s2 / 2;                            // Stat③ Bark: bank 1 → 3 thorn charges per cast (still capped by the shared MaxArmor)
+        float barbsDmg = Base() * 1.6f * (1f + 0.18f * s0);     // Stat① Barbs: burst damage
+        for (int i = 0; i < barkGrants; i++) AddArmor(true, barbsDmg);   // AddArmor no-ops once the shared pool is full
         Ring(GlobalPosition, DamageTypes.Col(DamageType.Nature), 2.8f, 0.4f);
     }
 
@@ -3769,6 +5732,14 @@ public partial class Player : Node3D
         _ht += dt;
         _kickL = Mathf.Max(0, _kickL - dt * 6f);
         _kickR = Mathf.Max(0, _kickR - dt * 6f);
+        if (ArcaneWitch) { UpdateArcaneHandFx(dt); UpdateArcaneMarks(dt); } else if (_arcaneHandFx.Count > 0) ClearArcaneHandFx();   // raw plasma crackling on her hands + mark-timer decay
+        if (ArcaneWitch && Charging) UpdateArcaneChargeOrb(dt, ChargeAmt); else ClearArcaneChargeOrb();   // the growing crackling charge orb between her palms
+        if (ArcaneWitch)   // fade arms/hands out as the charge nears full so they don't block the crosshair; ease back on release
+        {
+            float target = Charging ? Mathf.Clamp((ChargeAmt - 0.5f) / 0.45f, 0f, 1f) * 0.9f : 0f;
+            _armFade = Mathf.MoveToward(_armFade, target, dt * 5.5f);
+            SetArmFade(_armFade);
+        }
 
         Vector3 lp = _baseLPos, rp = _baseRPos, lr = _baseLRot, rr = _baseRRot;
         float bob = Mathf.Sin(_ht * 2f) * 0.008f;
@@ -3790,6 +5761,11 @@ public partial class Player : Node3D
                 rp.X = Mathf.Lerp(_baseRPos.X, 0.12f, cc); rp.Z += cc * 0.14f; rp.Y += cc * 0.05f;
                 rr.X += cc * 0.35f;
             }
+            else if (ArcaneWitch)   // (NEW) grasping a growing orb: LEFT cradles it from below (palm up), RIGHT hovers above (palm down)
+            {
+                lp.X = Mathf.Lerp(_baseLPos.X, -0.05f, cc); lp.Z -= cc * 0.30f; lp.Y = Mathf.Lerp(_baseLPos.Y, _baseLPos.Y - 0.05f, cc); lr.X += cc * 1.5f;
+                rp.X = Mathf.Lerp(_baseRPos.X, 0.05f, cc); rp.Z -= cc * 0.30f; rp.Y = Mathf.Lerp(_baseRPos.Y, _baseRPos.Y + 0.24f, cc); rr.X -= cc * 1.5f;
+            }
             else
             {
                 lp.X = Mathf.Lerp(_baseLPos.X, -0.16f, cc); rp.X = Mathf.Lerp(_baseRPos.X, 0.16f, cc);
@@ -3808,6 +5784,9 @@ public partial class Player : Node3D
                 case "palmsup": float up = Mathf.Max(0, (k - 0.3f) / 0.7f); lp.Y += 0.34f * up; rp.Y += 0.34f * up; lp.Z -= 0.28f * e; rp.Z -= 0.28f * e; lr.X += 0.5f * up; rr.X += 0.5f * up; break;
                 case "slam": lp.Y -= 0.18f * e; rp.Y -= 0.18f * e; lp.Z -= 0.28f * e; rp.Z -= 0.28f * e; lr.X += 0.5f * e; rr.X += 0.5f * e; break;
                 case "barrage": { float f2 = Mathf.Abs(Mathf.Sin(k * Mathf.Pi * 3f)); rp.Z -= 0.5f * f2; lp.Z -= 0.5f * (1f - f2); rr.X -= 0.7f * f2; lr.X -= 0.7f * (1f - f2); break; }   // Gale primary: rapid alternating jabs (NEW)
+                case "flick": { float f3 = Mathf.Sin(k * Mathf.Pi); lp.Z -= 0.34f * f3; lp.X -= 0.07f * f3; lp.Y += 0.06f * f3; lr.X -= 1.0f * f3; lr.Y += 0.5f * f3; break; }   // Arcane: LEFT hand snaps forward + outward, flicking the burst out (NEW)
+                case "channel": { float fc = Mathf.Sin(k * Mathf.Pi); lp.X = Mathf.Lerp(_baseLPos.X, -0.07f, fc); rp.X = Mathf.Lerp(_baseRPos.X, 0.07f, fc); lp.Z -= 0.5f * fc; rp.Z -= 0.5f * fc; lp.Y += 0.05f * fc; rp.Y += 0.05f * fc; lr.X -= 0.7f * fc; rr.X -= 0.7f * fc; break; }   // Arcane: both palms drive a torrent forward (NEW)
+                case "conjure": { float cu = Mathf.Sin(k * Mathf.Pi); lp.Y += 0.44f * cu; rp.Y += 0.44f * cu; lp.X -= 0.10f * cu; rp.X += 0.10f * cu; lp.Z -= 0.12f * cu; rp.Z -= 0.12f * cu; lr.X += 0.9f * cu; rr.X += 0.9f * cu; break; }   // Arcane: arms flung up, conjuring raw power (NEW)
                 case "grdpunch":   // Gale charged: wind up, then drive a fist down into the ground (NEW)
                 {
                     float wind = Mathf.Clamp(k / 0.35f, 0f, 1f);
@@ -3818,6 +5797,7 @@ public partial class Player : Node3D
                     lr.X += 0.8f * drive; rr.X += 0.8f * drive;
                     break;
                 }
+                case "ward": { float wd = Mathf.Sin(k * Mathf.Pi); lp.Z -= 0.44f * wd; rp.Z -= 0.44f * wd; lp.Y += 0.20f * wd; rp.Y += 0.20f * wd; lp.X -= 0.10f * wd; rp.X += 0.10f * wd; lr.X += 0.6f * wd; rr.X += 0.6f * wd; break; }   // Frost Wall: both palms push forward + out, raising a barrier (NEW)
                 case "flare": rp.Z -= 0.55f * e; rp.Y += 0.12f * e; rr.X += 0.4f * e; rr.Z -= 0.35f * e; break;   // firework: right hand out front, palm up (NEW)
                 case "crush": { float reach = Mathf.Clamp(k / 0.45f, 0f, 1f); float yank = Mathf.Clamp((k - 0.4f) / 0.6f, 0f, 1f); rp.Z -= 0.42f * reach; rp.Z += 0.55f * yank; rp.Y += 0.1f * reach - 0.12f * yank; rr.X += 0.7f * yank; break; }   // Forsaken: reach out, clasp, and YANK the curse in (NEW)
                 case "draw":
@@ -3891,6 +5871,8 @@ public partial class Player : Node3D
     {
         if (Ult == UltKind.None) return;
         if (Ult == UltKind.WildfireRush && UltActive && _flameDashCharges > 0) { FlameDash(); return; }   // (NEW) Q during the Wildfire window = a flame dash
+        if (Ult == UltKind.Stormform && UltActive && _windCharges > 0) { WindRush(); return; }            // (REWORK) Q during Stormform = a wind rush
+        if (Ult == UltKind.LifeCurse && _specter) { EndSpecter(true); return; }                            // (REWORK) Q during Specter = detonate the burst early
         if (UltActive || UltCharge < 1f) return;
         ActivateUlt();
     }
@@ -3898,21 +5880,37 @@ public partial class Player : Node3D
     private void ActivateUlt()
     {
         UltCharge = 0f;
-        Game.I.Sfx?.Release(DamageType.Lunar);
+        UltMax = 0f;   // (ULT METERS) each ult that has a timed window sets this in its case → the generic HUD duration bar only shows for those
+        // (NEW) anti-chain recharge lock. Reset here; the FIELD/SUMMON ult cases below set this to their EXACT lingering
+        // duration (in-scope value → precise). Transform/aura ults keep UltActive true for their whole window, so the
+        // existing !UltActive gate already covers them exactly. Instant bursts / DoTs leave nothing → recharge normally.
+        UltLingerT = 0f;
+        var _ecol = DamageTypes.Col(WitchDamage);        // (NEW) every witch's ult erupts a big element-coloured activation flourish + cinematic boom + shake
+        Game.I.UltCast(GlobalPosition, _ecol);
+        Game.I.Sfx?.UltCast(GlobalPosition);
+        CamKick(1.0f);
+        Game.I.NetMgr?.BroadcastUltCast((int)Ult);   // (NEW) allies get a picture-in-picture "ult cast" cutout of you casting this
+        if (Game.I.UltOverlay != null && Game.I.UltOverlay.SoloTest) Game.I.UltOverlay.TriggerLocal(this, Ult);   // (dev) single-player self-preview
         switch (Ult)
         {
             case UltKind.Eclipse:
-                UltActive = true; UltActiveT = 6f + UltTier * 1.6f; UltDmgMul = 2f; _eclipseMax = UltActiveT;
+                // (REWORK) NO MORE ×2 damage. Instead: an inverted black/white transform — ×2 move, ×3 jump, +crit, an
+                // arcane-blink dash, and every LUNAR hit detonates a shadow-nova. UltDmgMul stays 1.
+                UltActive = true; UltActiveT = 8f + UltTier * 1.6f; UltDmgMul = 1f; _eclipseMax = UltActiveT; UltMax = UltActiveT;
                 {
                     var ev = new EclipseVfx { Dur = UltActiveT, MaxDur = UltActiveT };
                     Game.I.AddChild(ev);
                     ev.GlobalPosition = new Vector3(GlobalPosition.X, GlobalPosition.Y + 26f, GlobalPosition.Z);
-                    Ring(GlobalPosition, DamageTypes.Col(DamageType.Lunar), 8f, 0.7f);
-                    Ring(GlobalPosition, Colors.White, 4f, 0.5f);
-                    CamKick(0.6f);
+                    Ring(GlobalPosition, Colors.Black, 9f, 0.7f);
+                    Ring(GlobalPosition, Colors.White, 4.5f, 0.5f);
+                    CamKick(0.7f);
+                    GrantUltAura(new Color(0.02f, 0.02f, 0.05f), 3.1f);   // an eclipse SHADOW wreathes her (white accents come from the aura's rim)
+                    Game.I.FallingMotes(GlobalPosition, 7f, Colors.White, 20);   // pale motes rain down
+                    _bodyModel?.SetEclipse(true);
                 }
                 Game.I.NetMgr?.BroadcastVfx(4, GlobalPosition, Vector3.Zero, UltActiveT, 0f, DamageTypes.Col(DamageType.Lunar));
-                Game.I.Hud?.Banner("LUNAR ECLIPSE");
+                Game.I.Sfx?.Thunder();
+                Game.I.Hud?.Banner("ECLIPSE");
                 break;
             case UltKind.LunarLight: DeployLunarLight(); break;
             case UltKind.Crescent: SpawnCrescents(); break;
@@ -3920,31 +5918,42 @@ public partial class Player : Node3D
             {
                 if (Game.I.Shield != null && GodotObject.IsInstanceValid(Game.I.Shield)) Game.I.Shield.QueueFree();
                 int t = UltTier;
+                float radius = (9f + t * 1.2f) * S.SpellArea;        // scales with spell-area / range cards
+                float dur = 13f;                                     // (REWORK) base 13s; NULLIFIES all attacks while you're inside (Player.InsideFaithShield)
+                float burst = Base() * (5f + t * 2f) * (ModShield ? 1.4f : 1f);   // flat shatter damage (base-scaled)
+                float knock = 16f + t * 2f;
+                var pos = new Vector3(GlobalPosition.X, 0.1f, GlobalPosition.Z);
                 var sh = new FaithShield
                 {
-                    MaxHp = 240f + t * 130f, Hp = 240f + t * 130f,
-                    Radius = 10f + t * 1.2f, Dur = 8f + t * 2f,        // ~3.5x the old area, rooted where cast
-                    MeleeDmg = 6f + t * 2f, Reflect = ModShield,
-                    HealPerSec = S.MaxHp * (0.05f + t * 0.008f),       // medium heal to allies inside
-                    BurstDmg = Base() * (4f + t * 1.5f), BurstRadius = 13f + t * 1.5f   // shatter blast on break/expire
+                    Radius = radius, Dur = dur, DurMax = dur, MeleeDmg = 6f + t * 2f, Reflect = ModShield,
+                    HealPerSec = S.MaxHp * (0.05f + t * 0.008f),
+                    BurstDmg = burst, BurstRadius = radius + 3f, Knock = knock,
+                    Remote = !Game.I.IsAuthority,                    // host = authoritative (blocks + shatters); client = visual
                 };
-                if (ModShield) { sh.MaxHp *= 1.4f; sh.Hp = sh.MaxHp; }
-                Game.I.AddChild(sh);
-                sh.GlobalPosition = new Vector3(GlobalPosition.X, 0.1f, GlobalPosition.Z);
+                Game.I.AddChild(sh); sh.GlobalPosition = pos;
                 Game.I.Shield = sh;
-                Game.I.NetMgr?.BroadcastVfx(5, new Vector3(GlobalPosition.X, 0.1f, GlobalPosition.Z), Vector3.Zero, sh.Radius, sh.Dur, DamageTypes.Col(DamageType.Holy));
-                UltActive = true; UltActiveT = sh.Dur;
+                Game.I.NetMgr?.SpawnFaithShield(pos, radius, dur, burst, knock, ModShield);   // MP: host spawns an authoritative copy, others a visual one
+                {
+                    var hcol = DamageTypes.Col(DamageType.Holy);
+                    Ring(pos, hcol, radius, 0.7f);
+                    Ring(pos, Colors.White, radius * 0.6f, 0.55f);
+                    Game.I.FallingMotes(pos, radius * 0.92f, hcol, 30, 13f);   // grace rains down as the aegis rises
+                    Game.I.Sfx?.Thunder();
+                }
+                UltActive = true; UltActiveT = dur; UltMax = dur;
                 Game.I.Hud?.Banner("FAITH SHIELD");
                 break;
             }
             case UltKind.Judgement:
             {
                 int t = UltTier;
+                float fieldDur = 13f;              // (REWORK) the light/lance fields linger ≥13s base
+                UltLingerT = fieldDur; UltMax = fieldDur;   // no recharge until they fade; drives the HUD duration meter
                 if (ModJudge)
                 {
                     // ONE colossal lance: devastating at the core, tapering to "okay" at the rim, then a pulsing field.
                     var at = GroundAim();
-                    float rad = 9f + t * 1.2f;
+                    float rad = (9f + t * 1.2f) * S.SpellArea;   // HolyPulse/Lance don't auto-scale, so scale here
                     float core = Base() * (7f + t * 2.5f);
                     foreach (var e in Game.I.Enemies.ToArray())
                     {
@@ -3960,16 +5969,18 @@ public partial class Player : Node3D
                     Lance(at, 5f, 3.2f);                 // a giant construct lance, planted for the duration
                     Ring(at, DamageTypes.Col(DamageType.Holy), rad, 0.8f);
                     Ring(at, Colors.White, rad * 0.5f, 0.6f);
+                    Game.I.FallingMotes(at, rad * 0.85f, DamageTypes.Col(DamageType.Holy), 26, 15f);   // the heavens open over the strike
                     var v = new Vfx(); Game.I.AddChild(v); v.GlobalPosition = new Vector3(at.X, 0.5f, at.Z);
                     v.Init(new SphereMesh { Radius = rad * 0.6f, Height = rad * 1.2f }, DamageTypes.Col(DamageType.Holy), 0.5f, 8f);
+                    float pulseR = (12f + t * 1.6f) * S.SpellArea;   // (REWORK) bigger base, scales with area cards
                     var pulse = new HolyPulse
                     {
-                        Radius = rad, Dur = 5f, MaxDur = 5f,
+                        Radius = pulseR, Dur = fieldDur, MaxDur = fieldDur,
                         PulseDmg = Base() * (0.5f + t * 0.12f),   // low-med pulse damage (heals allies by the same)
                         PulseHeal = S.MaxHp * 0.05f, Interval = 0.8f
                     };
                     Game.I.AddChild(pulse); pulse.GlobalPosition = new Vector3(at.X, 0.06f, at.Z);
-                    Game.I.NetMgr?.BroadcastField((int)FieldType.Heal, new Vector3(at.X, 0.04f, at.Z), rad, 5f, false, DamageTypes.Col(DamageType.Holy), (int)DamageType.Holy);
+                    Game.I.NetMgr?.BroadcastField((int)FieldType.Heal, new Vector3(at.X, 0.04f, at.Z), pulseR, fieldDur, false, DamageTypes.Col(DamageType.Holy), (int)DamageType.Holy);
                     CamKick(1.0f);
                     Game.I.Sfx?.Release(DamageType.Holy);
                     Game.I.Hud?.Banner("JUDGEMENT");
@@ -3978,19 +5989,24 @@ public partial class Player : Node3D
                 {
                     var all = Game.I.Enemies.FindAll(e => e != null && !e.Dead && GodotObject.IsInstanceValid(e));
                     all.Sort((a, b) => Flat(a, GlobalPosition).CompareTo(Flat(b, GlobalPosition)));
-                    int count = Mathf.Max(1, Mathf.CeilToInt(all.Count * 0.25f));
+                    int count = Mathf.Min(12, Mathf.Max(1, Mathf.CeilToInt(all.Count * 0.25f)));   // (PERF) cap strike points — was up to 25% of the WHOLE swarm, each spawning a Lance + GroundField + motes + an inner per-enemy raycast splash
                     float dmg = Base() * (3.0f + t * 1.0f);
-                    float aoe = 3.2f + t * 0.3f;
+                    float aoe = 5.0f + t * 0.5f;              // (REWORK) bigger base; the GroundField auto-scales this by SpellArea
+                    float aoeHit = aoe * S.SpellArea;         // splash + world damage scale to match the field
                     for (int i = 0; i < count && i < all.Count; i++)
                     {
                         var at = all[i].GlobalPosition;
                         foreach (var e in Game.I.Enemies.ToArray())   // small splash at each impact
-                            if (!e.Dead && Flat(e, at) < aoe && !Game.I.SightBlocked(at, e.GlobalPosition)) { e.Hurt(dmg, DamageType.Holy, true); ComboFromSource(); }
-                        Game.I.DamageWorld(at, aoe, dmg);   // (FIX) AoE breaks props too
+                            if (!e.Dead && Flat(e, at) < aoeHit && !Game.I.SightBlocked(at, e.GlobalPosition)) { e.Hurt(dmg, DamageType.Holy, true); ComboFromSource(); }
+                        Game.I.DamageWorld(at, aoeHit, dmg);   // (FIX) AoE breaks props too
                         Lance(at, 4.5f);                  // lances stay planted for the effect
-                        var f = new GroundField { Type = FieldType.Heal, HealAllies = true, EnemyDmg = Base() * 0.5f, Radius = aoe, Dur = 4.5f, Power = S.MaxHp * (0.02f + t * 0.004f), DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true };
+                        Ring(at, DamageTypes.Col(DamageType.Holy), aoeHit, 0.55f);
+                        Game.I.FallingMotes(at, aoeHit * 1.4f, DamageTypes.Col(DamageType.Holy), 10, 14f);   // a shaft of judgement from above
+                        var f = new GroundField { Type = FieldType.Heal, HealAllies = true, EnemyDmg = Base() * 0.5f, Radius = aoe, Dur = fieldDur, Power = S.MaxHp * (0.02f + t * 0.004f), DType = DamageType.Holy, TintColor = DamageTypes.Col(DamageType.Holy), FromCombo = true };   // (REWORK) fields last ≥13s (GroundField scales Radius by SpellArea)
                         Game.I.AddChild(f); f.GlobalPosition = new Vector3(at.X, 0.04f, at.Z);
                     }
+                    CamKick(0.8f);
+                    Game.I.Sfx?.Release(DamageType.Holy);
                     Game.I.Hud?.Banner("JUDGEMENT");
                 }
                 break;
@@ -3999,9 +6015,15 @@ public partial class Player : Node3D
             {
                 Divinity = true;
                 _divBaseY = GlobalPosition.Y;
-                _divT = 6f + UltTier * 1.5f + (ModDivinity ? 3f : 0f);
+                _divT = 13f + UltTier * 1.5f + (ModDivinity ? 3f : 0f);   // (REWORK) base 13s
                 _iframe = 999f;
-                UltActive = true;
+                UltActive = true; UltActiveT = _divT; UltMax = _divT;      // drive the HUD duration meter
+                _divRisen = false;
+                GrantUltAura(DamageTypes.Col(DamageType.Holy), 3.1f);   // radiant grace wreathes her as she ascends
+                Game.I.FallingMotes(GlobalPosition, 6f, DamageTypes.Col(DamageType.Holy), 26, 12f);
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Holy), 6f, 0.7f);
+                Ring(GlobalPosition, Colors.White, 3.5f, 0.55f);
+                Game.I.Sfx?.Thunder();
                 Game.I.NetMgr?.BroadcastVfx(6, GlobalPosition, Vector3.Zero, 4f, 0f, DamageTypes.Col(DamageType.Holy));
                 Game.I.Hud?.Banner("DIVINITY");
                 break;
@@ -4010,66 +6032,106 @@ public partial class Player : Node3D
             {
                 int t = UltTier;
                 Vector3 fwd = -_cam.GlobalTransform.Basis.Z; fwd.Y = 0; fwd = fwd.Normalized();
-                var wave = new BloodWave
+                float dmg = Base() * (3.8f + t * 0.9f) * (ModTsunami ? 1.35f : 1f);   // mod keeps the ×1.35 (enhance only)
+                float width = (20f + t * 2.5f + (ModTsunami ? 6f : 0f)) * S.SpellArea;
+                float speed = 24f * S.ProjSpeed, range = (60f + t * 7f) * S.SpellRange;
+                var bcol = DamageTypes.Col(DamageType.Blood);
+                void Wave(Vector3 dir)
                 {
-                    Dir = fwd,
-                    Dmg = Base() * (3.8f + t * 0.9f) * (ModTsunami ? 1.35f : 1f),
-                    Knock = 6f + t * 0.6f,
-                    Width = 14f + t * 2.5f + (ModTsunami ? 5f : 0f),
-                    Speed = 24f,
-                    Range = 56f + t * 7f,
-                    SlowDur = 3f
-                };
-                Game.I.AddChild(wave);
-                wave.GlobalPosition = new Vector3(GlobalPosition.X, 0.5f, GlobalPosition.Z) + fwd * 2f;
+                    var w = new BloodWave { Dir = dir, Dmg = dmg, Knock = 6f + t * 0.6f, Width = width, Speed = speed, Range = range, SlowDur = 3f };
+                    Game.I.AddChild(w);
+                    w.GlobalPosition = new Vector3(GlobalPosition.X, 0.5f, GlobalPosition.Z) + dir * 2f;
+                }
+                if (ModTsunami)   // (MOD REWORK) a RADIAL tsunami — waves erupt in all directions from her, not one wall
+                {
+                    int spokes = 8;
+                    for (int i = 0; i < spokes; i++) Wave(fwd.Rotated(Vector3.Up, i * Mathf.Tau / spokes));
+                    Ring(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), bcol, 8f, 0.7f);
+                    Ring(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), bcol.Lerp(Colors.White, 0.4f), 4f, 0.5f);
+                }
+                else
+                {
+                    Wave(fwd);
+                    var basePos = new Vector3(GlobalPosition.X, 0.4f, GlobalPosition.Z) + fwd * 2f;
+                    for (int i = 0; i < 26; i++)   // a fan of gore flung ahead of the crest as it surges forward
+                    {
+                        float spread = (GD.Randf() - 0.5f) * 1.6f;
+                        var dir = fwd.Rotated(Vector3.Up, spread);
+                        var drop = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.18f + GD.Randf() * 0.28f, Height = 0.4f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(bcol, 1.6f, 0.03f) };
+                        Game.I.AddChild(drop); drop.GlobalPosition = basePos + Vector3.Up * (GD.Randf() * 1.4f);
+                        float reach = 6f + GD.Randf() * 14f;
+                        var land = basePos + dir * reach; land.Y = 0.1f;
+                        var dt2 = drop.CreateTween(); dt2.SetParallel(true);
+                        dt2.TweenProperty(drop, "global_position", land, 0.35f + GD.Randf() * 0.25f).SetEase(Tween.EaseType.Out);
+                        dt2.TweenProperty(drop, "transparency", 1f, 0.55f);
+                        dt2.SetParallel(false);
+                        dt2.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(drop)) drop.QueueFree(); }));
+                    }
+                    Ring(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), bcol, 5f, 0.6f);
+                }
                 CamKick(0.8f);
                 Game.I.Sfx?.Release(DamageType.Blood);
-                Game.I.Hud?.Banner("BLOOD TSUNAMI");
+                Game.I.Sfx?.Thunder();
+                Game.I.Hud?.Banner(ModTsunami ? "BLOOD TSUNAMI — RADIAL" : "BLOOD TSUNAMI");
                 break;
             }
             case UltKind.Exsanguinate:
             {
                 int t = UltTier;
-                float rad = (12f + t * 2f) * S.SpellArea;
-                float pct = 0.12f + t * 0.035f;                 // % of max HP as damage
-                float exec = 0.18f + t * 0.035f + (ModExsang ? 0.12f : 0f);   // execute under this fraction of max HP
-                bool killed = false;
-                SetArm("draw", 0.75f);                          // hands reach out and draw the blood inward
-                var tcol = DamageTypes.Col(DamageType.Blood);
-                foreach (var e in Game.I.Enemies.ToArray())
+                // (REWORK) now a CHANNELED TRANSFORM: for the duration she bleeds everyone in her aura with a rising DoT,
+                // each kill POPS (nova) + heals her to FULL, and she keeps attacking normally. Works on bosses (Base-scaled).
+                _exsang = true;
+                _exsangRad = (12f + t * 2f) * (ModExsang ? 1.4f : 1f) * S.SpellArea;   // (MOD) Bloodthirst: bigger aura
+                _exsangDps = Base() * (1.3f + t * 0.35f) * (ModExsang ? 1.25f : 1f);    // (MOD) …and a harder-hitting harvest
+                _exsangTickT = 0f;
+                UltActive = true; UltActiveT = 12f + t * 1.0f; UltMax = UltActiveT;
+                GrantUltAura(DamageTypes.Col(DamageType.Blood), 3.0f);
+                SetArm("draw", 0.6f);
                 {
-                    if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-                    if (Flat(e, GlobalPosition) > rad + e.Radius) continue;
-                    if (!e.IsBoss && e.Hp <= e.MaxHp * exec) { e.Hurt(e.Hp + 9999f, DamageType.Blood, true); killed = true; }
-                    else { e.Hurt(e.MaxHp * pct, DamageType.Blood, true); if (e.Dead) killed = true; }
-                    e.Knockback(GlobalPosition, -2f);            // pull inward (negative = toward center)
-                    BloodReward(1f);
-                    Vector3 td = GlobalPosition - e.GlobalPosition; td.Y = 0f; float dist = td.Length();
-                    if (dist > 0.5f)
-                    {
-                        var ndir = td.Normalized();
-                        Game.I.VfxBloodTether(e.GlobalPosition, ndir, dist, tcol);          // a strand of blood drawn to her
-                        Game.I.NetMgr?.BroadcastVfx(9, e.GlobalPosition, ndir, dist, 0f, tcol);   // allies see the tethers too
-                    }
-                }
-                Game.I.DamageWorld(GlobalPosition, rad, Base());   // (FIX) the execute nova breaks props too
-                if (killed) Heal(S.MaxHp);                       // a kill drains her back to full
-                {
+                    float rad = _exsangRad;
                     var bcol = DamageTypes.Col(DamageType.Blood);
                     Ring(GlobalPosition, bcol, rad, 0.7f);
                     Ring(GlobalPosition, bcol.Lerp(Colors.White, 0.35f), rad * 0.55f, 0.5f);
                     var v = new Vfx(); Game.I.AddChild(v); v.GlobalPosition = GlobalPosition + new Vector3(0, 1f, 0);
-                    v.Init(new SphereMesh { Radius = rad * 0.5f, Height = rad }, bcol, 0.5f, 7f);
-                    // a column of drawn blood erupting up from her
-                    var col3 = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.3f, BottomRadius = 1.6f, Height = 9f }, MaterialOverride = Game.ToonEmissive(bcol, 2.2f, 0.03f) };
-                    Game.I.AddChild(col3); col3.GlobalPosition = GlobalPosition + new Vector3(0, 4.5f, 0);
-                    col3.Scale = new Vector3(0.2f, 1f, 0.2f);
+                    v.Init(new SphereMesh { Radius = rad * 0.6f, Height = rad * 1.2f }, bcol, 0.7f, 8f);
+                    Game.I.SpawnGroundSigil(GlobalPosition, rad, bcol);          // a blood sigil lingers on the ground
+                    Game.I.SpawnBloodMist(GlobalPosition, rad * 0.7f);           // a burst of gore
+
+                    // a TOWERING, churning column of drawn blood erupts and writhes up out of her (~2.5s, not a half-second flash)
+                    float ch = rad * 0.9f + 9f;
+                    var col3 = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.7f, BottomRadius = 2.6f, Height = ch, RadialSegments = 16 }, MaterialOverride = Game.ElementBoltMat(bcol, DamageType.Blood), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+                    Game.I.AddChild(col3); col3.GlobalPosition = GlobalPosition + new Vector3(0, ch * 0.5f - 0.5f, 0);
+                    col3.Scale = new Vector3(0.15f, 0.3f, 0.15f);
                     var ct = col3.CreateTween();
-                    ct.SetParallel(true);
-                    ct.TweenProperty(col3, "scale", new Vector3(1.3f, 1f, 1.3f), 0.18f);
-                    ct.TweenProperty(col3, "transparency", 1f, 0.5f);
-                    ct.SetParallel(false);
+                    ct.TweenProperty(col3, "scale", new Vector3(1.25f, 1f, 1.25f), 0.3f).SetEase(Tween.EaseType.Out);   // erupt
+                    ct.TweenProperty(col3, "scale", new Vector3(1.1f, 1f, 1.1f), 1.7f);                                 // writhe/settle
+                    ct.TweenProperty(col3, "scale", new Vector3(0.04f, 1.25f, 0.04f), 0.7f).SetEase(Tween.EaseType.In); // thin out + draw up as it dissipates (additive shader → fade by scale, not alpha)
                     ct.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(col3)) col3.QueueFree(); }));
+                    // a bright inner core so the column reads hot even from afar
+                    var core = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.28f, BottomRadius = 1.0f, Height = ch, RadialSegments = 10 }, MaterialOverride = Game.ToonEmissive(bcol.Lerp(Colors.White, 0.35f), 2.8f, 0.03f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+                    Game.I.AddChild(core); core.GlobalPosition = col3.GlobalPosition; core.Scale = new Vector3(0.15f, 0.3f, 0.15f);
+                    var cot = core.CreateTween();
+                    cot.TweenProperty(core, "scale", new Vector3(1f, 1f, 1f), 0.3f).SetEase(Tween.EaseType.Out);
+                    cot.TweenInterval(1.7f);
+                    cot.TweenProperty(core, "transparency", 1f, 0.7f);
+                    cot.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(core)) core.QueueFree(); }));
+                    // spiraling blood ribbons drawn up and around her — the siphoned life winding into the column
+                    for (int rb = 0; rb < 12; rb++)
+                    {
+                        float a0 = rb / 12f * Mathf.Tau;
+                        float rr = rad * 0.42f;
+                        var start = GlobalPosition + new Vector3(Mathf.Cos(a0) * rr, ch * 0.32f, Mathf.Sin(a0) * rr);
+                        var ribbon = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.34f, Height = ch * 0.7f, RadialSegments = 6 }, MaterialOverride = Game.ToonEmissive(bcol, 1.9f, 0.03f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+                        Game.I.AddChild(ribbon); ribbon.GlobalPosition = start;
+                        ribbon.RotationDegrees = new Vector3((GD.Randf() - 0.5f) * 40f, GD.Randf() * 360f, (GD.Randf() - 0.5f) * 40f);
+                        var rt = ribbon.CreateTween(); rt.SetParallel(true);
+                        rt.TweenProperty(ribbon, "global_position", start + new Vector3(0, ch * 0.5f, 0), 1.7f).SetEase(Tween.EaseType.Out).SetDelay(rb * 0.03f);
+                        rt.TweenProperty(ribbon, "rotation_degrees", ribbon.RotationDegrees + new Vector3(0, 260f, 0), 1.7f).SetDelay(rb * 0.03f);
+                        rt.TweenProperty(ribbon, "transparency", 1f, 1.3f).SetDelay(0.5f + rb * 0.03f);
+                        rt.SetParallel(false);
+                        rt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(ribbon)) ribbon.QueueFree(); }));
+                    }
+                    Game.I.RisingWisps(GlobalPosition, rad * 0.8f, bcol, 32, ch * 0.6f);   // drained life ascending into the column
                     Game.I.NetMgr?.BroadcastVfx(30, GlobalPosition, Vector3.Zero, 0f, 0f, bcol);   // (NEW) allies see the blood column
                 }
                 CamKick(0.9f);
@@ -4081,17 +6143,20 @@ public partial class Player : Node3D
             case UltKind.BloodRot:
             {
                 int t = UltTier;
-                float rad = (11f + t * 1.5f + (ModRot ? 4f : 0f)) * S.SpellArea;
-                float dps = Base() * (0.7f + t * 0.15f) * (ModRot ? 1.2f : 1f);
+                float radBase = 11f + t * 1.5f + (ModRot ? 4f : 0f);   // raw — the GroundField auto-scales this by SpellArea
+                float rad = radBase * S.SpellArea;                     // the direct bleed loop + ring + broadcast scale here
+                float dps = Base() * (1.1f + t * 0.2f) * (ModRot ? 1.2f : 1f);   // (REWORK) more base damage (was 0.7+0.15t); mod ×1.2 on top
+                float fieldDur = 14f + t;                              // (REWORK) initial field lasts 14+t s base
+                UltLingerT = fieldDur; UltMax = fieldDur;             // no recharge until it fades; drives the HUD meter
                 foreach (var e in Game.I.Enemies.ToArray())
                 {
                     if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                     if (Flat(e, GlobalPosition) > rad + e.Radius) continue;
-                    e.Bleed(dps, 6f + t, true);                  // rot: spreads when the victim dies
+                    e.Bleed(dps, fieldDur, true, 0, 1f, ModRot);   // (MOD) ModRot → the rot DoT PERSISTS on the foe until it dies (never auto-clears)
                 }
-                var f = new GroundField { Type = FieldType.Hex, Radius = rad, Dur = 6f + t, Power = dps * 0.4f, FromCombo = true, DType = DamageType.Blood, TintColor = DamageTypes.Col(DamageType.Blood), RotDps = dps };
+                var f = new GroundField { Type = FieldType.Hex, Radius = radBase, Dur = fieldDur, Power = dps * 0.4f, FromCombo = true, DType = DamageType.Blood, TintColor = DamageTypes.Col(DamageType.Blood), RotDps = dps, RotPersist = ModRot };
                 Game.I.AddChild(f); f.GlobalPosition = new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z);
-                Game.I.NetMgr?.BroadcastField((int)FieldType.Hex, new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z), rad, 6f + t, false, DamageTypes.Col(DamageType.Blood), (int)DamageType.Blood);   // (NEW) allies see the rot field
+                Game.I.NetMgr?.BroadcastField((int)FieldType.Hex, new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z), rad, fieldDur, false, DamageTypes.Col(DamageType.Blood), (int)DamageType.Blood);   // (NEW) allies see the rot field
                 {
                     var rcol = DamageTypes.Col(DamageType.Blood);
                     Ring(GlobalPosition, rcol, rad, 0.7f);
@@ -4123,17 +6188,37 @@ public partial class Player : Node3D
                 var g = new Guardian
                 {
                     Caster = this,
-                    Slams = 4 + t + (ModGuardian ? 2 : 0),
+                    Slams = 10 + t + (ModGuardian ? 2 : 0),      // (REWORK) more slams → the guardian stomps for ~13s+ base
                     SlamRadius = (7f + t * 0.8f + (ModGuardian ? 2f : 0f)) * S.SpellArea,
-                    SlamDamage = Base() * (2.6f + t * 0.6f),     // center value; tapers to ~40% at the edge
+                    SlamDamage = Base() * (3.6f + t * 0.8f),     // (REWORK) buffed center value; tapers to ~40% at the edge
                     Poison = ModGuardian ? Base() * 0.2f : 0f,
                     RootOnSlam = ModGuardian
                 };
                 Game.I.AddChild(g); g.GlobalPosition = new Vector3(at.X, 0f, at.Z);
                 ActiveGuardian = g;
-                UltActive = true; UltActiveT = g.Slams * 0.85f + 1.2f;
+                UltActive = true; UltActiveT = g.Slams * 1.35f; UltMax = UltActiveT;   // ~1.35s per stomp (SlamDur+RestDur); drives the HUD meter
+                {
+                    var ncol = DamageTypes.Col(DamageType.Nature);
+                    Ring(new Vector3(at.X, 0.05f, at.Z), ncol, g.SlamRadius, 0.7f);
+                    Ring(new Vector3(at.X, 0.05f, at.Z), ncol.Lerp(Colors.White, 0.3f), g.SlamRadius * 0.5f, 0.5f);
+                    // roots heave up in a ring as the ancient wakes
+                    for (int i = 0; i < 9; i++)
+                    {
+                        float a = i / 9f * Mathf.Tau, rr = 2.5f + GD.Randf() * 3f;
+                        var rp = new Vector3(at.X + Mathf.Cos(a) * rr, 0f, at.Z + Mathf.Sin(a) * rr);
+                        var root = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.35f, Height = 2.4f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(ncol, 0.8f, 0.05f) };
+                        Game.I.AddChild(root); root.GlobalPosition = new Vector3(rp.X, -1f, rp.Z);
+                        root.RotationDegrees = new Vector3((GD.Randf() - 0.5f) * 25f, GD.Randf() * 360f, (GD.Randf() - 0.5f) * 25f);
+                        var rt = root.CreateTween();
+                        rt.TweenProperty(root, "global_position", new Vector3(rp.X, 1.1f, rp.Z), 0.22f).SetEase(Tween.EaseType.Out).SetDelay(GD.Randf() * 0.2f);
+                        rt.TweenInterval(0.5f); rt.TweenProperty(root, "transparency", 1f, 0.4f);
+                        rt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(root)) root.QueueFree(); }));
+                    }
+                    Game.I.FallingMotes(new Vector3(at.X, 0.05f, at.Z), g.SlamRadius, ncol, 20, 10f);   // leaves shaken loose drift down
+                }
                 CamKick(0.7f);
                 Game.I.Sfx?.Release(DamageType.Nature);
+                Game.I.Sfx?.Creak();
                 Game.I.Hud?.Banner("ANCIENT GUARDIAN");
                 break;
             }
@@ -4141,19 +6226,59 @@ public partial class Player : Node3D
             {
                 int t = UltTier;
                 float sdur = LaunchStampede(t);
-                UltActive = true; UltActiveT = sdur + 0.4f;   // active flag spans the stampede
+                UltActive = true; UltActiveT = sdur + 0.4f; UltMax = UltActiveT;   // active flag spans the stampede; drives the HUD meter
+                {
+                    var ncol = DamageTypes.Col(DamageType.Nature);
+                    Vector3 fwd2 = -_cam.GlobalTransform.Basis.Z; fwd2.Y = 0; fwd2 = fwd2.Normalized();
+                    // a churn of kicked-up earth & leaves as the herd breaks loose ahead of her
+                    for (int i = 0; i < 22; i++)
+                    {
+                        float spread = (GD.Randf() - 0.5f) * 1.5f;
+                        var dir = fwd2.Rotated(Vector3.Up, spread);
+                        var puff = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.3f + GD.Randf() * 0.5f, Height = 0.7f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(ncol.Lerp(new Color(0.4f, 0.3f, 0.2f), 0.5f), 0.5f, 0.05f) };
+                        Game.I.AddChild(puff); puff.GlobalPosition = new Vector3(GlobalPosition.X, 0.3f, GlobalPosition.Z) + dir * (2f + GD.Randf() * 2f);
+                        var land = puff.GlobalPosition + dir * (5f + GD.Randf() * 8f) + Vector3.Up * (1f + GD.Randf());
+                        var pt = puff.CreateTween(); pt.SetParallel(true);
+                        pt.TweenProperty(puff, "global_position", land, 0.4f + GD.Randf() * 0.3f).SetEase(Tween.EaseType.Out);
+                        pt.TweenProperty(puff, "transparency", 1f, 0.6f);
+                        pt.SetParallel(false);
+                        pt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(puff)) puff.QueueFree(); }));
+                    }
+                    Ring(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), ncol, 5f, 0.5f);
+                }
                 CamKick(0.6f);
+                Game.I.Sfx?.Release(DamageType.Nature);
                 Game.I.Hud?.Banner("WILD SWARM — STAMPEDE!");
                 break;
             }
             case UltKind.Barkskin:
             {
                 int t = UltTier;
-                float dur = 7f + t * 1.0f + (ModBark ? 2.5f : 0f);
+                float dur = 15f + t * 1.0f + (ModBark ? 2.5f : 0f);   // (REWORK) base 15s
                 GrantBark(dur);                                       // self + your own ents
-                Game.I.NetMgr?.BroadcastBarkskin(dur);               // allies bark over too (each bursts on their own machine)
-                Game.I.NetMgr?.HealAlliesNear(GlobalPosition, 18f, S.MaxHp * 0.15f);
+                Game.I.NetMgr?.BroadcastBarkskin(dur);               // (REWORK) allies bark over too regardless of distance — broadcast, not radius; each barks their own ents locally
+                Game.I.NetMgr?.HealAlliesNear(GlobalPosition, 99999f, S.MaxHp * 0.15f);   // (REWORK) heal ALL allies, however far
                 Game.I.NetMgr?.BroadcastVfx(6, GlobalPosition, Vector3.Zero, 6f, 0f, DamageTypes.Col(DamageType.Nature));
+                {
+                    var ncol = DamageTypes.Col(DamageType.Nature);
+                    Ring(GlobalPosition, ncol, 4.5f, 0.5f);
+                    // slabs of bark heave up out of the earth and wrap over her in a tight shell
+                    for (int i = 0; i < 8; i++)
+                    {
+                        float a = i / 8f * Mathf.Tau;
+                        var plate = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.5f, 1.7f, 0.28f) }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(ncol.Lerp(new Color(0.35f, 0.24f, 0.12f), 0.65f), 0.4f, 0.05f) };
+                        Game.I.AddChild(plate);
+                        var seat = GlobalPosition + new Vector3(Mathf.Cos(a) * 1.05f, 1.0f, Mathf.Sin(a) * 1.05f);
+                        plate.GlobalPosition = GlobalPosition + new Vector3(Mathf.Cos(a) * 1.8f, -1.2f, Mathf.Sin(a) * 1.8f);
+                        plate.LookAt(GlobalPosition + Vector3.Up * 1.0f, Vector3.Up);
+                        var pt = plate.CreateTween();
+                        pt.TweenProperty(plate, "global_position", seat, 0.22f).SetEase(Tween.EaseType.Out).SetDelay(GD.Randf() * 0.12f);
+                        pt.TweenInterval(0.35f);
+                        pt.TweenProperty(plate, "transparency", 1f, 0.45f);   // the shell "sets" then the tell fades; the shield visual carries the duration
+                        pt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(plate)) plate.QueueFree(); }));
+                    }
+                    Game.I.FallingMotes(GlobalPosition, 5f, ncol, 16, 8f);   // leaves shaken loose drift down
+                }
                 UltActive = true; UltActiveT = dur;
                 CamKick(0.4f);
                 Game.I.Sfx?.Creak();                                 // the great tree groans as bark sheaths everyone
@@ -4171,7 +6296,7 @@ public partial class Player : Node3D
                 // and per-frame fling live in UpdateHurricane. Legendary (ModHurricane) speeds the caster up. (NEW)
                 int t = UltTier;
                 _hurriBaseY = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y - 0.1f);
-                UltActive = true; UltActiveT = 6f + t * 1.0f + (ModHurricane ? 2f : 0f);
+                UltActive = true; UltActiveT = 10f + t * 1.0f + (ModHurricane ? 2f : 0f); UltMax = UltActiveT;   // (REWORK) base 10s
                 _grounded = false; _vy = 6f;            // the leap kick-off; UpdateHurricane lifts her the rest of the way
                 _hurriFlingCd = 0f;
                 var col = DamageTypes.Col(DamageType.Wind);
@@ -4182,8 +6307,15 @@ public partial class Player : Node3D
                 cy.Init(this, new Vector3(GlobalPosition.X, _hurriBaseY, GlobalPosition.Z), radius, UltActiveT + 0.5f, 0f, true, true);  // visualOnly funnel we reposition each frame
                 _hurriVfx = cy;
                 Game.I.NetMgr?.BroadcastVfx(46, new Vector3(GlobalPosition.X, _hurriBaseY, GlobalPosition.Z), Vector3.Up, radius, UltActiveT, col);   // trackable funnel for allies
+                {
+                    var gp = new Vector3(GlobalPosition.X, _hurriBaseY + 0.05f, GlobalPosition.Z);
+                    Ring(gp, col, radius * 0.6f, 0.5f);
+                    Ring(gp, col.Lerp(Colors.White, 0.5f), 4f, 0.45f);
+                    Game.I.SwirlDebris(gp, radius * 0.7f, col, 30, false, 9f);   // the downdraft blasts grit up-and-out as she launches
+                }
                 CamKick(0.7f);
                 Game.I.Sfx?.Release(DamageType.Wind);
+                Game.I.Sfx?.Thunder();
                 Game.I.Hud?.Banner("HURRICANE");
                 break;
             }
@@ -4193,31 +6325,44 @@ public partial class Player : Node3D
                 // Maelstrom mod (ModCyclone) makes it bigger, longer, and pull harder.
                 int t = UltTier;
                 Vector3 pos = GroundAim();
-                float radius = 11f + t * 1.4f + (ModCyclone ? 4f : 0f);   // way bigger
-                float dur = 5.5f + t * 0.7f + (ModCyclone ? 2f : 0f);
-                float dps = Base() * (1.8f + t * 0.4f);                    // roughly doubled — grinds bosses/single targets too
+                float radius = (20f + t * 1.6f + (ModCyclone ? 8f : 0f)) * S.SpellArea;   // (BIG) a towering colossal tornado; Cyclone doesn't self-scale
+                float dur = 12f + t * 1.0f + (ModCyclone ? 2f : 0f);   // (REWORK) base 12s
+                UltLingerT = dur; UltMax = dur;   // the tornado grinds for `dur` s (UltActive is only a 1s flag); drives the HUD meter
+                float dps = Base() * (2.6f + t * 0.5f);                    // (REWORK) more base damage; grinds bosses/single targets too
                 var cy = new Cyclone();
                 Game.I.AddChild(cy);
-                cy.Init(this, pos, radius, dur, dps, ModCyclone, false);
+                cy.Init(this, pos, radius, dur, dps, ModCyclone, false, eatsProjectiles: true);   // (NEW) its wall eats enemy projectiles
                 Game.I.NetMgr?.BroadcastVfx(11, pos, Vector3.Up, radius, dur, DamageTypes.Col(DamageType.Wind));  // allies see a visual-only twister
+                {
+                    var wcol = DamageTypes.Col(DamageType.Wind);
+                    var gp = new Vector3(pos.X, 0.05f, pos.Z);
+                    Game.I.SpawnGroundSigil(gp, radius, wcol);            // a wind sigil brands the ground under the funnel
+                    Ring(gp, wcol, radius, 0.8f);
+                    Ring(gp, wcol.Lerp(Colors.White, 0.4f), radius * 0.6f, 0.6f);
+                    Ring(gp, wcol, radius * 1.3f, 1.0f);
+                    Game.I.SwirlDebris(gp, radius, wcol, 52, true, 12f);   // everything loose is dragged into the throat and flung up
+                }
                 UltActive = true; UltActiveT = 1.0f;   // brief flag; the Cyclone node self-manages its lifetime
-                CamKick(0.5f);
+                CamKick(0.9f);
                 Game.I.Sfx?.Release(DamageType.Wind);
+                Game.I.Sfx?.Thunder();
                 Game.I.Hud?.Banner("CYCLONE");
                 break;
             }
             case UltKind.Stormform:
             {
-                // self-buff: a windborne frenzy — big move speed + much faster casts for the duration.
-                // Eye of the Storm mod (ModStorm) makes it last longer.
+                // (REWORK) mirrors Wildfire Rush: it grants a stock of WIND RUSH charges (fire with Q). Each is a maxed
+                // wind-rush dash that leaves a ×3-speed WIND AREA + AIR MINES along the path. No heal, no flame trail.
                 int t = UltTier;
-                UltActive = true; UltActiveT = 7f + t * 1.2f; _stormMax = UltActiveT;   // ModStorm legendary is air-mines now, not duration (NEW)
-                _mineDropT = 0.8f;
+                _windCharges = 2 + (t + 1) / 2 + (ModStorm ? 2 : 0);   // (NERF) base 2 (was 3); +2 charges with Eye of the Storm
+                _windWindowT = 12f;                                     // window to spend them
+                UltActive = true; UltActiveT = _windWindowT;            // HUD shows CHARGES (not a duration) for this ult
+                GrantUltAura(DamageTypes.Col(DamageType.Wind), 2.4f);
                 Ring(GlobalPosition, DamageTypes.Col(DamageType.Wind), 6f, 0.6f);
                 Ring(GlobalPosition, DamageTypes.Col(DamageType.Wind).Lerp(Colors.White, 0.4f), 3.5f, 0.45f);
                 CamKick(0.5f);
                 Game.I.Sfx?.Release(DamageType.Wind);
-                Game.I.Hud?.Banner("STORMFORM");
+                Game.I.Hud?.Banner($"STORMFORM — {_windCharges} wind rushes [Q]");
                 break;
             }
             // ---- Frost witch ults (NEW) ----
@@ -4225,12 +6370,19 @@ public partial class Player : Node3D
             {
                 int t = UltTier;
                 Vector3 pos = GroundAim();
-                float radius = (12f + t * 2f) * (ModBlizzard ? 1.4f : 1f) * S.SpellArea;
-                float dur = 6f + t * 0.8f;
-                float dps = Base() * (0.9f + t * 0.25f) * (ModBlizzard ? 1.35f : 1f);
+                float radius = (15f + t * 2.5f) * (ModBlizzard ? 1.4f : 1f) * S.SpellArea;   // (REWORK) larger base area
+                float dur = 15f + t * 1.0f;                                                   // (REWORK) base 15s
+                UltLingerT = dur; UltMax = dur;   // the blizzard field lingers `dur` s (UltActive is a 1s flag); drives the HUD meter
+                float dps = Base() * (1.2f + t * 0.3f) * (ModBlizzard ? 1.35f : 1f);          // (REWORK) more base damage
                 float freezeChance = ModBlizzard ? 1f : Mathf.Min(0.5f, 0.10f + t * 0.10f);   // Whiteout: icicles always freeze
                 var bz = new Blizzard(); Game.I.AddChild(bz); bz.Init(this, pos, radius, dur, dps, freezeChance, false);
                 Game.I.NetMgr?.BroadcastVfx(51, pos, Vector3.Up, radius, dur, DamageTypes.Col(DamageType.Frost));
+                {
+                    var fcol = DamageTypes.Col(DamageType.Frost);
+                    Ring(new Vector3(pos.X, 0.05f, pos.Z), fcol, radius, 0.7f);
+                    Ring(new Vector3(pos.X, 0.05f, pos.Z), fcol.Lerp(Colors.White, 0.5f), radius * 0.55f, 0.5f);
+                    Game.I.FallingMotes(pos, radius, fcol.Lerp(Colors.White, 0.4f), 34, 15f);   // the sky whites out with driving snow
+                }
                 UltActive = true; UltActiveT = 1f;
                 CamKick(0.6f); Game.I.Sfx?.Release(DamageType.Frost); Game.I.Hud?.Banner("BLIZZARD");
                 break;
@@ -4238,25 +6390,58 @@ public partial class Player : Node3D
             case UltKind.FrostElemental:
             {
                 int t = UltTier;
-                float dur = 8f + t * 1.5f;
+                float dur = 11f + t * 1.0f;                                                    // (REWORK) base 11s
+                UltLingerT = dur; UltMax = dur;   // the elemental fights for `dur` s (UltActive is a 1s flag); drives the HUD meter
                 float size = (2.6f + t * 0.4f) * (ModFrostElem ? 1.4f : 1f) * S.SpellArea;
-                float dmg = Base() * (1.1f + t * 0.3f);
+                float dmg = Base() * (1.5f + t * 0.35f);                                        // (REWORK) a bit more base damage
                 var fe = new FrostElemental(); Game.I.AddChild(fe); fe.Init(this, GlobalPosition, size, dur, dmg, false, ModFrostElem);   // Avalanche: splits on melt
                 Game.I.NetMgr?.BroadcastVfx(53, GlobalPosition, Vector3.Zero, size, dur, DamageTypes.Col(DamageType.Frost));
+                {
+                    // the golem coalesces out of the ground — shards of ice heave up and lock together where it forms
+                    var fcol = DamageTypes.Col(DamageType.Frost);
+                    var gp = new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z);
+                    Ring(gp, fcol.Lerp(Colors.White, 0.5f), size * 2.2f, 0.7f);
+                    int shards = 10 + t;
+                    for (int i = 0; i < shards; i++)
+                    {
+                        float a = i / (float)shards * Mathf.Tau, rr = size * (0.8f + GD.Randf() * 1.1f);
+                        var sp = gp + new Vector3(Mathf.Cos(a) * rr, 0f, Mathf.Sin(a) * rr);
+                        float h = 1.4f + GD.Randf() * (size * 0.9f);
+                        var shard = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.28f + GD.Randf() * 0.22f, Height = h, RadialSegments = 5 }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(fcol.Lerp(Colors.White, 0.35f), 1.1f, 0.06f) };
+                        Game.I.AddChild(shard); shard.GlobalPosition = new Vector3(sp.X, -h, sp.Z);
+                        shard.RotationDegrees = new Vector3((GD.Randf() - 0.5f) * 25f, GD.Randf() * 360f, (GD.Randf() - 0.5f) * 25f);
+                        var st = shard.CreateTween();
+                        st.TweenProperty(shard, "global_position", new Vector3(sp.X, h * 0.35f, sp.Z), 0.2f).SetEase(Tween.EaseType.Out).SetDelay(GD.Randf() * 0.18f);
+                        st.TweenInterval(0.6f); st.TweenProperty(shard, "transparency", 1f, 0.5f);
+                        st.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(shard)) shard.QueueFree(); }));
+                    }
+                    Game.I.FallingMotes(gp, size * 2f, fcol.Lerp(Colors.White, 0.4f), 20, 10f);
+                }
                 UltActive = true; UltActiveT = 1f;
-                CamKick(0.7f); Game.I.Sfx?.Release(DamageType.Frost); Game.I.Hud?.Banner("FROST ELEMENTAL");
+                CamKick(0.7f); Game.I.Sfx?.Release(DamageType.Frost); Game.I.Sfx?.Freeze(GlobalPosition); Game.I.Hud?.Banner("FROST ELEMENTAL");
                 break;
             }
             case UltKind.DeepFreeze:
             {
+                // (REWORK) GLACIAL SUNDER — palms to the sky, huge jagged icicles erupt under the crowd: hard hit + fling-up,
+                // then solid obstacles that radiate cold. Count/AoE/damage/freeze all scale with tiers; can crit; mod flash-freezes + shatters.
                 int t = UltTier;
                 Vector3 pos = GroundAim();
-                float radius = (10f + t * 1.5f) * S.SpellArea;
-                float dur = (3f + t * 0.6f) * (ModDeepFreeze ? 1.6f : 1f);
-                var df = new DeepFreeze(); Game.I.AddChild(df); df.Init(this, pos, radius, dur, false, ModDeepFreeze);   // Absolute Zero: longer + shatters foes inside on end
-                Game.I.NetMgr?.BroadcastVfx(52, pos, Vector3.Up, radius, dur, DamageTypes.Col(DamageType.Frost));
+                float area = (12f + t * 2f) * S.SpellArea;
+                float dur = 10f + t * 1.0f;
+                UltLingerT = dur; UltMax = dur;   // the sunder keeps erupting spears for `dur` s; drives the HUD meter
+                float thrust = Base() * (2.2f + t * 0.6f);     // emergence hit — hits hard, can crit
+                float cold = Base() * (0.25f + t * 0.1f);      // per cold-tick, slight
+                var df = new DeepFreeze(); Game.I.AddChild(df); df.Init(this, pos, area, dur, false, ModDeepFreeze, t, thrust, cold);
+                Game.I.NetMgr?.BroadcastVfx(52, pos, Vector3.Up, area, dur, DamageTypes.Col(DamageType.Frost));
+                {
+                    var fcol = DamageTypes.Col(DamageType.Frost);
+                    Ring(new Vector3(pos.X, 0.05f, pos.Z), fcol.Lerp(Colors.White, 0.5f), area, 0.8f);
+                    Game.I.FallingMotes(pos, area, fcol.Lerp(Colors.White, 0.4f), 24, 13f);
+                }
+                SetArm("palmsup", 0.6f);
                 UltActive = true; UltActiveT = 1f;
-                CamKick(0.5f); Game.I.Sfx?.Freeze(pos); Game.I.Hud?.Banner("DEEP FREEZE");
+                CamKick(0.7f); Game.I.Sfx?.Freeze(pos); Game.I.Sfx?.Release(DamageType.Frost); Game.I.Hud?.Banner("GLACIAL SUNDER");
                 break;
             }
             // ---- Forsaken witch ults (NEW) ----
@@ -4265,12 +6450,19 @@ public partial class Player : Node3D
                 int t = UltTier;
                 float radius = (12f + t * 0.8f) * (ModPlague ? 1.4f : 1f) * S.SpellArea;
                 _hexGroup = ++_curseGroupSeq;                 // one shared mega-group so damage cascades across everyone inside
-                UltActive = true; UltActiveT = 10f + t * 1.5f;
+                UltActive = true; UltActiveT = 15f + t * 1.0f; UltMax = UltActiveT;   // (REWORK) base 15s + HUD meter
                 _hexTickT = 0f; _hexNetT = 0f;
                 if (_hexVfx != null && GodotObject.IsInstanceValid(_hexVfx)) _hexVfx.QueueFree();
                 _hexVfx = BuildHexField(radius); Game.I.AddChild(_hexVfx);
                 _hexVfx.GlobalPosition = new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z);
-                Ring(GlobalPosition, DamageTypes.Col(DamageType.Curse), radius, 0.7f);
+                {
+                    var ccol = DamageTypes.Col(DamageType.Curse);
+                    Game.I.SpawnGroundSigil(GlobalPosition, radius, ccol);   // a hex sigil brands the ground
+                    Ring(GlobalPosition, ccol, radius, 0.7f);
+                    Ring(GlobalPosition, ccol.Lerp(Colors.White, 0.35f), radius * 0.55f, 0.5f);
+                    CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, ccol, 2.2f);   // a dark heart collapses inward as the circle bites
+                    Game.I.RisingWisps(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), radius, ccol, 34, 7f);   // souls torn loose all across the ring
+                }
                 Game.I.NetMgr?.BroadcastVfx(59, GlobalPosition, Vector3.Zero, radius, UltActiveT, DamageTypes.Col(DamageType.Curse));
                 CamKick(0.5f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.Hud?.Banner("HEX CIRCLE");
                 break;
@@ -4279,56 +6471,273 @@ public partial class Player : Node3D
             {
                 int t = UltTier;
                 float radius = (11f + t * 1.5f) * S.SpellArea;
-                UltActive = true; UltActiveT = 7f + t * 1.0f;   // a proper flight-channel length, in line with Hurricane/Stormform
+                UltActive = true; UltActiveT = 13f + t * 1.0f; UltMax = UltActiveT;   // (REWORK) base 13s flight-channel + HUD meter
                 _drainBank = 0f; _drainBaseY = GlobalPosition.Y; _drainTickT = 0f; _drainNetT = 0f;
                 _grounded = false; _vy = 0f; _noFall = Mathf.Max(_noFall, 1f);   // she takes to the air for the channel
                 if (_drainVfx != null && GodotObject.IsInstanceValid(_drainVfx)) _drainVfx.QueueFree();
                 _drainVfx = BuildDrainAura(radius); AddChild(_drainVfx);   // parented to her → the aura rides along as she flies
-                Ring(GlobalPosition, DamageTypes.Col(DamageType.Curse), radius, 0.6f);
+                {
+                    var ccol = DamageTypes.Col(DamageType.Curse);
+                    Game.I.SpawnGroundSigil(GlobalPosition, radius, ccol);
+                    Ring(GlobalPosition, ccol, radius, 0.6f);
+                    Ring(GlobalPosition, ccol.Lerp(Colors.White, 0.35f), radius * 0.5f, 0.5f);
+                    Game.I.RisingWisps(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), radius, ccol, 40, 9f);   // life itself is dragged up out of the field toward her
+                }
                 Game.I.NetMgr?.BroadcastVfx(60, GlobalPosition, Vector3.Zero, radius, UltActiveT, DamageTypes.Col(DamageType.Curse));
                 CamKick(0.6f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.Hud?.Banner("LIFE DRAIN — Space/Ctrl to fly, drain then release");
                 break;
             }
             case UltKind.LifeCurse:
-                FireLifeCurse(UltTier);   // instant missing-HP rune nuke (no channel)
+                StartSpecter();   // (REWORK) SPECTER — immaterial projection: heal, ×3 speed, untouchable; release a %HP nova on retrigger/timeout
                 break;
             case UltKind.MeteorDescent:
             {
-                UltActive = true;
+                UltActive = true; UltActiveT = 5f; UltMax = 5f;   // (REWORK) aim window drives the HUD duration meter
                 _meteorAscend = true; _meteorAscendT = 5f; _meteorBaseY = GlobalPosition.Y;
+                _meteorRainLeft = 3 + UltTier + (ModMeteorDesc ? 3 : 0);   // (REWORK) meteors rain at random while she's aloft (+3 with Extinction Event); scales with tiers
+                _meteorRainT = 0.4f;
                 _grounded = false; _vy = 0f; _noFall = 999f; _iframe = 999f;   // rise, invulnerable, no fall damage until the slam
                 EndFlameCone();
-                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 6f, 0.6f);
+                {
+                    var ecol = DamageTypes.Col(DamageType.Ember);
+                    var feet = new Vector3(GlobalPosition.X, GlobalPosition.Y - 0.4f, GlobalPosition.Z);
+                    Ring(feet, ecol, 6f, 0.6f);
+                    Ring(feet, ecol.Lerp(Colors.White, 0.4f), 3.5f, 0.5f);
+                    // a roaring column of fire hurls her aloft
+                    var column = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 1.4f, BottomRadius = 2.4f, Height = 16f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(ecol, 2.4f, 0.03f) };
+                    Game.I.AddChild(column); column.GlobalPosition = feet + Vector3.Up * 7f;
+                    column.Scale = new Vector3(0.2f, 1f, 0.2f);
+                    var colt = column.CreateTween(); colt.SetParallel(true);
+                    colt.TweenProperty(column, "scale", new Vector3(1.3f, 1f, 1.3f), 0.2f).SetEase(Tween.EaseType.Out);
+                    colt.TweenProperty(column, "transparency", 1f, 0.6f);
+                    colt.SetParallel(false);
+                    colt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(column)) column.QueueFree(); }));
+                    Game.I.RisingWisps(feet, 6f, ecol, 30, 14f);   // embers stream up in her wake
+                    Game.I.SpawnEmberBurst(feet + Vector3.Up * 0.5f, 5f);
+                }
                 Game.I.NetMgr?.BroadcastVfx(68, GlobalPosition, Vector3.Up, 0f, 5f, DamageTypes.Col(DamageType.Ember));   // allies see her launch skyward
-                CamKick(0.5f); Game.I.Sfx?.ChargeUp(DamageType.Ember); Game.I.Hud?.Banner("METEOR DESCENT — aim, then drop");
+                CamKick(0.7f); Game.I.Sfx?.ChargeUp(DamageType.Ember); Game.I.Sfx?.Thunder(); Game.I.Hud?.Banner("METEOR DESCENT — aim, then drop");
                 break;
             }
             case UltKind.WildfireRush:
             {
                 int t = UltTier;
                 UltActive = true; UltActiveT = 10f;
-                _flameDashCharges = 3 + (t + 1) / 2;             // 3 → 5 dashes across tiers
+                _flameDashCharges = 3 + (t + 1) / 2 + (ModWildfire ? 2 : 0);   // 3 → 5 dashes across tiers (+2 with Firestorm)
                 _flameDashWindowT = 10f;
                 BurnLifestealT = 16f;                            // her burn ticks heal her while the trails burn
-                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 5f, 0.5f);
+                {
+                    var ecol = DamageTypes.Col(DamageType.Ember);
+                    Ring(GlobalPosition, ecol, 5f, 0.5f);
+                    Ring(GlobalPosition, ecol.Lerp(Colors.White, 0.4f), 3f, 0.4f);
+                    // she ignites — jets of flame lick up around her feet as the rush kindles
+                    for (int i = 0; i < 8; i++)
+                    {
+                        float a = i / 8f * Mathf.Tau, rr = 0.9f + GD.Randf() * 0.9f;
+                        var jet = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.3f, Height = 1.6f + GD.Randf() * 1.2f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, MaterialOverride = Game.ToonEmissive(ecol, 2.2f, 0.03f) };
+                        Game.I.AddChild(jet);
+                        jet.GlobalPosition = GlobalPosition + new Vector3(Mathf.Cos(a) * rr, 0.3f, Mathf.Sin(a) * rr);
+                        jet.Scale = new Vector3(1f, 0.1f, 1f);
+                        var jt = jet.CreateTween(); jt.SetParallel(true);
+                        jt.TweenProperty(jet, "scale", new Vector3(1f, 1.2f, 1f), 0.16f).SetEase(Tween.EaseType.Out).SetDelay(GD.Randf() * 0.1f);
+                        jt.TweenProperty(jet, "transparency", 1f, 0.5f);
+                        jt.SetParallel(false);
+                        jt.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(jet)) jet.QueueFree(); }));
+                    }
+                    Game.I.RisingWisps(GlobalPosition, 4f, ecol, 20, 6f);   // embers curl up off her
+                }
                 Game.I.NetMgr?.BroadcastVfx(69, GlobalPosition, Vector3.Zero, 5f, 0f, DamageTypes.Col(DamageType.Ember));
                 CamKick(0.4f); Game.I.Sfx?.Release(DamageType.Ember); Game.I.Hud?.Banner($"WILDFIRE RUSH — {_flameDashCharges} flame dashes [Q]");
                 break;
             }
             case UltKind.PhoenixAscend:
             {
+                // (FULL REWORK) hurl a giant flaming phoenix at the cursor: it pierces + burns a line, GRABS every non-boss
+                // it touches, banks skyward carrying them ~45u, then detonates — grabbed foes take heavy dmg + are flung,
+                // grazed bosses detonate in place for a capped %HP. Host simulates; every machine flies the visual bird.
                 int t = UltTier;
-                UltActive = true; UltActiveT = 10f + t * 1.5f;
-                _phoenix = true; _phoenixRebirth = true; _phoenixAuraT = 0f;
-                _grounded = false; _vy = 2f; _noFall = 999f;
-                if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) _phoenixVfx.QueueFree();
-                _phoenixVfx = BuildPhoenixAura(); AddChild(_phoenixVfx);
-                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 7f, 0.7f);
-                Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition, Vector3.Zero, UltActiveT, 0f, DamageTypes.Col(DamageType.Ember));
-                CamKick(0.6f); Game.I.Sfx?.ModEmber(GlobalPosition); Game.I.Hud?.Banner("PHOENIX ASCENDANT");
+                Vector3 aim = GroundAim();
+                Vector3 dir = new Vector3(aim.X - GlobalPosition.X, 0f, aim.Z - GlobalPosition.Z);
+                if (dir.LengthSquared() < 0.01f) { dir = -GlobalTransform.Basis.Z; dir.Y = 0f; }
+                dir = dir.Normalized();
+                Vector3 origin = GlobalPosition + dir * 1.2f + Vector3.Up * 0.6f;
+                float touchDmg = Base() * (1.2f + t * 0.3f) * ComboMul();       // pierce hit — scales with tiers
+                float grabDmg = Base() * (6f + t * 2f) * ComboMul();            // skyburst on grabbed foes — hits HARD
+                float bossFrac = 0.10f + t * 0.03f;                            // grazed bosses lose this % max HP (capped)
+                Game.I.FirePhoenixDive(this, origin, dir, t, ModPhoenix, touchDmg, grabDmg, bossFrac, Base());
+                SetArm("thrust", 0.5f);
+                _phoenix = false; _phoenixRebirth = false;   // not a transform anymore — she stays grounded and casts normally
+                UltActive = true; UltActiveT = 4.5f; UltMax = 0f;   // brief ACTIVE window (gates recharge while the bird flies); no duration bar
+                Ring(GlobalPosition, DamageTypes.Col(DamageType.Ember), 6f, 0.6f);
+                Game.I.FallingMotes(GlobalPosition, 6f, DamageTypes.Col(DamageType.Ember), 20, 9f);
+                CamKick(0.7f); Game.I.Sfx?.Release(DamageType.Ember); Game.I.Sfx?.Thunder(); Game.I.Hud?.Banner("PHOENIX ASCENDANT");
+                break;
+            }
+            // ---- Arcane witch ults (NEW) ----
+            case UltKind.ArcaneAscend:
+            {
+                int t = UltTier;
+                UltActive = true; UltActiveT = (12f + t * 1.5f) * (ModArcStorm ? 1.35f : 1f); UltDmgMul = 2f; UltMax = UltActiveT;   // a long transformation channel (Storm Incarnate: longer) + duration meter
+                _arcaneAscend = true; _arcaneAscendFireT = 0f;
+                var acol = DamageTypes.Col(DamageType.Arcane); Vector3 gp = GlobalPosition;
+                _grounded = false; _vy = 22f; _noFall = 999f;   // an arcane bolt erupts her skyward
+                float lr = (5f + t * 0.6f) * S.SpellArea, ldmg = Base() * (3f + t * 0.8f) * ComboMul();   // launch blast — scales with AoE
+                foreach (var e in Game.I.Enemies.ToArray())
+                {
+                    if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || Flat(e, gp) > lr + e.Radius) continue;
+                    bool crit = RollCrit(); float d = ldmg; if (crit) d *= CritMult();
+                    e.Hurt(d, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, d, DamageType.Arcane, crit);
+                }
+                Game.I.DamageWorld(gp, lr, ldmg);
+                Game.I.SpawnArcaneRupture(gp + Vector3.Up * 0.5f, lr);
+                Game.I.SpawnGroundSigil(gp, lr, acol);
+                Game.I.SpawnArcaneKamehameha(gp, Vector3.Up, 16f, 1.8f, acol);   // a raw-arcane column erupts skyward at the launch
+                Game.I.NetMgr?.BroadcastVfx(79, gp + Vector3.Up * 0.5f, Vector3.Zero, lr, 0f, acol);
+                float sy = Game.I.SurfaceHeight(gp, gp.Y);
+                GlobalPosition = new Vector3(gp.X, sy + 8f, gp.Z);   // …then she rides it up into the sky
+                if (_arcaneAura != null && GodotObject.IsInstanceValid(_arcaneAura)) _arcaneAura.QueueFree();
+                _arcaneAura = new ArcaneAura(); AddChild(_arcaneAura); _arcaneAura.Init(2.9f, 0.08f);   // transformation aura rides her
+                SetArm("conjure", 0.7f); CamKick(1.4f); Game.I.Sfx?.ChargeUp(DamageType.Arcane); Game.I.Sfx?.ArcaneBlast(gp); Game.I.Sfx?.Thunder(); Game.I.Hud?.Banner("ARCANE ASCENSION — Space/Ctrl to fly, LMB lightning");
+                break;
+            }
+            case UltKind.ArcaneEruption:
+            {
+                int t = UltTier;
+                float radiusB = (13f + t * 2f) * (ModArcCataclysm ? 1.4f : 1f), radius = radiusB * S.SpellArea;   // (REWORK) bigger base; grows with AoE cards + tier (Cataclysm: bigger)
+                float centerDmg = Base() * (7f + t * 2f) * ComboMul();      // (REWORK) stronger base core
+                float edgeDmg = Base() * (2f + t * 0.5f) * ComboMul();      // (REWORK) stronger base rim
+                var col = DamageTypes.Col(DamageType.Arcane); var here = GlobalPosition;
+                foreach (var e in Game.I.Enemies.ToArray())
+                {
+                    if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                    float d = Flat(e, here); if (d > radius + e.Radius) continue;
+                    float tt = Mathf.Clamp(d / radius, 0f, 1f);
+                    float dm = Mathf.Lerp(centerDmg, edgeDmg, tt);            // more damage the closer to her
+                    bool crit = RollCrit(); if (crit) dm *= CritMult();
+                    e.Hurt(dm, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, dm, DamageType.Arcane, crit);
+                    if (!e.Dead)   // survivors flung back + knocked up, harder near the center (host-authoritative)
+                    {
+                        float close = 1f - tt;
+                        Vector3 outw = e.GlobalPosition - here; outw.Y = 0f; outw = outw.LengthSquared() > 0.01f ? outw.Normalized() : Vector3.Forward;
+                        e.Fling(outw * ((9f + t) * (0.5f + close)) + Vector3.Up * ((8f + t) * (0.5f + close)));
+                        // (FIX) bosses + heavy foes shrug off the fling (Enemy.Fling barely budges them / no-ops on bosses),
+                        // so hit THEM with a hard horizontal KNOCKBACK instead — scales with the ult's tier + proximity.
+                        if (!e.Flingable) e.Knockback(here, (10f + t * 2.5f) * (0.55f + 0.45f * close));
+                    }
+                }
+                Game.I.DamageWorld(here, radius, centerDmg);
+                Ring(here, col, radius, 0.7f); Ring(here, col.Lerp(Colors.White, 0.5f), radius * 0.5f, 0.5f); Ring(here, col, radius * 1.35f, 0.95f);
+                Game.I.SpawnArcaneRupture(here + Vector3.Up * 0.6f, radius);
+                Game.I.SpawnGroundSigil(here, radius, col);
+                for (int i = 0; i < 10; i++)   // a crown of raw-arcane pillars heaves up around the blast
+                {
+                    float a = i / 10f * Mathf.Tau + GD.Randf();
+                    var pp = here + new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)) * radius * (0.3f + GD.Randf() * 0.6f);
+                    Game.I.SpawnArcaneKamehameha(new Vector3(pp.X, Game.I.SurfaceHeight(pp, here.Y), pp.Z), Vector3.Up, 6f + GD.Randf() * 5f, 0.5f, col);
+                }
+                float efDur = (ModArcCataclysm ? 8f : 5f) + t;   // (REWORK) the field lingers a bit longer, scales with tiers
+                var ef = new GroundField { Type = FieldType.Hex, Radius = radiusB, Dur = efDur, Power = Base() * (0.9f + t * 0.15f) * (ModArcCataclysm ? 1.5f : 1f), DType = DamageType.Arcane, TintColor = col, FromCombo = true, SlowMul = 0.6f };
+                Game.I.AddChild(ef); ef.GlobalPosition = new Vector3(here.X, 0.05f, here.Z);   // lingering unstable field keeps grinding
+                UltLingerT = efDur; UltMax = efDur;   // (REWORK) the unstable field grinds for its duration (UltActive is a 0.6s flag) — duration meter + no recharge until it fades
+                if (ModArcCataclysm) SpawnArcaneRift(here, radius * 0.85f, centerDmg * 0.7f);   // Cataclysm: a second delayed shockwave (~1s later)
+                UltActive = true; UltActiveT = 0.6f;
+                SetArm("conjure", 0.6f); CamKick(1.5f); Game.I.Sfx?.ArcaneBlast(here); Game.I.Sfx?.Thunder(); Game.I.Hud?.Banner("ARCANE ERUPTION");
+                break;
+            }
+            case UltKind.ArcaneOvercharge:
+            {
+                // (FULL REWORK) ARCANE STORM — a large field at the cursor that rains arcane bolts on any foe inside.
+                // Bolts scale with the target's max HP (capped for bosses), can crit with her passive, and each foe can
+                // be struck once per second. Lingers 13s base (+tier). Host simulates; every machine renders the storm.
+                int t = UltTier;
+                Vector3 pos = GroundAim(); pos = new Vector3(pos.X, Game.I.SurfaceHeight(pos, pos.Y), pos.Z);
+                float radius = (16f + t * 2f) * (ModArcUnbound ? 1.4f : 1f) * S.SpellArea;   // Singularity: bigger storm
+                float dur = 13f + t;
+                float baseDmg = Base() * (1.0f + t * 0.25f);         // per bolt
+                float hpScale = 0.03f + t * 0.008f;                  // + this fraction of the target's max HP per bolt
+                float bossCapMul = 2.5f + t * 0.3f;                  // bosses: hp-bonus capped at base×this (strong but bounded)
+                Game.I.FireArcaneStorm(this, pos, radius, dur, ModArcUnbound, t, baseDmg, hpScale, bossCapMul, CritChanceNow, CritMultPublic());
+                UltActive = true; UltActiveT = 1f; UltLingerT = dur; UltMax = dur;   // brief cast flag + the field-linger duration meter (no recharge until it fades)
+                var ocol = DamageTypes.Col(DamageType.Arcane);
+                Ring(pos, ocol, radius, 0.7f);
+                Ring(pos, ocol.Lerp(Colors.White, 0.4f), radius * 0.55f, 0.5f);
+                Game.I.FallingMotes(pos, radius, ocol, 30, 15f);
+                SetArm("conjure", 0.6f); CamKick(0.9f); Game.I.Sfx?.ChargeUp(DamageType.Arcane); Game.I.Sfx?.ArcaneBlast(pos); Game.I.Sfx?.Thunder(); Game.I.Hud?.Banner("ARCANE STORM");
                 break;
             }
         }
+    }
+
+    // Arcane ULT 1 — Ascension: free flight (Space up / Ctrl down); LMB rains massive chain-lightning that hits several
+    // foes at once and arcs to their neighbours; crits heal (passive) and kills lightly heal (this ult).
+    private void UpdateArcaneAscend(float dt)
+    {
+        if (Downed || !Game.I.SimActive) { EndArcaneAscend(); return; }
+        Floating = false;
+        Vector3 dir = InputDir();
+        Vector3 np = (dir != Vector3.Zero) ? GlobalPosition + dir * (S.Speed * 1.1f) * dt : GlobalPosition;
+        float vy = 0f;
+        if (Input.IsActionPressed("jump")) vy += 11f;
+        if (Input.IsActionPressed("descend")) vy -= 11f;
+        float ny = GlobalPosition.Y + vy * dt;
+        float floor = Game.I.SurfaceHeight(np, GlobalPosition.Y) + 3f;   // stays aloft
+        if (ny < floor) ny = floor;
+        GlobalPosition = ClampPos(new Vector3(np.X, ny, np.Z));
+        _grounded = false; _vy = 0f; _noFall = 1f;
+        _arcaneAscendFireT -= dt;
+        if (Input.IsActionPressed("cast") && _arcaneAscendFireT <= 0f) { _arcaneAscendFireT = Mathf.Max(0.14f, S.FireCd) * 1.15f; FireArcaneUltLightning(); }
+        UltActiveT -= dt;
+        if (UltActiveT <= 0f) EndArcaneAscend();
+    }
+    private void EndArcaneAscend() { _arcaneAscend = false; UltActive = false; UltDmgMul = 1f; _noFall = 3f; _iframe = Mathf.Max(_iframe, 0.3f); if (_arcaneAura != null && GodotObject.IsInstanceValid(_arcaneAura)) { _arcaneAura.QueueFree(); _arcaneAura = null; } }
+
+    private void FireArcaneUltLightning()
+    {
+        Vector3 eye = EyePos, aim = AimDir();
+        var col = DamageTypes.Col(DamageType.Arcane);
+        float range = 40f * S.SpellRange, dmg = Base() * (1.6f + UltTier * 0.4f) * ComboMul() * ArcanePowerMul;   // UltDmgMul=2 already doubles Base while aloft
+        float healKill = S.MaxHp * (0.02f + UltTier * 0.006f);
+        int maxTargets = 3 + UltTier + (ModArcStorm ? 2 : 0);   // Storm Incarnate: strikes more foes at once
+        Vector3 start = (_handMeshR != null && GodotObject.IsInstanceValid(_handMeshR)) ? _handMeshR.GlobalPosition : eye + aim * 0.5f;
+        var cand = new System.Collections.Generic.List<(float a, Enemy e)>();
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            var to = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f - eye; float d = to.Length(); if (d > range) continue;
+            if (aim.Dot(to / Mathf.Max(d, 0.01f)) < 0.55f) continue;   // ~57° forward cone
+            cand.Add((aim.Dot(to / Mathf.Max(d, 0.01f)), e));
+        }
+        cand.Sort((x, y) => y.a.CompareTo(x.a));
+        int hit = 0;
+        void Zap(Vector3 from, Enemy e, float coeff)
+        {
+            var ep = e.GlobalPosition + Vector3.Up * e.Radius * 0.5f;
+            bool crit = RollCrit(); float d = dmg * coeff; if (crit) d *= CritMult();
+            bool wasAlive = !e.Dead;
+            e.Hurt(d, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, d, DamageType.Arcane, crit);
+            if (wasAlive && e.Dead && !Downed) Heal(healKill);   // kills lightly heal her
+            Game.I.SpawnArcaneLightning(new System.Collections.Generic.List<Vector3> { from, ep }, 1f);
+            Game.I.NetMgr?.BroadcastVfx(78, from, (ep - from).Normalized(), (ep - from).Length(), 0f, col);
+        }
+        foreach (var (_, e) in cand)
+        {
+            if (hit >= maxTargets) break; hit++;
+            Zap(start, e, 1f);
+            int arcs = ModArcStorm ? 2 : 1; Enemy prev = e;   // arc to neighbour(s) — Storm Incarnate doubles the arcs
+            for (int ai = 0; ai < arcs && prev != null; ai++)
+            {
+                Enemy near = null; float nd = 8f * S.SpellRange;
+                foreach (var o in Game.I.Enemies.ToArray())
+                {
+                    if (o == null || o.Dead || o == e || o == prev || !GodotObject.IsInstanceValid(o)) continue;
+                    float dd = o.GlobalPosition.DistanceTo(prev.GlobalPosition); if (dd < nd) { nd = dd; near = o; }
+                }
+                if (near == null) break;
+                Zap(prev.GlobalPosition + Vector3.Up * prev.Radius * 0.5f, near, 0.7f - ai * 0.15f);
+                prev = near;
+            }
+        }
+        if (hit > 0) { _kickR = 1; FireHeat = Mathf.Min(1f, FireHeat + 0.08f); Game.I.Sfx?.Cast(DamageType.Arcane); }
     }
 
     // ===== FORSAKEN ULT HELPERS (NEW) =====
@@ -4376,8 +6785,9 @@ public partial class Player : Node3D
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                 if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
-                e.AddCurse(0.5f, _hexGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // ~2 stacks/s and fold into the mega-group so shared damage cascades
-                if (ModPlague) e.Hurt(Base() * 0.3f, DamageType.Curse, true);                 // Plaguebearer: the ring also festers
+                e.AddCurse(0.6f, _hexGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // ~2.4 stacks/s and fold into the mega-group so shared damage cascades
+                e.Hurt(Base() * (0.22f + t * 0.06f), DamageType.Curse, true);                 // (REWORK) the ring itself gnaws — more base dps, scales with tiers
+                if (ModPlague) e.Hurt(Base() * (0.32f + t * 0.08f), DamageType.Curse, true);  // Plaguebearer: the ring also festers harder
             }
         }
         _hexNetT -= dt;
@@ -4408,23 +6818,25 @@ public partial class Player : Node3D
         _grounded = false; _vy = 0f; _noFall = Mathf.Max(_noFall, 0.4f);
         _bodyModel?.ShowWings(true);
         // ---- drain everything in range; refresh the tether links every frame ----
-        _drainTickT -= dt; bool tick = _drainTickT <= 0f; if (tick) _drainTickT = 0.1f;
-        ClearDrainLinks();
+        _drainTickT -= dt; bool tick = _drainTickT <= 0f;
         var col = DamageTypes.Col(DamageType.Curse);
-        float bankCap = Base() * (6f + t * 1.5f);
-        foreach (var e in Game.I.Enemies.ToArray())
+        if (tick)   // (PERF) ALL per-enemy work — damage AND the tether rebuild — now runs only on the 0.1s tick, not every frame; and the tether nodes are capped. Was: ~100 node create+free PER FRAME in a swarm for the whole channel.
         {
-            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
-            if (tick)
+            _drainTickT = 0.1f;
+            ClearDrainLinks();
+            float bankCap = Base() * (6f + t * 1.5f);
+            int links = 0;
+            foreach (var e in Game.I.Enemies.ToArray())
             {
-                float drain = Base() * 0.7f * 0.1f * ComboMul();   // damage for this 0.1s tick
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+                float drain = Base() * (1.1f + t * 0.2f) * 0.1f * ComboMul();   // (REWORK) more damage/sec, scales with tiers — damage for this 0.1s tick
                 e.Hurt(drain, DamageType.Curse, true);
                 float heal = drain * 0.5f;                          // lifesteal: heal half of what she drains…
                 Heal(heal);
                 _drainBank = Mathf.Min(_drainBank + heal, bankCap);  // …and bank it as the release payload (capped)
+                if (links < 20) { links++; _drainLinks.Add(Game.I.SpawnCurseLink(GlobalPosition, e.GlobalPosition + Vector3.Up * e.Radius * 0.5f, col)); }   // (PERF) cap the visible tethers
             }
-            _drainLinks.Add(Game.I.SpawnCurseLink(GlobalPosition, e.GlobalPosition + Vector3.Up * e.Radius * 0.5f, col));
         }
         if (ModRapture && tick) Game.I.NetMgr?.StormForce(GlobalPosition, radius, 0, 8f);   // Rapture: drag the crowd in toward her
         _drainNetT -= dt;
@@ -4456,34 +6868,252 @@ public partial class Player : Node3D
         _noFall = 3f;   // safe landing from the hover
     }
 
-    // Life Curse: an instant rune-nuke. Damage to each foe = a fraction of its MAX HP, and that fraction grows the LOWER
-    // her current HP is (floor 10% → ceiling 50%), with a lower cap for bosses/minibosses so it can't delete their phases.
-    private void FireLifeCurse(int t)
+    // LifeCurse (REWORK) — SPECTER: the witch tears loose as an immaterial violet projection. For up to 10s she is
+    // untouchable (immune to all damage + CC via FullyImmune), cannot attack, moves at ×3 speed and knits her wounds
+    // shut (a full 9s heals to 100%). When she retriggers Q, or the 10s elapses, the projection collapses: a ~30u nova
+    // at her final position rips a %-of-max-HP chunk out of every foe (capped for bosses but still brutal) and flings
+    // them outward — both scaling with tiers. Legendary mod (Soul Harrow): drifting THROUGH a foe while immaterial
+    // saddles it with a %-max-HP curse DoT. Host simulates the burst/DoT; allies see the recolour via vitals bit 11.
+    private void StartSpecter()
+    {
+        int t = UltTier;
+        _specter = true; _specterT = 10f; _specterNetT = 0f; _specterDotT = 0f;
+        UltActive = true; UltActiveT = 10f; UltMax = 10f;
+        CleanseNegative();                    // shed any root/slow/stun as she phases out of the world
+        _bodyModel?.SetSpectral(true);
+        var ccol = DamageTypes.Col(DamageType.Curse);
+        if (_specterVfx != null && GodotObject.IsInstanceValid(_specterVfx)) _specterVfx.QueueFree();
+        _specterVfx = BuildSpecterAura(); AddChild(_specterVfx);   // rides along with her as she drifts
+        Ring(GlobalPosition, ccol, 5f, 0.6f);
+        Ring(GlobalPosition, ccol.Lerp(Colors.White, 0.35f), 2.6f, 0.5f);
+        CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, ccol, 2.2f);
+        Game.I.RisingWisps(new Vector3(GlobalPosition.X, 0.05f, GlobalPosition.Z), 5f, ccol, 26, 7f);
+        SetArm("together", 0.5f);
+        CamKick(0.6f); Game.I.Sfx?.CurseCrush(GlobalPosition);
+        Game.I.Hud?.Banner("SPECTER — Q to release the nova");
+    }
+
+    private Node3D BuildSpecterAura()   // a faint violet projection-shell around her while immaterial (parented to her)
     {
         var col = DamageTypes.Col(DamageType.Curse);
-        float radius = (13f + t) * S.SpellArea;
-        float missing = 1f - Mathf.Clamp(Hp / Mathf.Max(1f, S.MaxHp), 0f, 1f);
-        float frac = Mathf.Lerp(0.10f, 0.50f, Mathf.Pow(missing, 1.3f));
+        var root = new Node3D();
+        var shell = new MeshInstance3D { Mesh = new SphereMesh { Radius = 1.4f, Height = 2.8f } };
+        var sm = Game.ToonEmissive(col, 1.3f, 0f); sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; sm.AlbedoColor = new Color(col.R, col.G, col.B, 0.14f);
+        shell.MaterialOverride = sm; shell.Position = new Vector3(0, 1.0f, 0); root.AddChild(shell);
+        root.AddChild(new OmniLight3D { OmniRange = 4.5f, LightColor = col, LightEnergy = 2.4f, Position = new Vector3(0, 1.2f, 0), ShadowEnabled = false });
+        return root;
+    }
+
+    // immaterial drift: heal toward full, curse-DoT anything she passes through (mod), count down to the release nova
+    private void UpdateSpecter(float dt)
+    {
+        _specterT -= dt;
+        Heal(S.MaxHp * dt / 9f);          // knit her wounds — a full 9s of drift = back to 100%
+        _bodyModel?.ShowWings(true);
+        if (ModRite)                       // Soul Harrow: foes she drifts through take a %-max-HP curse DoT
+        {
+            _specterDotT -= dt;
+            if (_specterDotT <= 0f)
+            {
+                _specterDotT = 0.25f;
+                float pr = 2.6f;
+                foreach (var e in Game.I.Enemies.ToArray())
+                {
+                    if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || e.Remote) continue;
+                    if (Flat(e, GlobalPosition) > pr + e.Radius) continue;
+                    float frac = e.IsBoss ? 0.006f : 0.02f;   // per 0.25s tick (capped for bosses)
+                    e.Hurt(frac * e.MaxHp, DamageType.Curse, true);
+                }
+            }
+        }
+        _specterNetT -= dt;
+        if (_specterNetT <= 0f) { _specterNetT = 0.25f; Game.I.NetMgr?.BroadcastVfx(60, GlobalPosition + Vector3.Up * 0.8f, Vector3.Zero, 2.5f, 0.2f, DamageTypes.Col(DamageType.Curse)); }
+        if (_specterT <= 0f) EndSpecter(false);
+    }
+
+    // the projection collapses — a %-HP nova + outward fling at her final position (retrigger = early release)
+    private void EndSpecter(bool retrig)
+    {
+        if (!_specter) return;
+        _specter = false; UltActive = false; UltActiveT = 0f;
+        int t = UltTier;
+        _bodyModel?.SetSpectral(false); _bodyModel?.ShowWings(false);
+        if (_specterVfx != null && GodotObject.IsInstanceValid(_specterVfx)) { _specterVfx.QueueFree(); _specterVfx = null; }
+        var col = DamageTypes.Col(DamageType.Curse);
+        float radius = (30f + t * 4f) * S.SpellArea;
+        float frac = 0.18f + t * 0.05f;               // % max HP torn out — scales with tiers
+        float bossFrac = 0.06f + t * 0.02f;           // capped but still strong vs bosses
+        float fling = 16f + t * 3f;                   // outward launch — scales with tiers
         SetArm("crush", 0.5f);
+        int bursts = 0;
         foreach (var e in Game.I.Enemies.ToArray())
         {
-            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
-            if (Game.I.SightBlocked(GlobalPosition, e.GlobalPosition)) continue;
-            float useFrac = e.IsBoss ? Mathf.Min(frac, 0.22f) : frac;   // IsBoss covers boss + miniboss
-            float dmg = useFrac * e.MaxHp;
-            e.Hurt(dmg, DamageType.Curse, true);                        // cursed foes still eat the curse-bonus amp on top
-            if (!e.Dead) e.AddCurse(2f, 0, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // curse the survivors
-            if (ModRite && !e.Dead) Heal(dmg * 0.05f);                  // Blood Rite: siphon a sliver of the damage back as health
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || e.Remote) continue;
+            var d = e.GlobalPosition - GlobalPosition; d.Y = 0f;
+            if (d.Length() > radius + e.Radius) continue;
+            float useFrac = e.IsBoss ? bossFrac : frac;
+            e.Hurt(useFrac * e.MaxHp, DamageType.Curse, true);
+            if (!e.Dead)
+            {
+                var dir = d.LengthSquared() > 0.01f ? d.Normalized() : Vector3.Forward;
+                e.Fling(dir * fling + Vector3.Up * 6f);
+            }
+            if (bursts < 24) { bursts++; Game.I.VfxRing(e.GlobalPosition + Vector3.Up * 0.9f, col, 2.2f, 0.4f); }
         }
-        Game.I.DamageWorld(GlobalPosition, radius, frac * 60f);
+        Game.I.DamageWorld(GlobalPosition, radius, frac * 80f);
         Game.I.SpawnGroundSigil(GlobalPosition, radius, col);
         Ring(GlobalPosition, col, radius, 0.85f);
         Ring(GlobalPosition, col.Lerp(Colors.White, 0.4f), radius * 0.6f, 0.5f);
-        CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, col, 1.9f);
+        Game.I.FallingMotes(GlobalPosition, radius, col, 32, 12f);
+        CurseImplosion(GlobalPosition + Vector3.Up * 1.2f, col, 2.6f);
+        Game.I.RisingWisps(GlobalPosition, radius * 0.85f, col, 36, 10f);
         Game.I.NetMgr?.BroadcastVfx(61, GlobalPosition, Vector3.Zero, radius, 0f, col);
-        CamKick(1.1f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.PlayerSound(GlobalPosition, 2.2f);
-        Game.I.Hud?.Banner("LIFE CURSE");
+        CamKick(1.3f); Game.I.Sfx?.CurseCrush(GlobalPosition); Game.I.Sfx?.Thunder(); Game.I.PlayerSound(GlobalPosition, 2.2f);
+        Game.I.Hud?.Banner(retrig ? "SPECTER RELEASE" : "SPECTER — RELEASE");
+    }
+
+    // ===== Attunement live-spend (per-run perk activation) =====
+    // Owned nodes (gold, persistent) are LIT during a run by spending Attunement Points earned on level-up. Activation
+    // applies the node effect live to the fresh per-run Stats; it resets each run. Prereqs are within-branch (need the
+    // node above ACTIVATED). Points: small node 1, keystone 2.
+    // graph model: buy nodes with attribute points (14 cap, +1 every 4 levels); availability recomputed from the whole
+    // owned set each time; hidden routes fire free when their node-set is fully owned.
+    public int AttunePoints = 0;
+    private int _attuneEarned = 0;
+    private readonly HashSet<int> _perkLit = new();      // nodes ACTIVATED this run (with attribute points)
+    private readonly HashSet<int> _routesDone = new();
+    public bool PerkLit(int id) => _perkLit.Contains(id);
+    public List<int> PerkAvailable()                     // gold-OWNED nodes that are graph-reachable from the lit set (or roots)
+    {
+        var outl = new List<int>();
+        foreach (int n in Perks.Available(WitchIndex, _perkLit)) if (Perks.Owned(WitchIndex, n)) outl.Add(n);
+        return outl;
+    }
+    public void ResetPerks() { _perkLit.Clear(); _routesDone.Clear(); AttunePoints = 1; _attuneEarned = 1; }   // start with 1 point
+    public void GrantAttune() { if (Level % 4 != 0 || _attuneEarned >= Perks.AttuneCap) return; _attuneEarned++; AttunePoints++; }   // +1 every 4 levels, capped
+    public bool PurchasePerk(int id)
+    {
+        if (_perkLit.Contains(id) || AttunePoints <= 0) return false;
+        if (!Perks.Owned(WitchIndex, id)) return false;                            // must be gold-unlocked first
+        if (!Perks.Available(WitchIndex, _perkLit).Contains(id)) return false;     // and graph-reachable this run
+        AttunePoints--; _perkLit.Add(id);
+        Perks.Node(WitchIndex, id).Apply?.Invoke(this);
+        CheckHiddenRoutes();
+        return true;
+    }
+    private void CheckHiddenRoutes()   // any hidden route whose whole node-set is now owned fires (free) + is catalogued
+    {
+        var routes = Perks.Routes(WitchIndex);
+        for (int ri = 0; ri < routes.Length; ri++)
+        {
+            if (_routesDone.Contains(ri)) continue;
+            var r = routes[ri];
+            bool all = true; foreach (int n in r.Req) if (!_perkLit.Contains(n)) { all = false; break; }
+            if (!all) continue;
+            _routesDone.Add(ri); r.Apply?.Invoke(this);
+            Perks.MarkDiscovered(WitchIndex, ri);
+            Game.I?.Hud?.Banner($"HIDDEN KEYSTONE — {r.Name}");
+            Game.I?.Sfx?.WardComplete();
+        }
+    }
+
+    private float _witchPassiveT = 0f, _witchPassiveSfxT = 0f;
+    // (SURVIVAL PASSIVES) the fragile witches' innate survival — element-flavored, NOT active tools:
+    //   Frost → Frost Armor (anything close is chilled/slowed), Forsaken → Soul Siphon (cursed foes bleed life to her),
+    //   Ember → Cinder Skin (retaliatory heat singes attackers + her burns knit her wounds). Throttled to 4 Hz; MP-safe
+    //   (status calls route to the host for remote proxies; heals are local to the witch's own machine).
+    private void UpdateWitchPassives(float dt)
+    {
+        if (Game.I == null || !Game.I.SimActive || Downed) return;
+        _witchPassiveT -= dt; _witchPassiveSfxT -= dt;
+        if (_witchPassiveT > 0f) return;
+        _witchPassiveT = 0.25f;
+        float area = Mathf.Sqrt(Mathf.Max(1f, S.SpellArea));
+
+        if (VerdantWitch)
+        {
+            // Living Grove: trickle a fresh ent every ~9s even without combo, so she's never left army-less
+            _groveTrickleT -= 0.25f;
+            if (_groveTrickleT <= 0f) { _groveTrickleT = 9f; if (CountEnts() < MaxEnts) SummonEnt(); }
+        }
+        if (FrostWitch)
+        {
+            float r = 4.6f * area; int chilled = 0;
+            foreach (var e in Game.I.Enemies.ToArray())   // (FIX) snapshot — Slow/AddFreeze can remove a foe mid-loop
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                if (Flat(e, GlobalPosition) > r + e.Radius) continue;
+                e.Slow(0.6f, 0.55f);                                   // ~45% slow, refreshed while near (routes to host for proxies)
+                e.AddFreeze(0.08f, FreezeThreshMul, FrostDurBonus);    // a whisper of freeze buildup — lingerers eventually lock
+                chilled++;
+            }
+            if (chilled > 0)
+            {
+                Game.I.SpawnPollen(GlobalPosition + Vector3.Up * 0.6f, r, new Color(0.72f, 0.9f, 1f), 3, 0.8f, net: false);
+                if (_witchPassiveSfxT <= 0f) { _witchPassiveSfxT = 1.8f; Game.I.Sfx?.Freeze(GlobalPosition, false); }
+            }
+        }
+        else if (ForsakenWitch)
+        {
+            float r = 15f * area; float healed = 0f; Enemy wispFrom = null;
+            foreach (var e in Game.I.Enemies.ToArray())   // (FIX) snapshot for consistency/safety
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.Cursed) continue;
+                if (Flat(e, GlobalPosition) > r + e.Radius) continue;
+                healed += S.MaxHp * 0.004f;                            // 0.4% max HP per cursed foe per tick
+                if (wispFrom == null) wispFrom = e;
+                if (healed >= S.MaxHp * 0.03f) break;                  // cap ~3%/tick (~12%/s)
+            }
+            if (healed > 0f)
+            {
+                Heal(healed);
+                if (wispFrom != null)
+                {
+                    var l = Game.I.SpawnCurseLink(wispFrom.GlobalPosition + Vector3.Up * wispFrom.Radius * 0.5f, GlobalPosition + Vector3.Up, DamageTypes.Col(DamageType.Curse));
+                    if (l != null) { var t = l.CreateTween(); t.TweenInterval(0.2f); t.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(l)) l.QueueFree(); })); }
+                }
+            }
+        }
+        else if (EmberWitch)
+        {
+            float r = 3.6f * area;
+            foreach (var e in Game.I.Enemies.ToArray())   // (FIX) snapshot — AddBurn can kill a low-HP foe, mutating Enemies mid-loop (was the crash at Player.cs:6659)
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+                if (Flat(e, GlobalPosition) > r + e.Radius) continue;
+                e.AddBurn(0.6f, Base() * 0.06f, Base() * 2.5f, 0f, Game.I.LocalPeer);   // retaliatory heat singes anything crowding her
+            }
+            float healed = 0f, hr = 9f * area;
+            foreach (var e in Game.I.Enemies.ToArray())   // (FIX) snapshot for consistency/safety
+            {
+                if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.Burning) continue;
+                if (Flat(e, GlobalPosition) > hr + e.Radius) continue;
+                healed += S.MaxHp * 0.0035f;
+                if (healed >= S.MaxHp * 0.025f) break;
+            }
+            if (healed > 0f)
+            {
+                Heal(healed);
+                Game.I.SpawnPollen(GlobalPosition + Vector3.Up * 0.7f, r, new Color(1f, 0.6f, 0.25f), 2, 0.7f, net: false);
+            }
+        }
+        else if (ArcaneWitch)
+        {
+            // Arcane Feedback: her homing missiles occasionally shoot down an incoming enemy bolt that's close by
+            EnemyBolt best = null; float bd = 5.5f;
+            foreach (var b in EnemyBolt.All)
+            {
+                if (b == null || b.Remote || !GodotObject.IsInstanceValid(b)) continue;
+                float d = b.GlobalPosition.DistanceTo(GlobalPosition);
+                if (d < bd) { bd = d; best = b; }
+            }
+            if (best != null)
+            {
+                var bp = best.GlobalPosition; best.QueueFree();
+                Game.I.SpawnArcaneRupture(bp, 1.6f);
+                Game.I.Sfx?.ArcaneBlast(bp, false);
+            }
+        }
     }
 
     private void UpdateUlt(float dt)
@@ -4513,21 +7143,10 @@ public partial class Player : Node3D
             UltActiveT -= dt;
             if (UltActiveT <= 0f) UltActive = false;
         }
-        if (UltActive && Ult == UltKind.Stormform)   // Stormform: countdown + (legendary) drop air-mines while moving (NEW)
+        if (UltActive && Ult == UltKind.Stormform)   // (REWORK) Wind Rush charges: the window runs down; ends when it's spent or empty
         {
-            UltActiveT -= dt;
-            if (UltActiveT <= 0f) UltActive = false;
-            else if (ModStorm)
-            {
-                _mineDropT -= dt;
-                if (_mineDropT <= 0f && InputDir() != Vector3.Zero && !Airborne)
-                {
-                    _mineDropT = 0.8f;   // leave a mine in her wake roughly every 0.8s of walking
-                    float gy = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y);
-                    var mine = new AirMine(); Game.I.AddChild(mine);
-                    mine.Init(this, new Vector3(GlobalPosition.X, gy, GlobalPosition.Z), Base() * 0.6f);
-                }
-            }
+            _windWindowT -= dt; UltActiveT = _windWindowT;
+            if (_windWindowT <= 0f || _windCharges <= 0) { UltActive = false; ClearUltAura(); }
         }
         if (UltActive && Ult == UltKind.Hurricane)   // Hurricane: when it ends she falls; clear the funnel + suppress fall damage (NEW)
         {
@@ -4545,12 +7164,26 @@ public partial class Player : Node3D
         if (UltActive && (Ult == UltKind.Eclipse || Ult == UltKind.LunarLight))
         {
             UltActiveT -= dt;
-            if (UltActiveT <= 0f) { UltActive = false; UltDmgMul = 1f; }
+            if (UltActiveT <= 0f) { UltActive = false; UltDmgMul = 1f; ClearUltAura(); }
+        }
+        if (_exsang)   // (REWORK) Exsanguinate channel: DoT aura ticks + kill-pop-heal, and the timer runs down
+        {
+            UpdateExsanguinate(dt);
+            UltActiveT -= dt;
+            if (UltActiveT <= 0f) { _exsang = false; UltActive = false; ClearUltAura(); }
+        }
+        if (UltActive && (Ult == UltKind.ArcaneEruption || Ult == UltKind.ArcaneOvercharge))   // (NEW) instant eruption flag + overcharge steroid countdown
+        {
+            UltActiveT -= dt;
+            if (UltActiveT <= 0f) { UltActive = false; if (Ult == UltKind.ArcaneOvercharge && _arcaneAura != null && GodotObject.IsInstanceValid(_arcaneAura)) { _arcaneAura.QueueFree(); _arcaneAura = null; } }
         }
         if (BurnLifestealT > 0f) BurnLifestealT -= dt;   // (NEW) Wildfire Rush lifesteal window
+        if (FireWallT > 0f) FireWallT -= dt;             // (NEW) Ring of Fire re-arm lock
+        if (SnakeRootCd > 0f) SnakeRootCd -= dt;         // (NEW) per-player snake-root cooldown
         if (EmberFervorT > 0f)   // (NEW) Ember Fervor buff: decay + a periodic ember pulse so allies see the flames
         {
             EmberFervorT -= dt; _fervorNetT -= dt;
+            if (FervorPhoenix > 0) Heal(S.MaxHp * 0.008f * FervorPhoenix * dt);   // (OVERHAUL) Phoenix Heart: heal over the buff, scales with stacks
             if (_fervorNetT <= 0f) { _fervorNetT = 0.5f; Game.I.NetMgr?.BroadcastVfx(70, GlobalPosition + Vector3.Up * 0.5f, Vector3.Zero, 1.6f, 0f, DamageTypes.Col(DamageType.Ember)); }
             if (EmberFervorT <= 0f) ShowFervorFlames(false);
         }
@@ -4559,7 +7192,10 @@ public partial class Player : Node3D
             _flameDashWindowT -= dt;
             if (_flameDashWindowT <= 0f || _flameDashCharges <= 0) UltActive = false;
         }
+        if (UltActive && Ult == UltKind.PhoenixAscend) { UltActiveT -= dt; if (UltActiveT <= 0f) UltActive = false; }   // (REWORK) brief ACTIVE window while the phoenix bird flies — gates recharge, then clears
+        if (_rushDashLingerT > 0f) _rushDashLingerT -= dt;   // (REWORK) HUD: time left on the LAST dash's lingering field (flame trail / wind area)
         if (UltActive && Ult == UltKind.HexCircle) UpdateHexCircle(dt);   // (NEW) Forsaken curse field
+        if (_specter) UpdateSpecter(dt);                                   // (REWORK) LifeCurse immaterial projection drift
         if (UltActive && Ult == UltKind.Crescent)
         {
             UpdateCrescentControl(dt);
@@ -4576,9 +7212,10 @@ public partial class Player : Node3D
     private Vector3 GroundAim()
     {
         var o = _cam.GlobalPosition; var d = -_cam.GlobalTransform.Basis.Z;
+        float groundY = Game.I.SurfaceHeight(GlobalPosition, GlobalPosition.Y);   // (FIX) aim onto the surface UNDER her (includes floating-island decks), not the y=0 world base — so reticles land on the island, not the jungle far below
         Vector3 p;
         if (Mathf.Abs(d.Y) < 0.001f) p = GlobalPosition + new Vector3(d.X, 0, d.Z).Normalized() * 16f;
-        else { float t = -o.Y / d.Y; if (t < 0) t = 16f; p = o + d * t; }
+        else { float t = (groundY - o.Y) / d.Y; if (t < 0) t = 16f; p = o + d * t; p.Y = groundY; }
         var flat = new Vector3(p.X - GlobalPosition.X, 0, p.Z - GlobalPosition.Z);
         if (flat.Length() > 40f) p = GlobalPosition + flat.Normalized() * 40f;
         return p;
@@ -4590,29 +7227,33 @@ public partial class Player : Node3D
         float t = UltTier;
         var f = new GroundField
         {
-            Type = FieldType.Heal, HealAllies = true, Beam = true, TintColor = DamageTypes.Col(DamageType.Lunar),
-            Radius = 9f + t + (ModLight ? 3f : 0f), Dur = 8f + t,
-            Power = S.MaxHp * (0.04f + (ModLight ? 0.02f : 0f)),
-            EnemyDmg = Base() * (0.7f + t * 0.12f), FromCombo = true, DType = DamageType.Lunar   // moderate, scales with Atk
+            Type = FieldType.Heal, HealAllies = true, Cleanse = true, Beam = true, TintColor = DamageTypes.Col(DamageType.Lunar),
+            Radius = 13.5f + t + (ModLight ? 4f : 0f), Dur = 9f + t,          // (REWORK) ~1.5× bigger base; cleanses; a touch longer
+            Power = S.MaxHp * (0.055f + (ModLight ? 0.025f : 0f)),            // (REWORK) heals more
+            EnemyDmg = Base() * (1.0f + t * 0.18f), FromCombo = true, DType = DamageType.Lunar   // (REWORK) hits harder, scales with Atk
         };
         Game.I.AddChild(f);
         f.GlobalPosition = new Vector3(at.X, 0.04f, at.Z);
+        UltLingerT = 8f + t;   // (NEW) the moonwell field lingers 8+t s (no UltActive on this ult) — no recharge until it fades
         Game.I.NetMgr?.BroadcastVfx(6, new Vector3(at.X, 0.5f, at.Z), Vector3.Zero, 9f, 0f, DamageTypes.Col(DamageType.Lunar));
         var lun = DamageTypes.Col(DamageType.Lunar);
-        var pillar = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = f.Radius * 0.5f, BottomRadius = f.Radius * 0.85f, Height = 30f } };
-        pillar.MaterialOverride = new StandardMaterial3D
-        {
-            AlbedoColor = new Color(lun.R, lun.G, lun.B, 0.20f),
-            EmissionEnabled = true, Emission = lun, EmissionEnergyMultiplier = 1.4f,
-            Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
-            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded
-        };
+        // the shaft of moonlight is now living plasma — flowing veins of light pouring from the heavens
+        var pillar = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = f.Radius * 0.5f, BottomRadius = f.Radius * 0.85f, Height = 30f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+        pillar.MaterialOverride = Game.ElementEnergyMat(lun);
         pillar.Position = new Vector3(0, 15f, 0);
         f.AddChild(pillar);
+        // (REWORK) a FAINTER, moonlit-blue inner shaft — the old one was a near-white column that whited-out your view from
+        // inside the well. Lower alpha + blue tint + gentler emission so you can actually SEE the fight while standing in it.
+        var core = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = f.Radius * 0.16f, BottomRadius = f.Radius * 0.26f, Height = 30f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            MaterialOverride = new StandardMaterial3D { AlbedoColor = new Color(lun.R, lun.G, lun.B, 0.18f), EmissionEnabled = true, Emission = lun, EmissionEnergyMultiplier = 0.8f, Transparency = BaseMaterial3D.TransparencyEnum.Alpha, ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded } };
+        core.Position = new Vector3(0, 15f, 0); f.AddChild(core);
+        f.AddChild(new OmniLight3D { OmniRange = f.Radius * 2.2f, LightColor = lun, LightEnergy = 1.7f, ShadowEnabled = false, Position = new Vector3(0, 2f, 0) });
         Ring(new Vector3(at.X, 0.04f, at.Z), lun, f.Radius, 0.7f);
         Ring(new Vector3(at.X, 0.04f, at.Z), Colors.White, f.Radius * 0.5f, 0.5f);
+        Game.I.FallingMotes(new Vector3(at.X, 0.04f, at.Z), f.Radius * 0.9f, lun, 30, 12f);   // moonlight rains into the well
+        Game.I.Sfx?.Thunder();
 
-        UltActive = true; UltActiveT = f.Dur;
+        UltActive = true; UltActiveT = f.Dur; UltMax = f.Dur;
         Game.I.Hud?.Banner("LUNAR LIGHT");
     }
 
@@ -4635,7 +7276,7 @@ public partial class Player : Node3D
     {
         if (dur <= 0f || Downed) return;
         _barkT = dur; _barkMax = dur;
-        _barkDmg = Base() * (2.0f + UltTier * 0.5f);
+        _barkDmg = Base() * (4.5f + UltTier * 1.0f);   // (REWORK) a LOT more burst damage on expiry
         Shield = MaxShield;
         Game.I.Hud?.Banner("Barkskin — thorns up!");
         Ring(GlobalPosition, DamageTypes.Col(DamageType.Nature), 4f, 0.5f);
@@ -4645,7 +7286,8 @@ public partial class Player : Node3D
     private void BarkBurst()
     {
         var col = DamageTypes.Col(DamageType.Nature);
-        float r = (ModBark ? 9f : 7f) * S.SpellArea;
+        float rBase = ModBark ? 9f : 7f;   // raw — the ModBark GroundField auto-scales this by SpellArea
+        float r = rBase * S.SpellArea;     // the burst + spikes + world damage scale here
         foreach (var e in Game.I.Enemies.ToArray())
             if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < r + e.Radius)
             { e.Hurt(_barkDmg, DamageType.Nature, true); e.Root(1.0f); }
@@ -4666,7 +7308,7 @@ public partial class Player : Node3D
         }
         if (ModBark)   // legendary: leave a creeping poison field behind
         {
-            var f = new GroundField { Type = FieldType.Hex, TintColor = col, Radius = r, Dur = 5f, Power = Base() * 0.1f, PoisonAdd = 3f, SlowMul = 0.5f, FromCombo = true, DType = DamageType.Nature, Src = this };
+            var f = new GroundField { Type = FieldType.Hex, TintColor = col, Radius = rBase, Dur = 5f, Power = Base() * 0.1f, PoisonAdd = 3f, SlowMul = 0.5f, FromCombo = true, DType = DamageType.Nature, Src = this };
             Game.I.AddChild(f); f.GlobalPosition = new Vector3(GlobalPosition.X, 0.04f, GlobalPosition.Z);
             Game.I.RegisterComboField(f);
         }
@@ -4692,13 +7334,27 @@ public partial class Player : Node3D
         int count = 4 + UltTier + (ModCrescent ? 2 : 0);
         UltActive = true;
         UltActiveT = 9f + UltTier * 1.5f;     // they orbit for this long; fling & re-fling freely within it
+        var lun = DamageTypes.Col(DamageType.Lunar);
         for (int i = 0; i < count; i++)
         {
-            var orb = new CrescentOrb { Angle = i / (float)count * Mathf.Tau, OrbitR = 4.5f, Dmg = Base() * (3.5f + UltTier * 0.6f) };   // scales with Atk now (was flat 40+22t)
+            float ang = i / (float)count * Mathf.Tau;
+            var orb = new CrescentOrb { Angle = ang, OrbitR = 4.5f, Dmg = Base() * (3.5f + UltTier * 0.6f) };   // scales with Atk now (was flat 40+22t)
             Game.I.AddChild(orb);
             _crescents.Add(orb);
+            // each blade is forged from a flash of moonlight at its orbit point
+            var forge = GlobalPosition + new Vector3(Mathf.Cos(ang) * 4.5f, 1.1f, Mathf.Sin(ang) * 4.5f);
+            var flash = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.5f, Height = 1f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+                MaterialOverride = new StandardMaterial3D { AlbedoColor = new Color(1, 1, 1, 0.9f), EmissionEnabled = true, Emission = lun.Lerp(Colors.White, 0.6f), EmissionEnergyMultiplier = 4f, Transparency = BaseMaterial3D.TransparencyEnum.Alpha, ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded } };
+            Game.I.AddChild(flash); flash.GlobalPosition = forge;
+            var ft = flash.CreateTween(); ft.SetParallel();
+            ft.TweenProperty(flash, "scale", Vector3.One * 2.2f, 0.35f).SetEase(Tween.EaseType.Out);
+            ft.TweenProperty(flash, "transparency", 1f, 0.35f);
+            ft.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(flash)) flash.QueueFree(); }));
         }
-        Ring(GlobalPosition, DamageTypes.Col(DamageType.Lunar), 5f, 0.6f);
+        Ring(GlobalPosition, lun, 5f, 0.6f);
+        Ring(GlobalPosition, Colors.White, 4.5f, 0.5f);
+        Game.I.FallingMotes(GlobalPosition, 5f, lun, 16, 8f);
+        Game.I.Sfx?.Thunder();
         // allies see the orbs via the per-frame CrescentSnapshot (positions), covering orbit + fling + rotate
 
         CamKick(0.5f);
@@ -4753,6 +7409,29 @@ public partial class Player : Node3D
 
     public void AddMana(float amt) { Mana = Mathf.Clamp(Mana + amt, 0, S.ManaMax); }
     public void TryBurnLifesteal(float dmg) { if (BurnLifestealT > 0f && !Downed && Hp < S.MaxHp) Heal(dmg); }   // (NEW) Wildfire Rush: 100% of burn-tick damage heals her while the window is live
+    // (NEW) hard teleport: place + zero vertical velocity + a brief no-fall grace + refill jumps (sky-ritual entry/exit, re-ride)
+    public void TeleportReset(Vector3 pos) { GlobalPosition = pos; _vy = 0f; _grounded = false; _noFall = 1.5f; _jumps = JumpsMax; _vineRising = false; }
+    private bool _vineRising = false; private float _vineTargetY = 0f; private float _vineFling = 20f;
+    public void VineLaunch(float topY, float flingVel = 20f)   // (NEW) jungle vine: grapple UP the vine, then fling skyward at the top (hold jump to glide down). flingVel = the extra pop at the top (sky-island vines use a smaller one)
+    {
+        if (Downed || _vineRising) return;
+        _vineRising = true; _vineTargetY = topY; _vineFling = flingVel;
+        _grounded = false; _vy = 0f; _noFall = 6f;
+        Game.I.PlayerSound(GlobalPosition, 0.6f);
+        Game.I.GlowFlowersNear(GlobalPosition, 3f);
+    }
+    private void UpdateVineRise(float dt)
+    {
+        Floating = false;
+        float ny = Mathf.MoveToward(GlobalPosition.Y, _vineTargetY, 42f * dt);   // whoosh up the vine
+        GlobalPosition = new Vector3(GlobalPosition.X, ny, GlobalPosition.Z);
+        _grounded = false; _vy = 0f;
+        if (ny >= _vineTargetY - 0.3f)   // reached the top → fling for the fun extra
+        {
+            _vineRising = false; _vy = _vineFling; _noFall = 4f; _jumps = JumpsMax;
+            Game.I.PlayerSound(GlobalPosition, 0.5f);
+        }
+    }
     public bool SpendMana(float n = 1f) { if (Mana >= n) { Mana -= n; return true; } ResFail(); return false; }
     // a cast couldn't be paid for (mana for most witches, HP for Crimson): flash the bar + sputter.
     // rising-edge sound so holding the button with an empty bar doesn't machine-gun the sparks.
@@ -4773,7 +7452,14 @@ public partial class Player : Node3D
     public void AddXp(float amt)
     {
         Xp += amt;
-        while (Xp >= XpNext) { Xp -= XpNext; Level++; ApplyLevelGain(); XpNext = 28f + (Level - 1) * 22f; if (DivineWitch && Level % 10 == 0) Interventions = Mathf.Min(2, Interventions + 1); Game.I.OpenLevelUp(); }
+        while (Xp >= XpNext) { Xp -= XpNext; Level++; ApplyLevelGain(); XpNext = 26f + (Level - 1) * 19f; if (DivineWitch && Level % 10 == 0) Interventions = Mathf.Min(2, Interventions + 1); GrantAttune(); Game.I.OpenLevelUp(); }   // (TUNE) leveled a tad faster; (ATTUNE) +1 point/level, +1 milestone every 5th, capped per run
+    }
+
+    // (NEW) dev/testing: jump straight to a target level with the per-level stat gains applied, but NO upgrade prompts.
+    public void DevJumpLevel(int target)
+    {
+        while (Level < target) { Level++; ApplyLevelGain(); XpNext = 26f + (Level - 1) * 19f; if (DivineWitch && Level % 10 == 0) Interventions = Mathf.Min(2, Interventions + 1); }   // (TUNE) leveled a tad faster
+        Xp = 0f;
     }
 
     // Each level is rarer now, so each one grants a small permanent power bump to keep the curve climbing.
@@ -4784,26 +7470,52 @@ public partial class Player : Node3D
         float oldMax = S.MaxHp;
         S.MaxHp *= 1f + g;
         Hp = Mathf.Min(S.MaxHp, Hp + (S.MaxHp - oldMax));   // keep the new headroom filled
+        Hp = Mathf.Min(S.MaxHp, Hp + S.MaxHp * 0.15f);      // (NEW) a little level-up heal — +15% of max HP each level
         S.ShieldPct *= 1f + g * 0.5f;            // shield capacity grows at half rate
     }
 
     public float DmgDirT = 0f;
     public Vector3 DmgDirWorld = Vector3.Forward;
 
+    // (NEW) apply/refresh arrow-venom. Called every damage tick while you're inside a volley circle (locally on the
+    // host, over the wire on clients) — the hold window is what keeps it from double-dipping with the field damage.
+    public void ApplyVenom(float dur, float dps)
+    {
+        if (Downed || BlessedT > 0f || FullyImmune) return;   // Blessed clears it; Divinity/Faith Shield block it entirely
+        VenomT = Mathf.Max(VenomT, dur);
+        VenomDps = Mathf.Max(VenomDps, dps);   // a bigger formation's venom overrides a smaller one's
+        VenomHold = 0.5f;                      // suppressed while you're still standing in the rain
+    }
+
+    private void UpdateVenom(float dt)
+    {
+        if (VenomT <= 0f) { VenomDps = 0f; return; }
+        if (BlessedT > 0f) { VenomT = 0f; VenomDps = 0f; _venomTick = 0f; Game.I?.Hud?.Banner("the blessing burns the venom away"); return; }   // instant purge
+        if (VenomHold > 0f) { VenomHold -= dt; return; }   // still in the circle — the field damage is doing the work
+        VenomT -= dt;
+        _venomTick -= dt;
+        if (_venomTick <= 0f) { _venomTick = 0.5f; Hurt(VenomDps * 0.5f); }
+        if (VenomT <= 0f) VenomDps = 0f;
+    }
+
     public void Hurt(float dmg, Vector3? src = null)
     {
-        if (_iframe > 0 || _divFalling || Divinity || BarkActive || Downed || Game.I == null || !Game.I.WorldRunning) return;
+        if (_iframe > 0 || _divFalling || Divinity || BarkActive || _specter || Downed || Game.I == null || !Game.I.WorldRunning) return;   // _specter: immaterial Specter is untouchable
+        if (Game.I.MenuImmune || InsideFaithShield) return;   // (MP) untouchable inside her elemental bubble; and ALL damage is nullified inside a Faith Shield dome
         _combatT = 0f;   // taking fire = in combat; gates fast out-of-combat shield regen (NEW)
         if (Armor.Count > 0)   // one shared armor charge eats this whole hit, then pops (thorn charges also burst)
         {
             var ch = Armor[Armor.Count - 1]; Armor.RemoveAt(Armor.Count - 1);
             _iframe = 0.5f; ProcFlash = 0.3f;
+            ArmorBreakT = 0.6f; HurtFlash = Mathf.Max(HurtFlash, 0.4f);   // (NEW) armor pop reads LOUD — flash + callout + clang
+            if (src.HasValue) { DmgDirWorld = src.Value - GlobalPosition; DmgDirWorld.Y = 0; DmgDirT = 1.2f; }
+            Game.I.Sfx?.ArmorBreak();
             if (ch.Thorn)
             {
-                float r = ModThornSkin ? 7f : 5f;
+                float r = _thornBurstRad > 0f ? _thornBurstRad : 5f;   // (OVERHAUL) Bramble: burst radius
                 foreach (var e in Game.I.Enemies.ToArray())
                     if (e != null && !e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, GlobalPosition) < r + e.Radius)
-                    { e.Hurt(ch.Dmg, DamageType.Nature, true); if (ModThornSkin) { e.Root(1.2f); e.Poison(Base() * 0.15f, 3f); } }
+                    { e.Hurt(ch.Dmg, DamageType.Nature, true); if (_thornRoot > 0f) e.Root(_thornRoot); }   // (OVERHAUL) Snare Bark: burst roots
                 Game.I.DamageWorld(GlobalPosition, r, ch.Dmg);   // (FIX) AoE breaks props too
                 Ring(GlobalPosition, DamageTypes.Col(DamageType.Nature), r, 0.45f);
                 Game.I.NetMgr?.BroadcastVfx(6, GlobalPosition, Vector3.Zero, r, 0f, DamageTypes.Col(DamageType.Nature));
@@ -4820,14 +7532,19 @@ public partial class Player : Node3D
         HurtT = 1f;
         if (src.HasValue) { DmgDirWorld = src.Value - GlobalPosition; DmgDirWorld.Y = 0; DmgDirT = 1.4f; }
         dmg *= Mathf.Clamp(1f - S.DmgResist, 0.1f, 1f);   // damage resistance
+        if (_thornResistT > 0f) dmg *= Mathf.Max(0.3f, 1f - _thornResistAmt);   // (OVERHAUL) Ironbark: brief thorn damage resist
         if (_galeGuard > 0f) dmg *= 0.55f;   // Tailwind: ~45% less damage in the window after a dash (Gale) (NEW)
         bool hadShield = Shield > 0f;
         if (Shield > 0) { if (dmg <= Shield) { Shield -= dmg; dmg = 0; } else { dmg -= Shield; Shield = 0; } }
         // emptying the shield (or being hit with none left) means a much longer wait before it rebuilds
         _shieldT = (Shield <= 0.01f) ? S.ShieldDelay * 2.4f : S.ShieldDelay;
+        if (hadShield && Shield <= 0.01f) { ShieldBreakT = 0.6f; HurtFlash = Mathf.Max(HurtFlash, 0.5f); Game.I.Sfx?.ShieldBreak(); }   // (NEW) this hit just SHATTERED the shield
         if (dmg > 0)
         {
             Hp -= dmg;
+            float sev = Mathf.Clamp(dmg / Mathf.Max(1f, S.MaxHp), 0f, 1f);   // (NEW) hit severity → flash + grunt scale
+            HurtFlash = Mathf.Max(HurtFlash, Mathf.Min(1f, 0.4f + sev * 3f));
+            Game.I.Sfx?.PlayerHurt(sev);
             Game.I.MyStats.DamageTaken += dmg;   // (NEW) end-of-run tally
             if (Combo > 1)   // a hit that reaches HP breaks your combo (shield protects it)
             {
@@ -4851,17 +7568,22 @@ public partial class Player : Node3D
     {
         if (Downed) return;
         Downed = true; Hp = 0f; ReviveProg = 0f;
-        _meteorAscend = false; _phoenix = false; _flameDashT = 0f;   // (NEW) cancel any Ember flight ult cleanly
+        _meteorAscend = false; _meteorDiving = false; _phoenix = false; _flameDashT = 0f;   // (NEW) cancel any Ember flight ult cleanly
         if (_phoenixVfx != null && GodotObject.IsInstanceValid(_phoenixVfx)) { _phoenixVfx.QueueFree(); _phoenixVfx = null; }
+        ClearUltAura();   // free any empowerment aura (Eclipse/Divinity/Stormform) if she's downed mid-ult
+        _exsang = false; UltActive = false; _bodyModel?.SetEclipse(false);   // (REWORK) end a channeled transform / eclipse recolour if downed mid-cast
         HideEmberAimRing();
         EmberFervorT = 0f; ShowFervorFlames(false);   // (NEW) drop the Ember Fervor buff/flames
         Game.I.MyStats.TimesDowned++;   // (NEW) end-of-run tally
         Charging = false; ChargeAmt = 0f;
         if (_beamSeg != null) { _beamSeg.Free(); _beamSeg = null; _beamLight = null; _beamT = 0; }
+        foreach (var ps in _prismSegs) ps?.Free(); _prismSegs.Clear();
         Game.I.Hud?.Banner("DOWNED — hold on for an ally");
         Game.I.Sfx?.Discord();
-        if (Game.I.NetMgr != null && Game.I.NetMgr.Active) Game.I.NetMgr.LocalDowned(true);
-        else Game.I.GameOver();   // solo: no one can revive
+        if (Game.I.NetMgr != null && Game.I.NetMgr.Active) Game.I.NetMgr.LocalDowned(true);   // MP: report; the host evaluates all-down (→ maze/sky spit-out or game over)
+        else if (Game.I.InMaze) Game.I.MazeDeathExit();   // solo maze death: revived + spat back out (the well caves in), NOT game over
+        else if (Game.I.InSky) Game.I.SkyPlayerDown();    // solo sky death: revived + the ritual ends (you fell), NOT game over
+        else Game.I.GameOver();   // solo, open world: no one can revive
     }
 
     // An ally finished reviving us (or a network revive arrived).
@@ -4881,7 +7603,7 @@ public partial class Player : Node3D
     {
         if (Interventions > 0) Interventions--;
         Downed = false; ReviveProg = 0f;
-        Hp = S.MaxHp; _iframe = 1.6f; BlessedT = Mathf.Max(BlessedT, 4f);
+        Hp = S.MaxHp * 0.55f; _iframe = 1.6f; BlessedT = Mathf.Max(BlessedT, 4f);   // (NERF) revive at 55% HP, not a full reset — the cheat-death was making her near-unkillable at depth
         Game.I.Hud?.Banner(self ? "DIVINE INTERVENTION" : "DIVINE REVIVAL");
         Game.I.Sfx?.Release(DamageType.Holy);
         Game.I.RezBeam(at, true);

@@ -21,6 +21,18 @@ public partial class PestilencePool : Node3D
         dm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; dm.AlbedoColor = new Color(poolCol.R, poolCol.G, poolCol.B, 0.5f);
         disc.MaterialOverride = dm; AddChild(disc);
 
+        // (POLISH) bubbling blisters break up the flat pool surface — each swells and shrinks on its own loop
+        for (int i = 0; i < 6; i++)
+        {
+            float a = GD.Randf() * Mathf.Tau, rr = radius * (0.15f + GD.Randf() * 0.7f), bs = 0.3f + GD.Randf() * 0.4f;
+            var b = new MeshInstance3D { Mesh = new SphereMesh { Radius = bs, Height = bs * 1.3f }, MaterialOverride = Game.ToonEmissive(poolCol.Lerp(new Color(0.32f, 0.5f, 0.12f), 0.5f), 0.9f, 0f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+            b.Position = new Vector3(Mathf.Cos(a) * rr, 0.04f, Mathf.Sin(a) * rr);
+            AddChild(b);
+            var bt = b.CreateTween().SetLoops();
+            bt.TweenProperty(b, "scale", Vector3.One * 1.3f, 0.5f + GD.Randf() * 0.4f);
+            bt.TweenProperty(b, "scale", Vector3.One * 0.7f, 0.5f + GD.Randf() * 0.4f);
+        }
+
         var ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = radius * 0.93f, OuterRadius = radius } };
         ring.MaterialOverride = Game.Emissive(new Color(1f, 0.16f, 0.1f), 2.6f);   // red danger ring while in play
         AddChild(ring); _ring = ring;
@@ -33,7 +45,7 @@ public partial class PestilencePool : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta;
         _age += dt;
         bool bossAlive = false;

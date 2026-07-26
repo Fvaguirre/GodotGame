@@ -38,7 +38,7 @@ public partial class EmberTrail : Node3D
 
     public override void _Process(double delta)
     {
-        var g = Game.I; if (g == null || g.State != GameState.Playing) return;
+        var g = Game.I; if (g == null || !g.SimActive) return;
         float dt = (float)delta; _t += dt;
         float fade = Mathf.Clamp(Dur - _t, 0f, 1f);
         if (_decal != null) { _decal.Modulate = new Color(_col.R, _col.G, _col.B, 0.85f * fade); _decal.EmissionEnergy = 0.8f + 1.8f * fade; }

@@ -41,8 +41,18 @@ public partial class Bolt : Node3D
     public bool Horizontal = false;   // crescent lies flat (Lunar full-charge sweep)
     public float Grow = 0f;           // Radius (and visual) expands per second
     public float Poison = 0f, PoisonDur = 2.5f;   // poison-on-hit (Verdant thorns)
+    public int Splinter = 0;          // (OVERHAUL) Lunar Splintering Moon: homing shards loosed on first enemy hit
+    public float SplinterDmg = 0f;
+    private bool _splintered = false;
+    public float MarkOnHit = 0f;      // (OVERHAUL) Arcane Conduit Swarm: apply a conduit mark on hit
+    public int Arc = 0; public float ArcDmg = 0f;   // (OVERHAUL) Arcane Living Current: chain to nearby foes on hit
+    private bool _arced = false;
     public int Style = 0;             // 0 normal, 1 purple needle, 2 knotted wood spike
     public float RootOnHit = 0f;      // root duration applied to enemies hit (Verdant full-charge thorn)
+    public bool ArcaneBurst = false;  // (NEW) an Arcane primary-burst bolt — tracked for the 3-on-one-target slash payoff
+    private Node3D _arcaneShards;         // (NEW) spinning jagged energy shell for the arcane plasma bolt
+    private StandardMaterial3D _arcaneHalo;   // (NEW) its pulsing plasma halo
+    private float _arcaneSeed;
     public bool DetonatesEnts = false;// passes through her own ents and blows them up
     private bool _entRefunded = false;// a charged detonation refunds at most one ent
     public float SpeedMul = 1f;       // applied to homing cruise speed (initial Vel is pre-scaled by ProjSpeed)
@@ -57,6 +67,18 @@ public partial class Bolt : Node3D
     private float _age = 0f;          // (NEW) time alive — arms ground contact so a bolt can't self-mark at the muzzle
 
     private readonly HashSet<ulong> _hit = new();
+    private static readonly List<Enemy> _scan = new();   // (PERF) shared collision-scan buffer, reused across all bolts (single-threaded)
+
+    // perf: bolt lights draw from a shared global cap (Game.DynLightCap). In a bolt-storm, only the first N get a
+    // real-time light; the rest still show via their emissive shader. Decremented in _ExitTree when the bolt frees.
+    private bool _litReg = false;
+    private void AddBoltLight(Color col, float range, float energy)
+    {
+        if (!Game.DynLightRoom) return;
+        Game.DynLightAdd(); _litReg = true;
+        AddChild(new OmniLight3D { OmniRange = range, LightColor = col, LightEnergy = energy });
+    }
+    public override void _ExitTree() { if (_litReg) { Game.DynLightRemove(); _litReg = false; } }
 
     public override void _Ready()
     {
@@ -76,7 +98,7 @@ public partial class Bolt : Node3D
                 var fin = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.03f * s, 0.4f * s, 0.45f * s) }, MaterialOverride = ice };
                 fin.Position = new Vector3(0.16f * s, 0f, 0.95f * s); pivot.AddChild(fin);
             }
-            holder.AddChild(new OmniLight3D { OmniRange = 4.5f, LightColor = new Color(0.7f, 0.9f, 1f), LightEnergy = 1.6f });
+            AddBoltLight(new Color(0.7f, 0.9f, 1f), 4.5f, 1.6f);
             return;
         }
         if (Style == 1 || Style == 2)
@@ -91,21 +113,23 @@ public partial class Bolt : Node3D
                 float pitch = -Mathf.Asin(Mathf.Clamp(v.Y, -1f, 1f));
                 holder.Rotation = new Vector3(pitch, yaw, 0);
             }
-            if (Style == 1)   // purple poison needle — thin, long, reads as a straight line in flight
+            if (Style == 1)   // purple poison THORN — thin, tapered, reads as a poison needle in flight (NOT a bolt)
             {
                 var pur = new Color(0.62f, 0.26f, 0.85f);
-                var nmat = Game.ElementBoltMat(pur, DamageType.Arcane);   // (NEW) shader surface (Arcane sparkle) on the same needle — colour/shape unchanged
-                var needle = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.028f, Height = 1.5f }, MaterialOverride = nmat };
+                var nmat = Game.ElementBoltMat(pur, DamageType.Arcane);   // (NEW) shader surface (Arcane sparkle) on the same needle
+                // length tracks the hit radius so a bigger shot reads bigger, but it stays a SLENDER thorn (thin girth)
+                float len = 1.1f + Radius * 1.6f;
+                var needle = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.03f + Radius * 0.08f, Height = len }, MaterialOverride = nmat };
                 needle.RotationDegrees = new Vector3(90, 0, 0);          // lie along local -Z (forward)
-                needle.Position = new Vector3(0, 0, -0.25f);
+                needle.Position = new Vector3(0, 0, -Radius + len * 0.5f);   // tip at the front of the hit sphere, body trails back
                 holder.AddChild(needle);
-                AddChild(new OmniLight3D { OmniRange = 3f, LightColor = pur, LightEnergy = 1.1f });
+                AddBoltLight(pur, 3f, 1.1f);
             }
             else   // (NEW look) living ROOT-LANCE: a writhing root spearing forward — a tapered shaft with tendrils
             {      // corkscrewing around it (spun in flight so it reads as alive) and a couple of gnarled root-nodes.
                 var woodMat = Game.ElementBoltMat(new Color(0.42f, 0.3f, 0.17f), DamageType.Nature);   // Nature shader surface
                 var glowCol = new Color(0.4f, 0.85f, 0.4f);
-                float s = 0.5f + Radius * 0.2f;
+                float s = 0.4f + Radius * 0.9f;   // girth now tracks the hit radius so the lance matches the sphere it hits with (was ~fixed)
                 var parts = new System.Collections.Generic.List<MeshInstance3D>();
                 var shaft = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = 0.34f * s, Height = 2.0f * s }, MaterialOverride = woodMat };
                 shaft.RotationDegrees = new Vector3(90, 0, 0);        // point along local -Z (travel)
@@ -131,7 +155,7 @@ public partial class Bolt : Node3D
                     knot.Transparency = 1f;
                     spinner.AddChild(knot); parts.Add(knot);
                 }
-                holder.AddChild(new OmniLight3D { OmniRange = 5f, LightColor = glowCol, LightEnergy = 1.4f });
+                AddBoltLight(glowCol, 5f, 1.4f);
                 var spin = spinner.CreateTween(); spin.SetLoops();   // corkscrew the tendrils around the shaft in flight
                 spin.TweenProperty(spinner, "rotation", new Vector3(0, 0, Mathf.Tau), 0.9f);
                 var ft = CreateTween(); ft.SetParallel(true);        // fade each part in via instance transparency
@@ -200,22 +224,72 @@ public partial class Bolt : Node3D
                 AddChild(halo);
             }
         }
+        else if (DType == DamageType.Arcane)
+        {
+            // RAW ARCANE PLASMA BOLT: a searing white-hot core inside a pulsing violet plasma halo, wrapped in jagged energy
+            // shards that spin + jitter so it crackles like unstable raw magic (not a clean glowing marble). Animated in _Process.
+            float vr = Radius * 0.82f + 0.12f;
+            var holder = new Node3D(); AddChild(holder);
+            var core = new MeshInstance3D { Mesh = new SphereMesh { Radius = vr * 0.62f, Height = vr * 1.24f }, MaterialOverride = Game.ArcaneEnergyMat(), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+            holder.AddChild(core);
+            var halo = new MeshInstance3D { Mesh = new SphereMesh { Radius = vr * 1.25f, Height = vr * 2.5f }, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+            _arcaneHalo = new StandardMaterial3D { AlbedoColor = new Color(Tint.R, Tint.G, Tint.B, 0.28f), EmissionEnabled = true, Emission = Tint, EmissionEnergyMultiplier = 1.6f, Transparency = BaseMaterial3D.TransparencyEnum.Alpha, ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded, CullMode = BaseMaterial3D.CullModeEnum.Disabled };
+            halo.MaterialOverride = _arcaneHalo;
+            holder.AddChild(halo);
+            _arcaneShards = new Node3D(); holder.AddChild(_arcaneShards);
+            var smat = Game.Emissive(Tint.Lerp(Colors.White, 0.2f), 2.4f);
+            for (int i = 0; i < 5; i++)
+            {
+                var spike = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0f, BottomRadius = vr * 0.15f, Height = vr * (1.4f + GD.Randf() * 0.9f), RadialSegments = 4 }, MaterialOverride = smat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+                spike.RotationDegrees = new Vector3(GD.Randf() * 360f, GD.Randf() * 360f, GD.Randf() * 360f);
+                _arcaneShards.AddChild(spike);
+            }
+            _arcaneSeed = GD.Randf() * 10f;
+        }
         else
         {
-            var mi = new MeshInstance3D();
-            mi.Mesh = new SphereMesh { Radius = 0.26f + Radius * 0.2f, Height = 0.52f + Radius * 0.4f };
-            mi.MaterialOverride = Game.ElementBoltMat(Tint, DType);   // (NEW) per-element animated shader (was flat ToonEmissive)
-            AddChild(mi);
+            // (PHASE 3) elongated ENERGY STREAK instead of a round marble — oriented along travel (local -Z), with a bright
+            // leading core so the head reads sharp. Keeps the per-element animated shader. Modest stretch so homing bolts
+            // (orientation is set once) still read fine.
+            float vr = Radius * 0.82f + 0.12f;   // visual tracks the hit radius (kept just under the +0.4 hit grace)
+            var holder = new Node3D(); AddChild(holder);
+            if (Vel.LengthSquared() > 0.001f)
+            {
+                var v = Vel.Normalized();
+                holder.Rotation = new Vector3(-Mathf.Asin(Mathf.Clamp(v.Y, -1f, 1f)), Mathf.Atan2(v.X, v.Z), 0f);
+            }
+            var mi = new MeshInstance3D
+            {
+                Mesh = new SphereMesh { Radius = vr, Height = vr * 2f },
+                Scale = new Vector3(0.85f, 0.85f, 1.9f),   // stretch into a streak along -Z (travel)
+                MaterialOverride = Game.ElementBoltMat(Tint, DType)
+            };
+            holder.AddChild(mi);
+            holder.AddChild(new MeshInstance3D
+            {
+                Mesh = new SphereMesh { Radius = vr * 0.5f, Height = vr },
+                Position = new Vector3(0, 0, -vr * 0.95f),   // sharp bright head at the front
+                MaterialOverride = Game.Emissive(Tint.Lerp(Colors.White, 0.35f), 3f),
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off
+            });
         }
-        AddChild(new OmniLight3D { OmniRange = 5f, LightColor = Tint, LightEnergy = 1.4f });
+        AddBoltLight(Tint, 5f, 1.4f);
         if (DType != DamageType.Lunar) AddChild(Game.MakeCometTrail(Tint));   // Lunar crescent adds its own bigger white trail above (NEW)
     }
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta;
         _age += dt;
+
+        if (_arcaneShards != null && GodotObject.IsInstanceValid(_arcaneShards))   // (NEW) arcane plasma bolt: erratic tumble + crackle jitter + halo pulse
+        {
+            _arcaneShards.RotationDegrees += new Vector3(dt * 210f, dt * 300f, dt * 160f);
+            float j = 0.8f + 0.3f * Mathf.Sin(_age * 42f + _arcaneSeed) + (GD.Randf() - 0.5f) * 0.22f;
+            _arcaneShards.Scale = Vector3.One * Mathf.Clamp(j, 0.55f, 1.35f);
+            if (_arcaneHalo != null) _arcaneHalo.EmissionEnergyMultiplier = 1.3f + 0.7f * Mathf.Abs(Mathf.Sin(_age * 28f + _arcaneSeed));
+        }
 
         // holy descending ray: lay down a flickering warm scorch on the ground it passes over (cosmetic) (NEW)
         if (_holyRay)
@@ -306,8 +380,11 @@ public partial class Bolt : Node3D
             }
             if (RadiantHeal && !_didHeal && Src != null && Game.I.NetMgr != null && Game.I.NetMgr.Active)   // (NEW) Radiant Ascension: mend allies this mote flies through, once each, then carry on to the foe behind
                 if (Game.I.NetMgr.HealAlliesNear(GlobalPosition, 1.7f, HealAmt)) _didHeal = true;
-            var enemies = Game.I.Enemies.ToArray();   // (FIX) snapshot — a hit can kill/spawn and mutate the live list
-            for (int i = enemies.Length - 1; i >= 0; i--)
+            // (PERF) snapshot into a REUSED static buffer instead of allocating a fresh array every frame for every bolt
+            // (a hit can kill/spawn and mutate the live list). Safe: _Process is single-threaded + non-reentrant.
+            _scan.Clear(); _scan.AddRange(Game.I.Enemies);
+            var enemies = _scan;
+            for (int i = enemies.Count - 1; i >= 0; i--)
             {
                 var e = enemies[i];
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
@@ -338,6 +415,33 @@ public partial class Bolt : Node3D
                     if (Poison > 0f) e.Poison(Poison, PoisonDur);   // Verdant thorns: additive poison + slow
                     if (RootOnHit > 0f) e.Root(RootOnHit);          // full-charge thorn roots
                     Src?.OnHit(e, e.Dead, this);
+                    if (MarkOnHit > 0f) e.Mark(3f, MarkOnHit, 0);   // (OVERHAUL) Conduit Swarm: leave a conduit mark
+                    if (Arc > 0 && !_arced)   // (OVERHAUL) Living Current: chain to nearby un-hit foes on hit
+                    {
+                        _arced = true; Enemy prev = e;
+                        for (int a = 0; a < Arc; a++)
+                        {
+                            Enemy nxt = null; float bd = 10f;
+                            foreach (var o in Game.I.Enemies.ToArray())
+                                if (o != null && !o.Dead && GodotObject.IsInstanceValid(o) && !_hit.Contains(o.GetInstanceId())) { float dd = prev.GlobalPosition.DistanceTo(o.GlobalPosition); if (dd < bd) { bd = dd; nxt = o; } }
+                            if (nxt == null) break;
+                            _hit.Add(nxt.GetInstanceId());
+                            nxt.Hurt(ArcDmg, DType, FromCombo);
+                            Game.I.SpawnArcaneLightning(new List<Vector3> { prev.GlobalPosition + Vector3.Up, nxt.GlobalPosition + Vector3.Up }, 0.6f);
+                            prev = nxt;
+                        }
+                    }
+                    if (Splinter > 0 && !_splintered)   // (OVERHAUL) Splintering Moon: burst homing shards off the first foe struck
+                    {
+                        _splintered = true;
+                        for (int s = 0; s < Splinter; s++)
+                        {
+                            float sa = s / (float)Splinter * Mathf.Tau + _age * 3f;
+                            var sd = new Vector3(Mathf.Cos(sa), 0.12f, Mathf.Sin(sa)).Normalized();
+                            var sh = new Bolt { Vel = sd * 26f, Dmg = SplinterDmg, Radius = Mathf.Max(0.2f, Radius * 0.6f), Tint = Tint, DType = DType, Src = Src, FromCombo = FromCombo, Homing = true, HomeSpeed = 30f, Turn = 7f, HomeDelay = 0.06f, Life = 1.3f };
+                            Game.I.AddChild(sh); sh.GlobalPosition = GlobalPosition;
+                        }
+                    }
                     if (Full && !_modsFired) { Src?.ApplyChargedMods(GlobalPosition); _modsFired = true; }   // (FIX) mods trigger once, on the first foe hit — not per pierced enemy
                     if (Pierce > 0) { Pierce--; }
                     else { Game.I.Sfx?.Impact(DType); QueueFree(); return; }
@@ -367,6 +471,21 @@ public partial class Bolt : Node3D
                 if (Style == 2) Game.I.SpawnBrambleBurst(GlobalPosition, 1.0f, 5);   // (NEW) brambles climb the struck surface
                 QueueFree(); return;
             }
+
+        // (NEW) structure walls (Decks) — bolts splat on fort/ruin walls instead of passing through; they still fly
+        // OVER low walkable pads and over the top of a wall.
+        foreach (var d in Game.I.Decks)
+        {
+            if (d.TopY < 1.8f || GlobalPosition.Y >= d.TopY) continue;
+            float dx = GlobalPosition.X - d.Center.X, dz = GlobalPosition.Z - d.Center.Z;
+            if (Mathf.Abs(dx) < d.Half.X && Mathf.Abs(dz) < d.Half.Y)
+            {
+                var bn = (d.Half.X - Mathf.Abs(dx) < d.Half.Y - Mathf.Abs(dz)) ? new Vector3(Mathf.Sign(dx), 0f, 0f) : new Vector3(0f, 0f, Mathf.Sign(dz));
+                Game.I.SpawnImpactMark(GlobalPosition, bn, null, DType, Radius);
+                if (Style == 2) Game.I.SpawnBrambleBurst(GlobalPosition, 1.0f, 5);
+                QueueFree(); return;
+            }
+        }
 
         var pl = Game.I.Player;
         float far = pl != null ? GlobalPosition.DistanceTo(pl.GlobalPosition) : 0f;

@@ -14,6 +14,8 @@ public partial class WindPad : Node3D
     private bool _visualOnly;
     private Node3D _spin;
     private const float LaunchVel = 19f;   // the "huge boost"
+    public float LaunchMul = 1f;   // (OVERHAUL) Whirlwind Launch Pad: taller launch
+    public float Roam = 0f;        // (OVERHAUL) Whirlwind Roaming Twister: drifts toward the nearest foe
 
     // funnel dims + spiraling debris for the vortex look (NEW)
     private float _topR, _baseR, _colH = 4.5f;
@@ -111,7 +113,7 @@ public partial class WindPad : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused (NEW)
         float dt = (float)delta;
         _life += dt;
         if (_spin != null) _spin.RotateY(dt * 6f);
@@ -135,6 +137,14 @@ public partial class WindPad : Node3D
             if (_dmgT <= 0f) { _dmgT = 0.3f; Game.I.NetMgr?.StormForce(GlobalPosition, _radius, 2, _dps * 0.3f); }
         }
 
+        if (!_visualOnly && Roam > 0f)   // (OVERHAUL) Roaming Twister: the tornado wanders toward the nearest foe
+        {
+            Enemy near = null; float nd = 1e9f;
+            foreach (var e in Game.I.Enemies)
+                if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) { float d = GlobalPosition.DistanceSquaredTo(e.GlobalPosition); if (d < nd) { nd = d; near = e; } }
+            if (near != null) { var to = near.GlobalPosition - GlobalPosition; to.Y = 0f; if (to.Length() > _radius) GlobalPosition += to.Normalized() * Roam * dt; }
+        }
+
         // jump pad: every machine launches ITS OWN local player when they're standing in the footprint, so
         // all players can use any whirlwind (real or the visual-only ally copy)
         var p = Game.I.Player;
@@ -144,7 +154,7 @@ public partial class WindPad : Node3D
             float groundY = Game.I.SurfaceHeight(GlobalPosition, 0f);
             if (flat.Length() <= _radius && (p.GlobalPosition.Y - groundY) < 2.2f)
             {
-                p.WindLaunch(LaunchVel);
+                p.WindLaunch(LaunchVel * LaunchMul);
                 _launchCd = 0.5f;
                 Game.I.Sfx?.Release(DamageType.Wind);
             }

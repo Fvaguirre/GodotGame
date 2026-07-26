@@ -13,6 +13,7 @@ public partial class WindSlice : Node3D
     public float Speed = 34f;
     public float Range = 40f;
     public bool Remote = false;        // client visual copy: travels + fades, no damage
+    public float Pull = 0f;            // (OVERHAUL) Vortex Edge: drags foes toward the slice's path as it passes
     private bool _announced = false;
     private float _travelled = 0f;
     private Node3D _x;
@@ -63,7 +64,7 @@ public partial class WindSlice : Node3D
     public override void _Process(double delta)
     {
         var g = Game.I;
-        if (g == null || g.State != GameState.Playing) return;
+        if (g == null || !g.SimActive) return;
         float dt = (float)delta;
         float step = Speed * dt;
         GlobalPosition += Dir * step;
@@ -90,6 +91,14 @@ public partial class WindSlice : Node3D
                 e.Hurt(Dmg, DamageType.Wind, true);
             }
         }
+
+        if (!Remote && Pull > 0f)   // (OVERHAUL) Vortex Edge: drag nearby foes toward the slice's line
+            foreach (var e in g.Enemies.ToArray())
+                if (e != null && !e.Dead && GodotObject.IsInstanceValid(e))
+                {
+                    var d = e.GlobalPosition - GlobalPosition; d.Y = 0;
+                    if (d.Length() < Width * 1.6f + e.Radius) e.PullToward(GlobalPosition, Pull * dt);
+                }
 
         if (_travelled >= Range)
         {

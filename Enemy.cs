@@ -9,7 +9,7 @@ using Godot;
 // MULTIPLAYER: enemies are real only on the host. On a client this object is a proxy (Remote = true)
 // driven by EnemySnapshot; its Hurt() routes damage to the host via ReportHit and it NEVER Die()s
 // locally. To add an enemy type see DEV_GUIDE.md §6.1 (don't forget the EnemyKinds table!).
-public enum EBehav { Melee, Ranged, Charged, Flyer, Healer, Goblin, Boss, Zapper, Bomber, Diver, Hexer, Totem, Sapper }
+public enum EBehav { Melee, Ranged, Charged, Flyer, Healer, Goblin, Boss, Zapper, Bomber, Diver, Hexer, Totem, Sapper, Lobber, Phalanx, Archer }   // Lobber = croc bomb-thrower; Phalanx/Archer = the warded formation (NEW)
 
 public partial class Enemy : Node3D
 {
@@ -21,8 +21,11 @@ public partial class Enemy : Node3D
     public bool IsBoss = false;
     public bool IsGoblin = false;
     public string Label = "";
+    public bool PlateOccluded = false;   // (PERF) cached HUD nameplate line-of-sight result — the raycast is throttled to ~15Hz, not run every draw
+    public ulong PlateLosMs = 0;         // next tick (ms) at which DrawEnemyBars re-runs the occlusion raycast for this foe
     public int NetId = 0;      // host-assigned id for multiplayer sync
     public int TypeIdx = 0;    // index into EnemyKinds table for client-side rendering
+    public float SizeMul = 1f; // (NEW) power/variety size multiplier — host computes it, applied to Radius in _Ready, synced to clients so co-op renders matching sizes + hitboxes
 
     // ---- elite affixes (0 none,1 shielded,2 frenzied,3 vampiric,4 volatile,5 armored) ----
     public int Affix = 0;
@@ -43,15 +46,44 @@ public partial class Enemy : Node3D
 
     public void SetAffix(int a) { Affix = a; }   // client visual only — host owns the mechanics
 
-    // small nameplate text shown by the HUD near the health bar (affix and/or special archetype)
-    public string PlateText()
+    // Nameplate tag shown by the HUD. Two kinds of info:
+    //  • ROLLED elite AFFIX (rare modifier) → a small ICON, because it's a modifier on top of the base enemy.
+    //  • the enemy's BASE archetype ability → a WORD ("Stunner", "Rooter", "Empowerer"…), because that's just what it IS.
+    // Both can show together (e.g. a frenzied ptero → "💢 Stunner"). Bosses/goblins/the Taker keep their name label instead.
+    public string PlateTag()
     {
-        string a = Affix switch { 1 => "Shielded", 2 => "Frenzied", 3 => "Vampiric", 4 => "Volatile", 5 => "Armored", _ => "" };
-        string t = _type switch { "sentinel" => "Sentinel", "diver" => "Diver", "hexer" => "Hexer", "splitter" => "Splitter", "totem" => "Empowerer", _ => "" };
-        if (a.Length > 0 && t.Length > 0) return a + " " + t;
-        return a.Length > 0 ? a : t;
+        if (IsBoss || IsGoblin || _type == "taker") return "";
+        string icon = Affix switch
+        {
+            1 => "\U0001F537",   // shielded → blue diamond (energy barrier)
+            2 => "\U0001F4A2",   // frenzied → rage
+            3 => "\U0001FA78",   // vampiric → blood drop (lifesteal)
+            4 => "\U0001F4A5",   // volatile → explosion (blows up on death)
+            5 => "\U0001F6E1",   // armored → shield
+            _ => ""
+        };
+        string word = _type switch
+        {
+            "sentinel" => "Armored",     // heavy-plated tank (crits punch through)
+            "jtroll"   => "Charger",     // charges + knocks you back
+            "ptero"    => "Stunner",     // ranged stun bolt
+            "zapper"   => "Stunner",     // ranged stun bolt
+            "snake"    => "Rooter",      // roots you on touch
+            "croc"     => "Bomber",      // lobs timed bombs
+            "bomber"   => "Bomber",      // rushes + self-detonates
+            "healer"   => "Healer",      // heals its allies
+            "hexer"    => "Hexer",       // curse + snare
+            "wardbane" => "Dispeller",   // strips your shield/wards
+            "splitter" => "Splitter",    // splits into two on death
+            "totem"    => "Empowerer",   // hastes nearby allies
+            "diver"    => "Diver",       // dive-bombs from above
+            "bat"      => "Diver",       // dive-bombs from above
+            "caster"   => "Caster",      // arcane bolt-thrower
+            _ => ""
+        };
+        if (icon.Length > 0 && word.Length > 0) return icon + " " + word;
+        return icon.Length > 0 ? icon : word;
     }
-    public Color PlateColor() => Affix > 0 ? AffixCol(Affix) : new Color(0.86f, 0.86f, 0.96f);
 
     public void MakeAffix(int a)
     {
@@ -78,6 +110,8 @@ public partial class Enemy : Node3D
         if (_tgtPeer == 0) { var pl = Game.I.Player; if (pl != null) pl.Hurt(dmg, GlobalPosition); }
         else Game.I.NetMgr?.DamagePlayer(_tgtPeer, dmg);
         if (_type == "swarmer") { if (_tgtPeer == 0) Game.I.Player?.SlowMe(1.2f, 0.6f); else Game.I.NetMgr?.SlowPlayer(_tgtPeer, 1.2f, 0.6f); Game.I.Sfx?.ZombieAttack(GlobalPosition); }   // (NEW) swarmer hits slow you + attack snarl   // route to the ally who's being hit
+        if (_type == "jtroll") { if (_tgtPeer == 0) Game.I.Player?.Knockback(GlobalPosition, 18f); else Game.I.NetMgr?.KnockbackPlayer(_tgtPeer, GlobalPosition, 18f); }   // (CHANGED) troll charge KNOCKS YOU BACK instead of stunning — the jungle already has plenty of stuns
+        if (_type == "snake") Game.I.TrySnakeRoot(_tgtPeer, NetId);   // (NEW) snake touch roots you — ground-only, throttled per player, ends on the snake's death
     }
 
     // status effects
@@ -121,8 +155,34 @@ public partial class Enemy : Node3D
         if (Game.I.Player != null && Game.I.Player.EmberWitch) Game.I.MyStats.Highlight++;   // Ember highlight = bombs detonated
     }
     private bool _bleedRot = false;
+    private float _bleedBurstMul = 1f;   // (OVERHAUL) Hemorrhage Rupture: scales the on-death blood burst
     private float _rotBubT = 0f;
     private bool _rotShow = false;     // client mirror of the rot state (status bit 32)
+
+    // (NEW) a couple of short bright-crimson gashes flick across the body — reads as "bleeding" (distinct from rot's rising bubbles)
+    private void SpawnBleedSlash()
+    {
+        if (Game.I == null) return;
+        var c = DamageTypes.Col(DamageType.Blood).Lerp(new Color(1f, 0.2f, 0.2f), 0.35f);
+        var mat = Game.ToonEmissive(c, 3.4f, 0f);
+        for (int i = 0; i < 2; i++)
+        {
+            float len = Radius * (0.55f + GD.Randf() * 0.5f);
+            var slash = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(len, 0.09f, 0.03f) }, MaterialOverride = mat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+            Game.I.AddChild(slash);
+            float a = GD.Randf() * Mathf.Tau, rr = Radius * (0.72f + GD.Randf() * 0.32f);
+            float y = 0.4f + GD.Randf() * (Radius * 1.5f);
+            var pos = GlobalPosition + new Vector3(Mathf.Cos(a) * rr, y, Mathf.Sin(a) * rr);
+            slash.GlobalPosition = pos;
+            slash.LookAt(pos + new Vector3(Mathf.Cos(a), 0f, Mathf.Sin(a)), Vector3.Up);   // face outward off the silhouette
+            slash.RotateObjectLocal(Vector3.Forward, GD.Randf() * Mathf.Pi);               // random diagonal — a slash, not a bar
+            var tw = slash.CreateTween(); tw.SetParallel(true);
+            tw.TweenProperty(slash, "position", pos + new Vector3(0f, -0.35f, 0f), 0.35f);   // slight downward drip
+            tw.TweenProperty(slash, "transparency", 1f, 0.35f);
+            tw.SetParallel(false);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(slash)) slash.QueueFree(); }));
+        }
+    }
 
     private void SpawnRotBubble()
     {
@@ -153,29 +213,539 @@ public partial class Enemy : Node3D
     private bool _rThrown = false;                 // client proxy: mid-air tumbling (driven by networked throw/land events) (NEW)
     private float _getUpT = 0f, _getUpDur = 0f;   // after a hard landing: downed → rising stagger window (NEW)
     public bool Thrown => _thrown;            // query for the Hurricane ult
+    // (NEW) HUD threat telegraph: this ranged foe is winding up a shot (sieger charge / zapper / hexer / sapper tell)
+    public bool Telegraphing => _chargeT > 0f || _zapTele > 0f || _hexTele > 0f;
+    public float TeleFrac => _chargeT > 0f && _chargeDur > 0.01f ? Mathf.Clamp(1f - _chargeT / _chargeDur, 0f, 1f)
+                           : _zapTele > 0f ? Mathf.Clamp(1f - _zapTele / 1.05f, 0f, 1f)
+                           : _hexTele > 0f ? Mathf.Clamp(1f - _hexTele / 1.1f, 0f, 1f) : 0f;
+    // (NEW) a diver/bat committed to its swoop — a body threat the HUD warns about like a projectile
+    public bool Diving => _diving;
+    // (NEW) special-infected charge state — Taker rearing back (4) or dashing to grab (1). Locator uses the existing IsSpecial.
+    public bool SpecialCharging => (IsTaker && (_takerState == 4 || _takerState == 1)) || (IsPhalanx && (_chargeWind > 0f || _chargeLunge > 0f));
+    public string SpecialTag => IsPhalanx ? "PHALANX" : "TAKER";
+    public string SpecialWarn => IsPhalanx ? "CHARGE!" : "GRAB!";   // (NEW) the loud on-screen callout while this special commits to its big move
     private const float ThrowGravity = -26f, ThrowHurtSpeed = 9f, ThrowDmgPer = 2.4f;
+    private float _fallDmgMul = 1f;   // (NEW) Updraft Tempest: multiplies the fall damage taken on this throw's landing
     private float _popAccum = 0f, _popT = 0f;
     private Color _popCol = Colors.White;
     private bool _popAmp = false;
     private bool _popCrit = false;
 
+    // ===== WARDED PHALANX (NEW) — a compound miniboss: one ward-bearer at the front, up to 8 archers behind it =====
+    // While the ward stands, NOTHING in the formation can be hurt: all damage pours into the ward pool, and the archers
+    // are untouchable. They answer with a massed volley that paints a circle of falling arrows on whoever they're
+    // targeting, which forces the party to keep moving. Break the ward and the unit inverts: the bearer drops its guard
+    // and charges you (knockback + stun), while the now-defenceless archers scatter and cower behind other foes — until
+    // another phalanx shows up, at which point they'll run to enlist in ITS ranks, making that ward tougher and its
+    // volley deadlier. Every scaling number keys off the live archer count, so a merged super-formation is a real threat.
+    public const int MaxArchers = 8;
+    private float _wardBase = 0f;                        // pre-archer ward pool (set in Configure, scales with depth)
+    private float _wardHp = 0f, _wardMax = 0f;
+    private float _volleyT = 5f;                         // countdown to the next massed volley
+    private float _rWard = -1f;                          // CLIENT mirror of the ward fraction (-1 = no ward / unknown)
+    private bool _rGuarded = false;                      // CLIENT mirror of "protected by a leader's ward"
+    private Enemy _leader = null;                        // archer -> its ward-bearer
+    private readonly System.Collections.Generic.List<Enemy> _squad = new();   // bearer -> its archers
+    private MeshInstance3D _wardDome, _wardRunes;
+    private float _wardPulse = 0f;
+    private float _joinScanT = 0f;
+    public float WardFrac => Remote ? Mathf.Max(0f, _rWard) : (_wardMax > 0.01f ? Mathf.Clamp(_wardHp / _wardMax, 0f, 1f) : 0f);
+    public bool WardUp => Remote ? _rWard > 0.001f : _wardHp > 0.01f;
+    public int ArcherCount => _squad.Count;
+    // an archer is untouchable exactly while its bearer's ward stands — that's the whole puzzle of the fight
+    public bool WardGuarded => Remote ? _rGuarded : (_leader != null && GodotObject.IsInstanceValid(_leader) && !_leader.Dead && _leader.WardUp);
+    public bool IsPhalanx => _type == "phalanx";
+    public bool IsArcher => _type == "archer";
+    public void SetRemoteWard(float frac) { _rWard = frac; }
+    public void SetRemoteGuarded(bool on) { _rGuarded = on; }
+
+    // (NEW REFLOW) trailing-chase bookkeeping — see Game.RunReflowDirector
+    private float _chaseFarT = 0f;
+    public float ChaseFarT => _chaseFarT;
+    public void ResetChaseFar() { _chaseFarT = 0f; _avoidSign = 0f; _sepPush = Vector3.Zero; }
+    // safe to pick up and re-insert somewhere else? Bosses/specials/goblins are set-pieces you're meant to leave behind
+    // or chase down; a grabbed Taker, an airborne fling, a downed foe and un-woken ambushers all own their own position.
+    public bool Relocatable => !Dead && !Remote && !IsBoss && !IsGoblin && !IsSpecial && !IsArcher
+                               && !_thrown && _getUpT <= 0f && _grabPeer == 0 && _behav != EBehav.Totem
+                               && RootT <= 0f && FrozenT <= 0f                     // (NEW) don't blink a HARD-CC'd foe away — it's held in a placed field (Blizzard/DeepFreeze/GroveGuardian root), let the field keep it
+                               && !PhoenixHeld                                     // (PHOENIX) never blink a foe the phoenix is carrying
+                               && !(_type == "swarmer" && !_alerted);
+
+    // (PHOENIX) carried by a phoenix dive: locked to PhoenixHoldPos, all AI/attacks skipped
+    public bool PhoenixHeld = false; public Vector3 PhoenixHoldPos;
+    public void PhoenixGrab(Vector3 pos) { if (Remote || Dead) return; if (IsTaker && _grabPeer != 0) ReleaseGrab(); _thrown = false; _climbing = false; PhoenixHeld = true; PhoenixHoldPos = pos; }
+    public void PhoenixRelease() { PhoenixHeld = false; }
+
+    private bool _climbing = false;               // (NEW) hauling itself up a vertical face: half speed, and a crit/knock/fling peels it off
+    private Vector3 _climbDir = Vector3.Forward;  // horizontal direction INTO the wall we're scaling
+    public bool Climbing => _climbing;
+
     // push the enemy away from `from` (negative force pulls toward it)
     public void Knockback(Vector3 from, float force)
     {
+        if (IsArcher && WardGuarded) return;   // (NEW) a warded archer can't be shoved out of formation — the ward shelters it from displacement too, so CC ults don't break the "unbreakable" ward phase
         var d = GlobalPosition - from; d.Y = 0;
         if (d.LengthSquared() < 0.01f) d = Vector3.Forward;
-        _knock += d.Normalized() * force * 6f;
+        d = d.Normalized();
+        if (_climbing && force > 0f) { PeelOffWall(d * Mathf.Max(3.5f, force * 3f)); return; }   // (NEW) knocked off the wall mid-climb → it falls
+        _knock += d * force * 6f;
+    }
+
+    // (NEW) shaken off a wall mid-climb (crit / knockback / fling). Hands the foe to the existing throw arc, so
+    // UpdateThrown → EndThrow gives us impact-scaled fall damage, the topple/get-up stagger and the MP sync for free —
+    // a foe peeled off near the top of a keep hits the dirt far harder than one shrugged off two metres up.
+    private void PeelOffWall(Vector3 push)
+    {
+        if (Remote || Dead || _thrown || !_climbing) return;
+        _climbing = false;
+        push.Y = 0f;
+        if (push.LengthSquared() < 0.01f) push = -_climbDir * 4f;
+        Fling(push + Vector3.Up * 2.5f);   // a little pop so it clears the face before gravity takes over
+    }
+
+    // ===== PHALANX: formation bookkeeping (host only) =====
+
+    // stand up a fresh formation: this bearer takes command of `archers` and raises its ward
+    public void FormPhalanx(System.Collections.Generic.List<Enemy> archers)
+    {
+        if (!IsPhalanx) return;
+        foreach (var a in archers) if (a != null && a.IsArcher) { a._leader = this; _squad.Add(a); }
+        RecomputeWard(true);
+    }
+
+    // a loose archer joins this bearer's ranks — the ward grows AND heals by the delta, and the volley gets meaner.
+    // This is the escalation the player has to respect: ignore a broken unit's stragglers and the next one is worse.
+    public bool EnlistArcher(Enemy a)
+    {
+        if (!IsPhalanx || a == null || !a.IsArcher || a.Dead || Dead || !WardUp) return false;
+        if (_squad.Count >= MaxArchers) return false;
+        if (a._leader == this) return false;
+        a._leader?._squad.Remove(a);
+        a._leader = this; _squad.Add(a);
+        float before = _wardMax;
+        RecomputeWard(false);
+        _wardHp = Mathf.Min(_wardMax, _wardHp + (_wardMax - before));   // the new body reinforces the barrier
+        Game.I?.NetMgr?.BroadcastWardGuard(a.NetId, true);
+        Game.I?.Sfx?.Impact(DamageType.Arcane);
+        Game.I?.Hud?.Banner("an archer falls in — the ward thickens");
+        return true;
+    }
+
+    private void RecomputeWard(bool full)
+    {
+        PruneSquad();
+        _wardMax = _wardBase * (1f + 0.35f * _squad.Count);   // 3 archers ≈ 2.05×, 8 ≈ 3.8× the bare pool
+        if (full) _wardHp = _wardMax;
+        _wardHp = Mathf.Min(_wardHp, _wardMax);
+    }
+
+    private void PruneSquad()
+    {
+        for (int i = _squad.Count - 1; i >= 0; i--)
+        { var a = _squad[i]; if (a == null || !GodotObject.IsInstanceValid(a) || a.Dead) _squad.RemoveAt(i); }
+    }
+
+    // the ward falls: the bearer drops its guard and charges, the archers are suddenly killable and bolt for cover
+    private void BreakWard()
+    {
+        _wardHp = 0f;
+        PruneSquad();
+        foreach (var a in _squad) { a._leader = null; a._fleeing = true; a._hasFlee = false; Game.I?.NetMgr?.BroadcastWardGuard(a.NetId, false); }
+        _squad.Clear();
+        Game.I?.NetMgr?.BroadcastWard(NetId, 0f);
+        WardShatter();
+        Game.I?.Hud?.Banner("the ward shatters — the bearer charges!");
+    }
+
+    private bool _shattered = false;
+    private void WardShatter()
+    {
+        _shattered = true;
+        var c = new Color(0.62f, 0.45f, 1f);
+        Game.I?.Sfx?.Impact(DamageType.Arcane);
+        Game.I?.SpawnPoof(GlobalPosition);
+        if (_wardDome != null)
+        {
+            var tw = _wardDome.CreateTween();
+            tw.TweenProperty(_wardDome, "scale", Vector3.One * 1.5f, 0.32f).SetTrans(Tween.TransitionType.Back);
+            tw.Parallel().TweenProperty(_wardDome, "transparency", 1f, 0.32f);
+            tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(_wardDome)) _wardDome.QueueFree(); _wardDome = null; }));
+        }
+        if (_wardRunes != null) { _wardRunes.QueueFree(); _wardRunes = null; }
+        // knock nearby witches back a step — the barrier bursting outward reads as a real event
+        var pl = Game.I?.Player;
+        if (pl != null && pl.GlobalPosition.DistanceTo(GlobalPosition) < WardRadius + 2f) pl.Knockback(GlobalPosition, 6f);
+        _ = c;
+    }
+
+    public float WardRadius => Radius * 3.4f;   // the dome the archers shelter inside
+
+    // a shot that hits a warded archer: no damage, no number — just a spark so you can SEE it being turned away
+    private float _deflectT = 0f;
+    private void WardDeflect()
+    {
+        _flash = 0.10f;
+        if (_deflectT > 0f) return;
+        _deflectT = 0.16f;
+        Game.I?.Sfx?.DamageTick(GlobalPosition + Vector3.Up * Radius, false);
+        Game.I?.SpawnPollen(GlobalPosition + Vector3.Up * Radius, Radius * 1.4f, new Color(0.62f, 0.45f, 1f), 4, 3f, net: false);
+    }
+
+    // ===== PHALANX: visuals =====
+    private void UpdateWardVisual(float dt)
+    {
+        bool up = WardUp;
+        if (up && _wardDome == null && !_shattered) BuildWardDome();
+        if (!up && _wardDome != null && !_shattered) { _shattered = true; WardShatter(); }   // clients reach this off the synced fraction; the host from BreakWard
+        if (_wardDome == null) return;
+        _wardPulse += dt;
+        float f = WardFrac;
+        // as the ward is worn down it dims, tightens and flickers faster — a readable "almost there" tell
+        float flick = 0.5f + 0.5f * Mathf.Sin(_wardPulse * Mathf.Lerp(2.2f, 11f, 1f - f));
+        var mat = _wardDome.MaterialOverride as StandardMaterial3D;
+        if (mat != null)
+        {
+            var bc = new Color(0.55f, 0.42f, 0.98f).Lerp(new Color(1f, 0.35f, 0.45f), 1f - f);   // violet → angry red as it fails
+            mat.AlbedoColor = new Color(bc.R, bc.G, bc.B, 0.10f + 0.20f * f * (0.6f + 0.4f * flick));
+            mat.EmissionEnabled = true; mat.Emission = bc; mat.EmissionEnergyMultiplier = 0.8f + 2.4f * f * flick;
+        }
+        _wardDome.Scale = Vector3.One * (0.92f + 0.08f * f);
+        if (_wardRunes != null) _wardRunes.RotationDegrees = new Vector3(0, _wardPulse * 26f, 0);
+    }
+
+    private void BuildWardDome()
+    {
+        float r = WardRadius;
+        _wardDome = new MeshInstance3D { Mesh = new SphereMesh { Radius = r, Height = r * 2f } };
+        _wardDome.MaterialOverride = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.55f, 0.42f, 0.98f, 0.22f),
+            Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+            BlendMode = BaseMaterial3D.BlendModeEnum.Add,
+            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            CullMode = BaseMaterial3D.CullModeEnum.Disabled,
+            EmissionEnabled = true,
+            Emission = new Color(0.55f, 0.42f, 0.98f),
+            EmissionEnergyMultiplier = 2.2f,
+        };
+        _wardDome.Position = new Vector3(0, Radius * 0.4f, 0);
+        AddChild(_wardDome);
+
+        // a sigil ring scribed on the ground at the dome's foot, so the safe/blocked area reads from the outside too
+        _wardRunes = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = r * 0.94f, OuterRadius = r } };
+        _wardRunes.MaterialOverride = Game.Emissive(new Color(0.72f, 0.58f, 1f), 2.6f);
+        _wardRunes.Position = new Vector3(0, -Radius * 0.85f, 0);
+        AddChild(_wardRunes);
+    }
+
+    private float _wardNetT = 0f;
+    private void UpdatePhalanxState(float dt)
+    {
+        if (IsPhalanx)
+        {
+            UpdateWardVisual(dt);
+            if (!Remote && _wardHp > 0f)
+            {
+                PruneSquad();
+                if (_squad.Count == 0) BreakWard();   // last archer down → nothing left to shelter, the barrier collapses
+                else
+                {
+                    _wardNetT -= dt;
+                    if (_wardNetT <= 0f) { _wardNetT = 0.2f; Game.I?.NetMgr?.BroadcastWard(NetId, WardFrac); }
+                }
+            }
+        }
+        else if (IsArcher && !Remote && _leader != null && (!GodotObject.IsInstanceValid(_leader) || _leader.Dead || !_leader.WardUp))
+        { _leader = null; _fleeing = true; Game.I?.NetMgr?.BroadcastWardGuard(NetId, false); }
+    }
+
+    // ===== PHALANX: the massed volley =====
+    // the bearer barks the order; the rank raises their bows to the sky and holds the draw. Nothing is committed yet —
+    // the circle is only painted when they LOOSE, so the aiming pose is the earliest tell that a volley is coming.
+    private void BeginVolley()
+    {
+        PruneSquad();
+        if (_squad.Count == 0) return;
+        _volleyWind = VolleyDraw;
+        foreach (var a in _squad) { a.AimSky(true); a.Quip(); Game.I?.NetMgr?.BroadcastArcherPose(a.NetId, 1); }
+        Game.I?.Sfx?.EnemyGrowl(GlobalPosition);
+    }
+
+    private void FireVolley()
+    {
+        PruneSquad();
+        int n = _squad.Count;
+        if (n <= 0 || Game.I == null) return;
+        Vector3 aim = _tgt; aim.Y = 0f;
+        float dps = Dmg * 0.18f * n;                                // 3 archers ≈ 14 dps at base, 8 ≈ 37 — scales with depth via Dmg
+        float venom = Mathf.Min(5f, 0.625f * n);                    // capped at the promised 5/sec with a full 8-strong rank
+        var v = new ArrowVolley();
+        Game.I.AddChild(v);
+        v.Init(aim, 6f + 0.25f * n, dps, venom);                    // a bigger rank paints a bigger circle
+        Game.I.NetMgr?.BroadcastVolley(aim, 6f + 0.25f * n, dps, venom);
+        foreach (var a in _squad) { a.Loose(); Game.I.NetMgr?.BroadcastArcherPose(a.NetId, 0); }   // every archer releases on the same frame
+        _creature?.SetSwing(0f);
+    }
+
+    private const float VolleyDraw = 0.85f;   // seconds the rank spends visibly aiming before it looses
+    private float _volleyWind = 0f;
+
+    // ---- archer bow rig + quips ----
+    private Node3D _bow; private float _aim = 0f, _aimT = 0f;
+    private Label3D _quip; private float _quipT = 0f;
+    private static readonly string[] Quips = {
+        "loose!", "i hope this hits", "my arms are killing me",
+        "mind the trees this time", "aim UP, gerald", "i'm gonna be so sore",
+        "left a bit... no, my left", "that's the last of my good arrows",
+        "don't watch, it's embarrassing", "i counted three of them?",
+        "this is why i drew the short straw", "nocked! ...i think",
+    };
+    public void AimSky(bool on) { _aimT = on ? 1f : 0f; }
+    public void Loose()
+    {
+        _aimT = 0f;
+        _creature?.Strike();
+        if (_bow != null && GodotObject.IsInstanceValid(_bow))
+        {
+            var tw = _bow.CreateTween();   // snap the limbs forward on release
+            tw.TweenProperty(_bow, "scale", new Vector3(1f, 0.82f, 1f), 0.06f);
+            tw.TweenProperty(_bow, "scale", Vector3.One, 0.22f).SetTrans(Tween.TransitionType.Elastic);
+        }
+        Game.I?.SpawnPollen(GlobalPosition + Vector3.Up * Radius * 2.2f, 0.8f, new Color(0.72f, 0.58f, 1f), 6, 6f, net: false);
+        Game.I?.Sfx?.EnemyShoot(GlobalPosition);
+    }
+    public void Quip()
+    {
+        if (GD.Randf() > 0.55f) return;   // not every archer pipes up — a chorus of them would be noise
+        _quip ??= MakeQuipLabel();
+        if (_quip == null) return;
+        _quip.Text = Quips[GD.RandRange(0, Quips.Length - 1)];
+        _quip.Visible = true;
+        _quipT = 2.2f;
+    }
+    private Label3D MakeQuipLabel()
+    {
+        var l = new Label3D {
+            FontSize = 34, OutlineSize = 10, PixelSize = 0.0055f,
+            Billboard = BaseMaterial3D.BillboardModeEnum.Enabled, NoDepthTest = true,
+            Modulate = new Color(0.93f, 0.88f, 1f), OutlineModulate = new Color(0.04f, 0.02f, 0.07f, 0.95f),
+            Position = new Vector3(0, Radius * 3.1f, 0), Visible = false,
+        };
+        AddChild(l);
+        return l;
+    }
+    // build the bow once, parented to the creature so it rides the archer's facing
+    private void BuildBow()
+    {
+        _bow = new Node3D { Position = new Vector3(Radius * 0.52f, Radius * 1.15f, Radius * 0.35f) };
+        _creature.AddChild(_bow);
+        var wood = Game.Toon(new Color(0.26f, 0.17f, 0.09f), 0.8f, 0.3f, 0.03f);
+        var stringMat = Game.ToonEmissive(new Color(0.80f, 0.70f, 1f), 1.5f, 0f);
+        float lr = Radius * 0.78f;
+        // two swept limbs + a taut string: reads as a bow in silhouette without a real curve mesh
+        for (int s = -1; s <= 1; s += 2)
+        {
+            var limb = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.07f, lr, 0.07f) }, MaterialOverride = wood };
+            limb.Position = new Vector3(0, s * lr * 0.45f, 0);
+            limb.RotationDegrees = new Vector3(0, 0, s * 16f);
+            _bow.AddChild(limb);
+        }
+        var str = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.02f, lr * 1.75f, 0.02f) }, MaterialOverride = stringMat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+        str.Position = new Vector3(0, 0, -0.13f);
+        _bow.AddChild(str);
+        var shaft = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.045f, 0.045f, lr * 1.25f) }, MaterialOverride = Game.ToonEmissive(new Color(0.66f, 0.5f, 1f), 2.2f, 0f), CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
+        shaft.Position = new Vector3(0, 0, 0.18f);
+        _bow.AddChild(shaft);
+    }
+    // hold the bow low at rest, swing it up to a high loft while drawing — the sky-aim IS the telegraph
+    private void UpdateBowPose(float dt)
+    {
+        if (_quipT > 0f) { _quipT -= dt; if (_quipT <= 0f && _quip != null) _quip.Visible = false; }
+        if (_bow == null || !GodotObject.IsInstanceValid(_bow)) return;
+        _aim = Mathf.MoveToward(_aim, _aimT, dt * 3.4f);
+        _bow.RotationDegrees = new Vector3(Mathf.Lerp(6f, -62f, _aim), 0f, Mathf.Lerp(-8f, 4f, _aim));   // muzzle-down → lofted at the sky
+        _bow.Position = new Vector3(Radius * 0.52f, Radius * (1.15f + 0.32f * _aim), Radius * (0.35f + 0.12f * _aim));
+    }
+
+    // ===== PHALANX: the ward-bearer's AI =====
+    private void MovePhalanx(Player p, float dt, float spdMul)
+    {
+        PruneSquad();
+        Vector3 to = _tgt - GlobalPosition; to.Y = 0f;
+        float d = to.Length();
+        Vector3 dir = d > 0.01f ? to / d : Vector3.Forward;
+
+        if (WardUp)
+        {
+            // GUARDED: an advancing siege line. It closes to volley range and then holds, keeping its archers in
+            // range of you without ever letting them get flanked. Standing still is fatal — the volley is coming.
+            float hold = 24f;
+            Vector3 want = Vector3.Zero;
+            if (d > hold + 3f) want = dir;
+            else if (d < hold - 8f) want = -dir;   // you rushed the line: it backs off so the archers keep their spacing
+            if (want.LengthSquared() > 0.001f && spdMul > 0f)
+                GlobalPosition = ClampArena(GlobalPosition + AvoidBlockers(want) * Speed * spdMul * dt);
+            FaceTarget(dt);
+            if (_volleyWind > 0f)   // the rank is drawing — hold, then loose
+            {
+                _volleyWind -= dt;
+                if (_volleyWind <= 0f) FireVolley();
+                return;
+            }
+            _volleyT -= dt;
+            if (_volleyT <= 0f && _squad.Count > 0 && d < 60f)
+            {
+                _volleyT = VolleyEvery * Pace;
+                BeginVolley();
+            }
+            return;
+        }
+        // BROKEN: the guard is gone and so is the patience — it barrels in, shield first, to knock you flat.
+        if (_chargeLunge > 0f)
+        {
+            _chargeLunge -= dt;
+            GlobalPosition = ClampArena(GlobalPosition + _slamDir * (Speed * 4.2f) * dt);
+            if (d < Radius + 2.2f) { ShieldSlam(); _chargeLunge = 0f; _slamCd = 4.5f; }
+            else if (_chargeLunge <= 0f) _slamCd = 3.2f;
+            return;
+        }
+        if (_chargeWind > 0f)
+        {
+            _chargeWind -= dt;
+            _creature?.SetSwing(Mathf.Clamp(1f - _chargeWind / 0.7f, 0f, 1f));
+            FaceTarget(dt);
+            if (_chargeWind <= 0f) { _creature?.SetSwing(0f); _slamDir = dir; _chargeLunge = 0.85f; Game.I?.Sfx?.EnemyGrowl(GlobalPosition); }
+            return;
+        }
+        _slamCd -= dt;
+        if (_slamCd <= 0f && d < 26f && d > 3.5f) { _chargeWind = 0.7f; return; }
+        MoveMelee(p, dt, spdMul);   // otherwise it just closes like any other heavy
+    }
+
+    private const float VolleyEvery = 7f;
+    private float _slamCd = 2f, _chargeWind = 0f, _chargeLunge = 0f;
+    private Vector3 _slamDir = Vector3.Forward;
+
+    private void ShieldSlam()
+    {
+        _creature?.Strike();
+        Game.I?.Sfx?.Impact(DamageType.Physical);
+        Game.I?.NetMgr?.HurtStunPlayersIn(GlobalPosition, Radius + 5f, Dmg, 1.3f);
+        var pl = Game.I?.Player;
+        if (pl != null && pl.GlobalPosition.DistanceTo(GlobalPosition) < Radius + 6f) pl.Knockback(GlobalPosition, 16f);
+        Game.I?.NetMgr?.StormForce(GlobalPosition, Radius + 6f, 3, 16f);   // shove allies too (no damage — HurtStun already paid it)
+    }
+
+    private void FaceTarget(float dt)
+    {
+        if (_creature == null) return;
+        Vector3 to = _tgt - GlobalPosition; to.Y = 0f;
+        if (to.LengthSquared() < 0.01f) return;
+        float yaw = Mathf.Atan2(to.X, to.Z);
+        _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, yaw, dt * 6f), 0);
+    }
+
+    // ===== PHALANX: the archers' AI =====
+    private bool _fleeing = false;
+    private void MoveArcher(Player p, float dt, float spdMul)
+    {
+        if (WardGuarded)
+        {
+            // IN RANKS: hold a slot inside the dome, on the far side of the bearer from you, so the only way through
+            // to them is through the ward. They never attack on their own — the bearer calls the volley.
+            var L = _leader;
+            int idx = Mathf.Max(0, L._squad.IndexOf(this));
+            Vector3 back = L.GlobalPosition - _tgt; back.Y = 0f;
+            back = back.LengthSquared() > 0.01f ? back.Normalized() : Vector3.Back;
+            float ang = (idx - (L._squad.Count - 1) * 0.5f) * 0.55f;   // fanned out in a shallow rank behind the bearer
+            Vector3 slot = L.GlobalPosition + back.Rotated(Vector3.Up, ang) * (L.WardRadius * 0.62f);
+            Vector3 to = slot - GlobalPosition; to.Y = 0f;
+            if (to.Length() > 1.2f && spdMul > 0f)
+                GlobalPosition = ClampArena(GlobalPosition + to.Normalized() * Speed * spdMul * dt);
+            FaceTarget(dt);
+            return;
+        }
+        // BROKEN: defenceless. It looks for another bearer to enlist under; failing that it cowers behind whatever
+        // body it can find — the loot goblin's cover logic, but the cover is other enemies.
+        _joinScanT -= dt;
+        if (_joinScanT <= 0f)
+        {
+            _joinScanT = 0.7f;
+            var host = FindRecruitingBearer();
+            if (host != null)
+            {
+                _fleeTarget = host.GlobalPosition; _hasFlee = true;
+                if (GlobalPosition.DistanceTo(host.GlobalPosition) < host.WardRadius * 0.9f && host.EnlistArcher(this)) { _fleeing = false; return; }
+            }
+            else { _fleeTarget = PickCoverBehindEnemies(_tgt, GlobalPosition); _hasFlee = true; }
+        }
+        if (_hasFlee && spdMul > 0f)
+        {
+            Vector3 to = _fleeTarget - GlobalPosition; to.Y = 0f;
+            Vector3 away = GlobalPosition - _tgt; away.Y = 0f;
+            Vector3 want = to.Length() > 1.5f ? to.Normalized() : (away.LengthSquared() > 0.01f ? away.Normalized() : Vector3.Forward);
+            if (away.Length() < 14f && away.LengthSquared() > 0.01f) want = (want + away.Normalized() * 0.8f).Normalized();   // you're close → always retreat too
+            GlobalPosition = ClampArena(GlobalPosition + AvoidBlockers(want) * Speed * spdMul * dt);
+        }
+    }
+
+    // the nearest bearer whose ward still stands and whose rank isn't full
+    private Enemy FindRecruitingBearer()
+    {
+        Enemy best = null; float bd = 220f * 220f;
+        var list = Game.I.Enemies;
+        for (int i = 0; i < list.Count; i++)
+        {
+            var e = list[i];
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || !e.IsPhalanx || e.Remote) continue;
+            if (!e.WardUp || e._squad.Count >= MaxArchers) continue;
+            float d = GlobalPosition.DistanceSquaredTo(e.GlobalPosition);
+            if (d < bd) { bd = d; best = e; }
+        }
+        return best;
+    }
+
+    // a spot on the far side of another (living, non-archer) enemy from the player — a meat shield, not a tree
+    private Vector3 PickCoverBehindEnemies(Vector3 player, Vector3 self)
+    {
+        Vector3 best = self + (self - player).Normalized() * 16f; best.Y = 0f;
+        float bestScore = -1e9f;
+        var list = Game.I.Enemies;
+        for (int i = 0; i < list.Count; i++)
+        {
+            var e = list[i];
+            if (e == null || e == this || e.Dead || !GodotObject.IsInstanceValid(e) || e.IsArcher) continue;
+            Vector3 bp = new Vector3(e.GlobalPosition.X, 0f, e.GlobalPosition.Z);
+            float dPlayer = new Vector2(bp.X - player.X, bp.Z - player.Z).Length();
+            float dSelf = new Vector2(bp.X - self.X, bp.Z - self.Z).Length();
+            if (dPlayer < 5f || dSelf > 70f) continue;
+            float score = -dSelf * 0.5f - Mathf.Abs(dPlayer - 15f) + e.Radius * 2.5f;   // prefer close, mid-range, BIG bodies
+            if (score > bestScore)
+            {
+                bestScore = score;
+                Vector3 away = bp - player; away.Y = 0f;
+                if (away.LengthSquared() < 0.01f) away = Vector3.Forward;
+                best = bp + away.Normalized() * (e.Radius + 1.8f); best.Y = 0f;
+            }
+        }
+        return best;
     }
 
     // Hurricane fling — launch this enemy with a 3D velocity. Heavier (bigger) enemies are scaled down so
     // they're harder to pick up; bosses can't be flung (they just shrug + get a small nudge). The throw is
     // host-authoritative; the airborne arc reaches clients through the (now Y-bearing) enemy snapshot, and
     // fall damage is applied on landing in EndThrow, scaling with impact speed (i.e. fall height/force). (NEW)
-    public void Fling(Vector3 velocity)
+    // (NEW) foes a fling can't meaningfully launch — bosses (no-op) and heavy bodies that barely leave the ground. Callers
+    // that want a guaranteed reaction (e.g. Arcane Eruption) knock these back horizontally instead.
+    public bool Flingable => _behav != EBehav.Boss && Radius < 1.9f;
+    public void Fling(Vector3 velocity, float fallMul = 1f)
     {
         if (Remote || Dead) return;
+        if (IsArcher && WardGuarded) return;   // (NEW) warded archers are immune to being flung too — the ward keeps the formation intact until you break it
         if (IsTaker && _grabPeer != 0) ReleaseGrab();   // (NEW) a flung Taker drops whoever it's carrying
         if (_behav == EBehav.Boss) { Knockback(GlobalPosition - velocity, 1.5f); return; }
+        _climbing = false;   // (NEW) flung off whatever it was scaling
+        _fallDmgMul = fallMul;   // (NEW) Updraft Tempest amplifies the landing damage
         float mass = 0.85f + Radius * 0.4f;   // weight: heavies launch lower than light foes, but everyone gets real air now (was 0.6 + Radius, which barely budged big enemies) (NEW)
         _throwVel = velocity / mass;
         _knock = Vector3.Zero;             // a throw overrides any pending horizontal knockback
@@ -219,7 +789,8 @@ public partial class Enemy : Node3D
     {
         _thrown = false; _throwVel = Vector3.Zero; _thrownT = 0f;
         if (impactSpeed > ThrowHurtSpeed && !Dead)
-            Hurt((impactSpeed - ThrowHurtSpeed) * ThrowDmgPer, DamageType.Wind, false);   // harder/higher landing = more damage
+            Hurt((impactSpeed - ThrowHurtSpeed) * ThrowDmgPer * _fallDmgMul, DamageType.Wind, false);   // harder/higher landing = more damage (× Tempest)
+        _fallDmgMul = 1f;   // consumed — reset for the next throw
         // real landings crash them onto the ground and leave them scrambling back up — a punish window. Trivial
         // tosses (and bosses/dead) just stand straight back up. (NEW)
         float gud = 0f;
@@ -273,12 +844,15 @@ public partial class Enemy : Node3D
         }
     }
     // bleed DoT; rot=true spreads to nearby enemies when this one dies
-    public void Bleed(float dps, float dur, bool rot = false, int owner = 0)
+    private bool _bleedPersist = false;   // (BLOOD ROT mod) the DoT never times out — bleeds until the foe dies
+    public void Bleed(float dps, float dur, bool rot = false, int owner = 0, float burstMul = 1f, bool persist = false)
     {
-        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 0, dps, dur, rot ? 1f : 0f); return; }
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 0, dps, dur, (rot ? 1f : 0f) + (persist ? 2f : 0f)); return; }   // pack persist into the flag slot for MP
         _bleedDps = Mathf.Max(_bleedDps, dps);
         _bleedT = Mathf.Max(_bleedT, dur);
+        _bleedBurstMul = Mathf.Max(_bleedBurstMul, burstMul);   // (OVERHAUL) Rupture: keep the strongest burst multiplier
         if (rot) _bleedRot = true;
+        if (persist) _bleedPersist = true;
         _bleedOwner = owner != 0 ? owner : (Game.I != null ? Game.I.LocalPeer : 1);   // (NEW) caster peer
     }
     public float SlowMul = 0.45f;
@@ -293,6 +867,7 @@ public partial class Enemy : Node3D
     public int CurseGroup = 0;                       // (NEW) tether group id (0 = ungrouped)
     private bool _remoteCursed = false;              // (NEW) client-proxy cursed mirror
     public bool Cursed => Remote ? _remoteCursed : CurseT > 0f;
+    public bool Burning => !Remote && _burnT > 0f;   // (NEW) Ember Cinder Skin reads this to heal her near burning foes
     private DamageType _curseBonusType = DamageType.Curse;
     private int _curseBonusType2 = -1;   // (NEW) optional 2nd bonus type from the Cursebrand legendary (-1 = none)
     private float _curseBonusMul = 1.35f, _curseShareFrac = 0.35f;
@@ -302,34 +877,54 @@ public partial class Enemy : Node3D
     // burst is what froze the game in MP. These caps bound the work per frame (self-reset via the process-frame counter).
     private static ulong _shareFrame; private static int _shareBudget; private static bool _shareWarned;
     private static ulong _cascFrame; private static int _cascBudget; private static bool _cascWarned;
-    public float FreezeThreshold => Mathf.Clamp(1f + MaxHp / 120f, 1f, 240f) * 1.25f * _freezeThreshMul;   // +25% stacks to freeze (across the board); Brittle (best-of) still lowers it
+    public float FreezeThreshold => (IsBoss
+        ? Mathf.Clamp(1f + MaxHp / 300f, 1f, 18f)     // (NEW) bosses/minibosses: gentler HP→stacks so a tanky target freezes in a few seconds, not ~8
+        : Mathf.Clamp(1f + MaxHp / 120f, 1f, 240f)) * _freezeThreshMul;   // (BUFF) dropped the flat ×1.25 tax → every freeze builds ~20% faster; Brittle (best-of) still lowers it
     private float _freezeExpT = 0f;                  // stacks all expire together 2s after the last one
     private bool _radiatesCold = false;              // (NEW) only beam/shatter freezes radiate Deep Winter; ambient-frozen foes don't (no chain)
     private float _freezeThreshMul = 1f, _freezeDurBonus = 0f;   // (NEW) best-of frost profile accumulated from contributing witches
     private float _deepWinterT = 0f;                 // (NEW) Deep Winter spread throttle
     private float _frozenBlue = 0f, _frozenBlueMax = 0f, _frozenBlueDmg = 0f;   // temp blue bar while frozen
+    private float _frozenDur = 1f;              // (NEW) the freeze's full duration, so the ice block can melt (shrink+fade) across its life
     private MeshInstance3D _iceBlock;
     private float _remoteBlueFrac = 1f;
     public float FrozenBlueFrac => Remote ? _remoteBlueFrac : (_frozenBlueMax > 0f ? Mathf.Clamp(_frozenBlue / _frozenBlueMax, 0f, 1f) : 0f);
     public bool Frozen => FrozenT > 0f;
     private void EnsureIceBlock(bool show)
     {
-        if (show && _iceBlock == null)
+        if (show)
         {
-            _iceBlock = new MeshInstance3D { Mesh = new BoxMesh { Size = Vector3.One * Radius * 2.6f } };
-            var m = Game.ToonEmissive(new Color(0.6f, 0.85f, 1f), 1.4f, 0f);
-            m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; m.AlbedoColor = new Color(0.7f, 0.9f, 1f, 0.4f); m.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
-            _iceBlock.MaterialOverride = m;
-            AddChild(_iceBlock);
+            if (_iceBlock == null)
+            {
+                _iceBlock = new MeshInstance3D { Mesh = new BoxMesh { Size = Vector3.One * Radius * 2.6f } };
+                var m = Game.ToonEmissive(new Color(0.6f, 0.85f, 1f), 1.4f, 0f);
+                m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; m.AlbedoColor = new Color(0.7f, 0.9f, 1f, 0.42f); m.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+                _iceBlock.MaterialOverride = m;
+                AddChild(_iceBlock);
+            }
+            else   // reuse a block from a previous freeze: restore it to full size + opacity (it may have been shrunk mid-melt)
+            {
+                _iceBlock.Scale = Vector3.One;
+                if (_iceBlock.MaterialOverride is BaseMaterial3D im) { var ac = im.AlbedoColor; ac.A = 0.42f; im.AlbedoColor = ac; }
+            }
+            _iceBlock.Visible = true;
         }
-        if (_iceBlock != null) _iceBlock.Visible = show;
+        else if (_iceBlock != null) { _iceBlock.QueueFree(); _iceBlock = null; }   // (FIX) actually remove it — a hidden-but-kept block was the stale-ice bug
     }
     public float MarkAmp = 1f;
     public int MarkJumps = 0;
+    private float _markDoom = 0f;   // (OVERHAUL) Hex Mark Doombrand: on-death curse detonation
+    // ---- Arcane witch: Arcane Mark — a PERSISTENT paint (max 4 tracked on the caster, FIFO, cleared on death/eviction) that
+    // her charged chain-lightning bounces through. No timer here; the caster's Player owns the mark set & calls SetArcaneMark. ----
+    private bool _arcaneMarked = false;              // host truth
+    private bool _markShow = false;                  // client-proxy mirror
+    public bool ArcaneMarked => Remote ? _markShow : _arcaneMarked;   // HUD pip + client-caster chain targeting
+    public void SetArcaneMark(bool on) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 8, on ? 1f : 0f, 0f, 0f); return; } _arcaneMarked = on; }
 
     private string _type = "shade";
     private EBehav _behav = EBehav.Melee;
     private float _touchCd = 0f;
+    private float Pace => Game.I?.AtkPace ?? 1f;   // (NEW) global attack-cadence multiplier (slower early, ramps up with tier)
     private float _atkCd = 0f;        // melee: cooldown before the next swing can begin
     private float _atkWind = 0f;      // melee: remaining wind-up before the strike connects
     private bool _swinging = false;   // melee: mid wind-up (holds position, telegraphs)
@@ -344,6 +939,7 @@ public partial class Enemy : Node3D
     private static ulong _lastZombieMs = 0;                    // (NEW) global swarmer-groan throttle
     private bool _hadLos = false;                              // (NEW) swarmer: had line-of-sight last frame (excited/scream on gain)
     private bool _alerted = false;                             // (NEW) swarmer: awake + hunting (vs idle until it sees/hears you)
+    private bool _losCache = false; private float _losCacheT = 0f;   // (PERF) cached line-of-sight to the target — SightBlocked is expensive in the maze; recompute ~5Hz staggered, not every frame
     private float _faceYaw = 0f;                               // (NEW) swarmer idle facing (randomized in Configure)
     private float _heard = 0f;                                 // (NEW) accumulated nearby noise (decays); drives look/investigate/aggro
     private Vector3 _soundPos;                                 // (NEW) last heard sound position
@@ -360,7 +956,10 @@ public partial class Enemy : Node3D
     private Vector3 _wanderDir;
     private float _wanderT = 0f;
     public bool IsTaker => _type == "taker";
-    public bool IsSpecial => _type == "taker";   // (NEW) special enemies are capped at (players-1) total; add future specials here
+    // (NEW) special enemies: director-spawned, hard-capped, cooldown-gated, and excluded from the normal concurrent-horde
+    // cap so they're always an EVENT rather than part of the stream. The phalanx BEARER is the special; its archers are
+    // ordinary bodies (counting them here would blow the cap instantly).
+    public bool IsSpecial => _type == "taker" || _type == "phalanx";
     public Vector3 GraspPos => GlobalPosition + (_creature != null ? new Vector3(Mathf.Sin(_creature.Rotation.Y), 0, Mathf.Cos(_creature.Rotation.Y)) : Vector3.Forward) * (Radius + 0.5f) + new Vector3(0, 0.4f, 0);
     public bool IsSwarmer => _type == "swarmer";
     public bool Alerted => _alerted;
@@ -375,6 +974,16 @@ public partial class Enemy : Node3D
         var d = from - GlobalPosition; d.Y = 0f;
         if (d.LengthSquared() > 0.01f) _faceYaw = Mathf.Atan2(d.X, d.Z);   // snap to face where it came from
     }
+    // ANY damage (beams, ground fields, DoTs — which never call HitFrom) rouses an idle zombie: it investigates
+    // toward the nearest warden (the source), shambling over to find them instead of standing there getting chipped.
+    private void DamageInvestigate()
+    {
+        if (_type != "swarmer" || Remote || _alerted || Game.I == null) return;
+        var wp = Game.I.NearestWardenPos(GlobalPosition);
+        _heard = Mathf.Max(_heard, 8f); _soundPos = wp;
+        var d = wp - GlobalPosition; d.Y = 0f;
+        if (d.LengthSquared() > 0.01f) _faceYaw = Mathf.Atan2(d.X, d.Z);
+    }
     private float _boltSpeed = 16f, _boltDmg = 8f, _boltRadius = 0.5f;
     private float _chargeDur = 0f, _chargeT = 0f;       // sieger telegraph
     private float _healEvery = 1.4f, _healCd = 0f, _healAmt = 6f;
@@ -384,6 +993,7 @@ public partial class Enemy : Node3D
     private float _catchMul = 1f;   // distant enemies speed up to re-engage
     private StandardMaterial3D _mat;
     private float _flash = 0f, _baseEnergy;
+    private Color _lastEmit = Colors.Black; private float _lastEmitEn = -999f; private bool _emitDirty = true;   // (PERF) skip redundant material emission writes
     private float _hitSndT = 0f;   // (NEW) per-enemy throttle for the universal damage-tick sound (keeps DoTs a gentle pulse, not a machine-gun)
     private MeshInstance3D _markRing, _statusRing, _eliteRing;
     private MeshInstance3D _curseRing;              // (NEW) cursed ground ring
@@ -401,8 +1011,8 @@ public partial class Enemy : Node3D
         switch (type)
         {
             case "wisp":   MaxHp = 7 * hs;  Speed = 8.6f; Dmg = 7;  Score = 14; Radius = 0.9f; Col = new Color(0.50f, 0.82f, 1.0f); _behav = EBehav.Melee; break;
-            case "swarmer": MaxHp = 24 * hs; Speed = 6.8f; Dmg = 5f * ds; Score = 10; Radius = 0.95f; Col = new Color(0.42f, 0.5f, 0.32f); _behav = EBehav.Melee; _faceYaw = GD.Randf() * Mathf.Tau; break;   // maze zombie: fast, low dmg, slows on hit, swarms (NEW)
-            case "taker": MaxHp = 260 * hs; Speed = 2.6f; Dmg = 6f * ds; Score = 90; Radius = 1.9f; Col = new Color(0.30f, 0.34f, 0.26f); _behav = EBehav.Melee; break;   // (NEW) big kidnapper: charges, grabs, carries a player off (MP only)
+            case "swarmer": MaxHp = 24 * hs; Speed = 6.8f; Dmg = 5f; Score = 10; Radius = 0.95f; Col = new Color(0.42f, 0.5f, 0.32f); _behav = EBehav.Melee; _faceYaw = GD.Randf() * Mathf.Tau; break;   // (FIX) was 5*ds → double-scaled by the ds pass at line ~1038; plain base now scales once like every other mob
+            case "taker": MaxHp = 260 * hs; Speed = 2.6f; Dmg = 6f; Score = 90; Radius = 1.9f; Col = new Color(0.30f, 0.34f, 0.26f); _behav = EBehav.Melee; break;   // (FIX) was 6*ds → same double-scale; scales once now
             case "brute":  MaxHp = 60 * hs; Speed = 2.6f; Dmg = 20; Score = 30; Radius = 2.2f; Col = Palette.Blood; _behav = EBehav.Melee; break;
             case "caster": MaxHp = 12 * hs; Speed = 5.0f; Dmg = 0;  Score = 20; Radius = 1.0f; Col = DamageTypes.Col(DamageType.Arcane); _behav = EBehav.Ranged;
                            _range = 26; _preferDist = 16; _fireEvery = 1.8f; _boltSpeed = 17; _boltDmg = 9; _boltRadius = 0.5f; break;
@@ -422,7 +1032,19 @@ public partial class Enemy : Node3D
             case "splitter": MaxHp = 40 * hs;  Speed = 3.4f; Dmg = 16; Score = 28; Radius = 1.6f; Col = new Color(0.5f, 0.85f, 0.4f); _behav = EBehav.Melee; _splitter = true; break;
             case "totem":    MaxHp = 70 * hs;  Speed = 0f;   Dmg = 0;  Score = 55; Radius = 1.4f; Col = new Color(1f, 0.8f, 0.35f); _behav = EBehav.Totem; break;
             case "spawnling":MaxHp = 8 * hs;   Speed = 6.5f; Dmg = 8;  Score = 6;  Radius = 0.7f; Col = new Color(0.5f, 0.85f, 0.4f); _behav = EBehav.Melee; break;
+            // ---- Rainforest jungle enemies (NEW) ----
+            case "jtroll": MaxHp = 90 * hs; Speed = 5.6f; Dmg = 26; Score = 42; Radius = 2.2f; Col = new Color(0.28f, 0.42f, 0.24f); _behav = EBehav.Melee; break;            // rushing bruiser — staggers you on hit
+            case "pigmy":  MaxHp = 12 * hs; Speed = 8.5f; Dmg = 8;  Score = 8;  Radius = 0.8f; Col = new Color(0.75f, 0.6f, 0.35f); _behav = EBehav.Melee; _faceYaw = GD.Randf() * Mathf.Tau; break;  // fast fodder spear
+            case "pigmydart": MaxHp = 11 * hs; Speed = 6.5f; Dmg = 0; Score = 12; Radius = 0.85f; Col = new Color(0.7f, 0.55f, 0.3f); _behav = EBehav.Ranged; _range = 24; _preferDist = 15; _fireEvery = 1.7f; _boltSpeed = 20; _boltDmg = 7; _boltRadius = 0.35f; break;  // fast fodder blowdart
+            case "ptero":  MaxHp = 18 * hs; Speed = 6.0f; Dmg = 0;  Score = 30; Radius = 1.0f; Col = new Color(0.55f, 0.75f, 0.85f); _behav = EBehav.Zapper; _range = 32; _preferDist = 20; _fireEvery = 4.0f + GD.Randf() * 1.0f; _flyY = 6.5f; break;  // flying electric stunner — 4-5s between stun casts (was 3s) so you can't get chain-stunned
+            case "bat":    MaxHp = 12 * hs; Speed = 8.0f; Dmg = 15; Score = 24; Radius = 0.7f; Col = new Color(0.3f, 0.24f, 0.3f); _behav = EBehav.Diver; _range = 22; _preferDist = 11; _flyY = 6.0f; _diveCd = 2.0f; break;  // diver
+            case "croc":   MaxHp = 55 * hs; Speed = 3.0f; Dmg = 12; Score = 44; Radius = 1.6f; Col = new Color(0.4f, 0.55f, 0.3f); _behav = EBehav.Lobber; _range = 30; _preferDist = 20; _fireEvery = 3.4f; _boltDmg = 26; _boltRadius = 4.5f; break;  // lobs timed bombs
+            case "snake":  MaxHp = 1;       Speed = 9.6f; Dmg = 6;  Score = 6;  Radius = 0.7f; Col = new Color(0.5f, 0.8f, 0.35f); _behav = EBehav.Melee; break;             // 1-hit glass cannon — roots you on touch
             case "goblin": MaxHp = 95 * bhs; Speed = 11.5f; Dmg = 0; Score = 0;  Radius = 1.0f; Col = new Color(1f, 0.84f, 0.3f); _behav = EBehav.Goblin; IsGoblin = true; Label = "LOOT GOBLIN"; break;
+            // ---- WARDED PHALANX (a compound miniboss: one ward-bearer + up to 8 archers) ----
+            case "phalanx": MaxHp = 320 * bhs; Speed = 2.4f; Dmg = 30; Score = 180; Radius = 2.8f; Col = new Color(0.55f, 0.42f, 0.95f); _behav = EBehav.Phalanx; Label = "WARD BEARER";
+                           _wardBase = 900f * bhs; break;   // the ward, not the HP, is the real health bar
+            case "archer":  MaxHp = 34 * hs;  Speed = 5.2f; Dmg = 6;  Score = 45; Radius = 1.05f; Col = new Color(0.70f, 0.58f, 1.0f); _behav = EBehav.Archer; Label = "PHALANX ARCHER"; break;
             case "miniboss": MaxHp = 680 * bhs; Speed = 3.0f; Dmg = 28; Score = 220; Radius = 3.0f; Col = new Color(0.62f, 0.30f, 0.85f); _behav = EBehav.Boss; IsBoss = true; Label = "MINI-BOSS";
                            _range = 30; _fireEvery = 2.4f; _boltSpeed = 15; _boltDmg = 16; _boltRadius = 0.7f; break;
             case "boss":   MaxHp = 4200 * bhs; Speed = 2.6f; Dmg = 40; Score = 800; Radius = 4.0f; Col = new Color(0.85f, 0.25f, 0.45f); _behav = EBehav.Boss; IsBoss = true; Label = "THE HOLLOW MOON";
@@ -430,6 +1052,16 @@ public partial class Enemy : Node3D
             default:       MaxHp = 14 * hs; Speed = 4.0f; Dmg = 10; Score = 10; Radius = 1.3f; Col = new Color(0.54f, 0.47f, 0.84f); _behav = EBehav.Melee; break;
         }
         Dmg *= ds; _boltDmg *= ds;   // contact + projectile damage scale with depth (host-authoritative, so MP-consistent)
+        // (NEW) POST-WAVE-10 HARD RAMP — from wave 11 on, difficulty climbs STEEPLY: HP, damage, and move speed all compound.
+        // Applies to ALL foes AND bosses/minibosses. This is what gives levels 2+ their teeth, and it carries across levels
+        // because Wave keeps climbing through portals (the previous level's ending difficulty = the new level's start).
+        if (wave > 10)
+        {
+            float hardHp = Mathf.Pow(1.062f, wave - 10);   // ~1.8× @ w20, 3.3× @ w30, 6× @ w40 (on top of the base depth scale)
+            float hardDmg = Mathf.Pow(1.05f, wave - 10);   // damage ramps a touch gentler so it stays survivable
+            MaxHp *= hardHp; Dmg *= hardDmg; _boltDmg *= hardDmg;
+            Speed *= 1f + Mathf.Min(0.5f, (wave - 10) * 0.02f);   // up to +50% move speed
+        }
         // (NEW) named wave mutators: Blood Moon / Surge foes move faster (bosses excepted, they have their own pacing)
         if (!IsBoss && Game.I != null)
         {
@@ -445,6 +1077,12 @@ public partial class Enemy : Node3D
             float hpScale = (IsBoss || IsGoblin) ? (1f + 0.70f * (players - 1)) : (1f + 0.30f * (players - 1));
             MaxHp *= hpScale;
         }
+        if (_type == "snake") MaxHp = 1f;   // (NEW) the snake ALWAYS dies in one hit, at any depth
+        // (NEW) model + HITBOX size scale gently with power for visual variety — tougher (deeper-wave) trash looks bigger, plus a
+        // small per-enemy jitter so a pack isn't uniform. Capped. Bosses/goblins keep their set size. Stored as SizeMul and APPLIED
+        // to Radius in _Ready (before the mesh builds) — and SYNCED to clients so co-op renders identical sizes + hitboxes.
+        if (!IsBoss && !IsGoblin)
+            SizeMul = Mathf.Clamp(1f + (hs - 1f) * 0.16f, 1f, 1.28f) * (0.9f + GD.Randf() * 0.2f);
         Hp = MaxHp;
         _spin = (float)GD.RandRange(-2.0, 2.0);
         _strafe = GD.Randf() < 0.5f ? -1f : 1f;
@@ -461,6 +1099,13 @@ public partial class Enemy : Node3D
         Col = Col.Lerp(new Color(1f, 0.86f, 0.25f), 0.5f);
         if (Label != "" && !IsGoblin) Label = "ELITE " + Label;
         if (IsGoblin) Label = "ELITE GOBLIN";
+    }
+
+    // (BOSS-LAIR) weaken a summoned world boss — used by the future 3 hidden "nerfer" pickups. Scales HP + damage.
+    public void ScaleBossPower(float mul)
+    {
+        if (mul >= 0.999f) return;
+        MaxHp *= mul; Hp = MaxHp; Dmg *= mul; _boltDmg *= mul;
     }
 
     // aggro spreads through the horde: an idle zombie that sees an already-woken zombie wakes too (throttled)
@@ -670,21 +1315,31 @@ public partial class Enemy : Node3D
 
     public override void _Ready()
     {
+        if (!IsBoss && !IsGoblin && SizeMul != 1f) Radius *= SizeMul;   // (NEW) apply the (synced) power/variety size BEFORE the mesh + hitbox are built off Radius
         CreatureKind kind;
         if (_type == "boss") kind = CreatureKind.HollowBoss;   // THE HOLLOW MOON — bespoke half-orc/half-zombie w/ a hollow midsection
         else if (IsBoss || _type == "miniboss" || _type == "brute" || _type == "sieger") kind = CreatureKind.Orc;
-        else if (_type == "sentinel") kind = CreatureKind.Orc;
+        else if (_type == "sentinel" || _type == "phalanx") kind = CreatureKind.Orc;   // (NEW) the ward-bearer is a heavy
+        else if (_type == "archer") kind = CreatureKind.Goblin;                        // (NEW) wiry archers behind the line
         else if (_type == "flyer" || _type == "diver") kind = CreatureKind.Mosquito;
         else if (_type == "zapper") kind = CreatureKind.Zapper;
         else if (_type == "bomber") kind = CreatureKind.Bomber;
         else if (_type == "caster" || _type == "healer" || _type == "hexer" || _type == "totem" || _type == "wardbane") kind = CreatureKind.Spider;
         else if (_type == "swarmer" || _type == "taker") kind = CreatureKind.Zombie;   // (NEW) shambling zombie / big kidnapper
+        else if (_type == "jtroll") kind = CreatureKind.Troll;          // (NEW jungle) hulking troll bruiser
+        else if (_type == "ptero") kind = CreatureKind.Pterodactyl;     // (NEW jungle) flying stunner
+        else if (_type == "bat") kind = CreatureKind.Bat;               // (NEW jungle) diver
+        else if (_type == "croc") kind = CreatureKind.Crocodile;        // (NEW jungle) crocodile-humanoid bomber
+        else if (_type == "snake") kind = CreatureKind.Snake;           // (NEW jungle) slithering serpent
+        else if (_type == "pigmy" || _type == "pigmydart") kind = CreatureKind.Pigmy;   // (NEW jungle) pigmy fodder
         else kind = CreatureKind.Goblin;   // shade / wisp / goblin-loot
 
         // two-tone palettes: orcs green->brown, goblins green->yellow, the rest neon for the synth look
         Color bodyC, limbC, accentC;
         if (IsBoss) { bodyC = Col; limbC = Col.Darkened(0.4f); accentC = Col.Lerp(Colors.White, 0.4f); }
         else if (_type == "swarmer") { bodyC = new Color(0.40f, 0.47f, 0.30f); limbC = new Color(0.26f, 0.30f, 0.20f); accentC = new Color(0.60f, 0.66f, 0.40f); }   // sickly zombie flesh (NEW)
+        else if (_type == "phalanx") { bodyC = new Color(0.32f, 0.25f, 0.52f); limbC = new Color(0.19f, 0.15f, 0.33f); accentC = new Color(0.80f, 0.64f, 1f); }      // (NEW) warded bearer: deep violet plate, glowing sigils
+        else if (_type == "archer") { bodyC = new Color(0.45f, 0.36f, 0.68f); limbC = new Color(0.26f, 0.20f, 0.42f); accentC = new Color(0.88f, 0.75f, 1f); }       // (NEW) its archers, in the bearer's colours
         else switch (kind)
         {
             case CreatureKind.Orc:
@@ -701,6 +1356,18 @@ public partial class Enemy : Node3D
                 bodyC = new Color(1.0f, 0.42f, 0.16f); limbC = new Color(0.48f, 0.16f, 0.07f); accentC = new Color(1.0f, 0.85f, 0.30f); break;   // hot orange
             case CreatureKind.Zapper:
                 bodyC = new Color(0.42f, 0.70f, 1.0f); limbC = new Color(0.16f, 0.28f, 0.60f); accentC = new Color(0.72f, 0.96f, 1.0f); break;   // electric blue
+            case CreatureKind.Crocodile:
+                bodyC = new Color(0.24f, 0.42f, 0.22f); limbC = new Color(0.17f, 0.30f, 0.15f); accentC = new Color(0.90f, 0.92f, 0.72f); break;   // scaly green, cream teeth/belly
+            case CreatureKind.Troll:
+                bodyC = new Color(0.26f, 0.40f, 0.24f); limbC = new Color(0.30f, 0.34f, 0.22f); accentC = new Color(0.88f, 0.86f, 0.62f); break;   // mossy troll, bone tusks
+            case CreatureKind.Pigmy:
+                bodyC = new Color(0.62f, 0.44f, 0.28f); limbC = new Color(0.45f, 0.30f, 0.18f); accentC = new Color(0.95f, 0.5f, 0.3f); break;      // tan skin, warpaint/feather
+            case CreatureKind.Pterodactyl:
+                bodyC = new Color(0.5f, 0.62f, 0.72f); limbC = new Color(0.3f, 0.4f, 0.5f); accentC = new Color(0.95f, 0.75f, 0.35f); break;        // leathery slate, amber crest
+            case CreatureKind.Bat:
+                bodyC = new Color(0.26f, 0.20f, 0.28f); limbC = new Color(0.15f, 0.11f, 0.17f); accentC = new Color(0.95f, 0.32f, 0.35f); break;    // dark, red eyes/fangs
+            case CreatureKind.Snake:
+                bodyC = new Color(0.28f, 0.62f, 0.26f); limbC = new Color(0.18f, 0.42f, 0.18f); accentC = new Color(0.95f, 0.85f, 0.2f); break;     // green scales, yellow eyes/tongue
             default:
                 bodyC = Col; limbC = Col.Darkened(0.45f); accentC = Col.Lerp(Colors.White, 0.35f); break;
         }
@@ -732,6 +1399,7 @@ public partial class Enemy : Node3D
             cpulse.TweenProperty(_sentinelCore, "scale", Vector3.One * 1.18f, 0.55f).SetTrans(Tween.TransitionType.Sine);
             cpulse.TweenProperty(_sentinelCore, "scale", Vector3.One * 0.9f, 0.55f).SetTrans(Tween.TransitionType.Sine);
         }
+        if (_type == "archer" && _creature != null) BuildBow();   // (NEW) every phalanx archer carries a nocked bow
         if (_type == "swarmer" && _creature != null)
         {
             _creature.Rotation = new Vector3(0, _faceYaw, 0);   // (NEW) spread initial facing so a whole batch doesn't spot you at once
@@ -773,13 +1441,35 @@ public partial class Enemy : Node3D
         tw.Chain().TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(ring)) ring.QueueFree(); }));
     }
 
+    // perf: the light budget (Game.CullEnemyLights) keeps only the nearest N enemy lights lit in a big fight —
+    // distant foes still glow from their emissive material, they just stop casting a real-time OmniLight.
+    public void SetLightOn(bool on) { if (_light != null && GodotObject.IsInstanceValid(_light) && _light.Visible != on) _light.Visible = on; }
+
     public override void _Process(double delta)
     {
         if (Dead) return;
         if (Game.I == null || !Game.I.WorldRunning) return;
-        if (Game.I.State != GameState.Playing) return;   // freeze AI/animation/firing/DoTs while a menu or card screen is open (NEW)
+        if (!Game.I.SimActive) return;   // freeze AI/animation/firing/DoTs while a menu or card screen is open (NEW)
         float dt = (float)delta;
         if (_hitSndT > 0f) _hitSndT -= dt;   // (NEW) damage-tick throttle (ticks for remote proxies too — this runs before the Remote return below)
+        if (_creature != null)   // (PERF) distance/visibility-driven LOD + animation cull, computed once per frame
+        {
+            var acam = Game.I.Player?.Cam;
+            if (acam != null)
+            {
+                float camD2 = GlobalPosition.DistanceSquaredTo(acam.GlobalPosition);
+                bool near = camD2 < 30f * 30f;
+                // freeze skeletal animation for foes that are both far AND off-camera — their pose can't be seen
+                _creature.AnimSuspended = !near && !acam.IsPositionInFrustum(GlobalPosition + Vector3.Up * Radius);
+                // (PERF) count-adaptive LOD: the bigger the swarm, the CLOSER we drop detail + shadow-casting. At 180+ enemies a
+                // tight swarm sits mostly within 18m, so a fixed 18m barely helped — pull it to ~8m so almost the whole horde
+                // sheds its trim meshes + shadow-cascade passes (draws were the wall). Small fights keep full detail at 18m.
+                int ec = Game.I.Enemies.Count;
+                float lodD = ec > 120 ? 8f : ec > 60 ? 12f : 18f;
+                _creature.SetLodFar(camD2 > lodD * lodD);
+            }
+            else { _creature.AnimSuspended = false; _creature.SetLodFar(false); }
+        }
         if (!_shimmerDone)   // (NEW) small "arrival" shimmer the first time the local camera catches this foe
         {
             var scam = Game.I.Player?.Cam;
@@ -800,10 +1490,12 @@ public partial class Enemy : Node3D
             }
         }
 
-        // Blood Rot: bubbling crimson aura rises off affected enemies (host drives, client mirrors via status bit)
+        // (CHANGE) bleeding now flicks little crimson SLASH marks (not the old rot bubbles). `_bleedT` is mirrored on clients
+        // via status bit 1, so this reads on every machine. Blood Rot stays distinct via its pulsing crimson body glow (see tint).
         _rotBubT -= dt;
-        bool rotActive = Remote ? _rotShow : (_bleedT > 0f && _bleedRot);
-        if (rotActive && _rotBubT <= 0f) { _rotBubT = 0.26f; SpawnRotBubble(); }
+        if (_bleedT > 0f && _rotBubT <= 0f) { _rotBubT = 0.3f; SpawnBleedSlash(); }
+
+        if (_behav == EBehav.Healer) UpdateHealerTether();   // (NEW) a green beam to whoever it's mending — runs on every machine so you can SEE who to kill first
 
         if (Remote)
         {
@@ -811,7 +1503,11 @@ public partial class Enemy : Node3D
             if (IsBoss) _bossHeat = Mathf.MoveToward(_bossHeat, Mathf.Clamp(0.12f + 0.66f * (1f - Hp / MaxHp), 0f, 1f), dt * 0.5f);   // (NEW) HP-based heat estimate for the HUD
             // client-side ghost: follow the host's reported position; animate from that motion
             var prev = GlobalPosition;
-            GlobalPosition = GlobalPosition.Lerp(_remoteTarget, Mathf.Clamp(dt * 16f, 0f, 1f));
+            // (NEW REFLOW) a big jump is a host-side RELOCATION, not lag — snap and poof instead of sliding the proxy
+            // across half the map at lerp speed (which is what the smoothing would otherwise do).
+            if (GlobalPosition.DistanceSquaredTo(_remoteTarget) > 400f)
+            { GlobalPosition = _remoteTarget; Game.I.SpawnPoof(GlobalPosition); }
+            else GlobalPosition = GlobalPosition.Lerp(_remoteTarget, Mathf.Clamp(dt * 16f, 0f, 1f));
             var mv = GlobalPosition - prev; mv.Y = 0;
             float moved = mv.Length();
             if (moved > 0.001f) Game.I.MaybeWaterTrail(GlobalPosition, GlobalPosition.Y - Radius, dt);   // proxy enemies ripple water on clients too (NEW)
@@ -847,6 +1543,9 @@ public partial class Enemy : Node3D
             }
             if (_flash > 0) _flash -= dt;
             UpdateStatusVisual(dt);   // emission = Col + bleed/slow/root/mark tints & rings from synced status
+            if (_deflectT > 0f) _deflectT -= dt;
+            if (IsPhalanx) UpdateWardVisual(dt);   // (NEW) the ward dome renders on clients too, driven by the synced fraction
+            if (IsArcher) UpdateBowPose(dt);       // (NEW) …and so does the bow (aim/loose come over the wire, below)
             SeparateFromPlayers();    // keep client-side proxies out of this player's camera
             return;
         }
@@ -865,10 +1564,16 @@ public partial class Enemy : Node3D
             _popAccum = 0f; _popAmp = false; _popCrit = false; _popT = 0.28f;
         }
         if (RootT > 0) RootT -= dt;
-        if (FrozenT > 0f)   // (NEW) frozen countdown → shatter on expiry
+        if (FrozenT > 0f)   // (NEW) frozen countdown → the block melts across its life, then a light crack on expiry
         {
             FrozenT -= dt;
-            if (_iceBlock != null) _iceBlock.RotationDegrees = new Vector3(0, _iceBlock.RotationDegrees.Y + dt * 20f, 0);
+            if (_iceBlock != null)
+            {
+                _iceBlock.RotationDegrees = new Vector3(0, _iceBlock.RotationDegrees.Y + dt * 20f, 0);
+                float melt = 1f - Mathf.Clamp(FrozenT / Mathf.Max(0.001f, _frozenDur), 0f, 1f);   // 0 fresh → 1 fully thawed
+                _iceBlock.Scale = Vector3.One * (1f - melt * 0.5f);                                 // shrinks toward half as it thaws
+                if (_iceBlock.MaterialOverride is BaseMaterial3D im) { var ac = im.AlbedoColor; ac.A = 0.42f * (1f - melt * 0.7f); im.AlbedoColor = ac; }   // and fades
+            }
             if (!Remote && _radiatesCold && Game.I.Player != null && Game.I.Player.DeepWinter)   // (NEW legendary) chill neighbours toward freezing — only REAL freezes radiate (no cascade)
             {
                 _deepWinterT -= dt;
@@ -881,7 +1586,7 @@ public partial class Enemy : Node3D
                             o.AddFreeze(o.FreezeThreshold * 0.12f, dw != null ? dw.FreezeThreshMul : 1f, dw != null ? dw.FrostDurBonus : 0f, canRadiate: false);   // ambient chill can't itself spread further
                 }
             }
-            if (FrozenT <= 0f) ShatterFreeze();
+            if (FrozenT <= 0f) MeltFreeze();   // (FIX) timer ran out → thaw the ice with a light crack (no damage). Was ShatterFreeze(), which early-returned because FrozenT was already 0, leaving the ice block stuck on the enemy.
         }
         else if (FreezeStacks > 0f)   // (NEW) stacks all expire together 2s after the last one
         {
@@ -892,20 +1597,21 @@ public partial class Enemy : Node3D
         if (CurseT > 0f) { CurseT -= dt; if (CurseT <= 0f) { CurseGroup = 0; CurseStacks = 0f; } }   // (NEW) curse fades → drop the tether + stacks
         if (_bleedT > 0f)
         {
-            _bleedT -= dt; _bleedTick -= dt;
-            if (_bleedTick <= 0f) { _bleedTick = 0.3f; if (!Dead) { Hurt(_bleedDps * 0.3f, DamageType.Blood, false); Game.I.AwardDotCombo(_bleedOwner); } }   // (NEW) DoT trickles combo to its caster
+            if (!_bleedPersist) _bleedT -= dt;   // (BLOOD ROT mod) persistent rot never runs out — it bleeds until death
+            _bleedTick -= dt;
+            if (_bleedTick <= 0f) { _bleedTick = 0.3f; if (!Dead) { HurtFrom(_bleedOwner, _bleedDps * 0.3f, DamageType.Blood); Game.I.AwardDotCombo(_bleedOwner); } }   // (NEW) DoT trickles combo + soul credit to its caster
         }
         if (_poiT > 0f)
         {
             _poiT -= dt; _poiTick -= dt;
             SlowT = Mathf.Max(SlowT, 0.2f);   // poison ivy slows as long as it's ticking on them
-            if (_poiTick <= 0f) { _poiTick = 0.4f; if (!Dead) { Hurt(_poiDps * 0.4f, DamageType.Nature, false); Game.I.AwardDotCombo(_poiOwner); } }   // (NEW) DoT trickles combo to its caster
+            if (_poiTick <= 0f) { _poiTick = 0.4f; if (!Dead) { HurtFrom(_poiOwner, _poiDps * 0.4f, DamageType.Nature); Game.I.AwardDotCombo(_poiOwner); } }   // (NEW) DoT trickles combo + soul credit to its caster
             if (_poiT <= 0f) _poiDps = 0f;
         }
         if (_burnT > 0f)   // (NEW) Ember burn DoT — ticks stacks × per-stack dps; stacks reset when it burns out
         {
             _burnT -= dt; _burnTick -= dt;
-            if (_burnTick <= 0f) { _burnTick = 0.4f; if (!Dead) { float bd = _burnStacks * _burnPerStack * 0.4f; Hurt(bd, DamageType.Ember, false); Game.I?.AwardBurnLifesteal(_burnOwner, bd); } }   // (NEW) burn ticks lifesteal to the owner (Wildfire Rush)
+            if (_burnTick <= 0f) { _burnTick = 0.4f; if (!Dead) { float bd = _burnStacks * _burnPerStack * 0.4f; HurtFrom(_burnOwner, bd, DamageType.Ember); Game.I?.AwardBurnLifesteal(_burnOwner, bd); } }   // (NEW) burn ticks lifesteal + soul credit to the owner (Wildfire Rush)
             if (_burnT <= 0f) _burnStacks = 0f;
         }
         if (_knock.LengthSquared() > 0.0001f)
@@ -919,7 +1625,11 @@ public partial class Enemy : Node3D
         if (_eliteRing != null) _eliteRing.RotateY(dt * 2f);   // spin flat-in-plane (NEW: was RotateZ → tumbled upright)
 
         UpdateStatusVisual(dt);
+        if (_deflectT > 0f) _deflectT -= dt;
+        if (IsPhalanx || IsArcher) UpdatePhalanxState(dt);   // (NEW) ward dome + the host's 5Hz ward sync
+        if (IsArcher) UpdateBowPose(dt);
 
+        if (PhoenixHeld) { GlobalPosition = PhoenixHoldPos; RootT = Mathf.Max(RootT, 0.2f); return; }   // (PHOENIX) carried by the phoenix dive — locked in place; skips all AI/attack/shoot below so it can't act
         if (_thrown) { UpdateThrown(dt); return; }   // airborne fling owns movement; skip AI + ground-follow (NEW)
         if (_getUpT > 0f) { UpdateGetUp(dt); return; }   // downed → rising; stay staggered + open (NEW)
 
@@ -927,20 +1637,49 @@ public partial class Enemy : Node3D
         if (p == null) return;
         _tgt = Game.I.ResolveEnemyTarget(GlobalPosition, _behav == EBehav.Melee, out _tgtPeer, out _tgtIsMinion);   // melee foes can peel onto ents
         Vector3 realTarget = _tgt;   // (NEW) the actual player/ent, before corridor retargeting (for vision + hunt speed)
-        if (_behav == EBehav.Melee && _type != "taker")   // surround: melee foes aim at a distinct spot around the target (golden-angle) → attack from open sides
+
+        // (#3) self-track the target's velocity so fast foes can LEAD it. Works for any target (player/ally/minion); the
+        // length guard rejects target-switch position jumps so a re-target never reads as one giant velocity spike.
+        if (_tgtVelInit)
         {
+            Vector3 dTgt = realTarget - _lastTgtPos;
+            _tgtVel = (dt > 0.0001f && dTgt.LengthSquared() < 100f) ? _tgtVel.Lerp(dTgt / dt, 0.25f) : Vector3.Zero;
+        }
+        _lastTgtPos = realTarget; _tgtVelInit = true;
+        Vector3 flatToTgt = realTarget - GlobalPosition; flatToTgt.Y = 0f;
+        float distToTgt = flatToTgt.Length();   // GROUND-PLANE distance — a flyer/diver's hover altitude must never inflate the flank/lead math
+
+        if (_behav == EBehav.Melee && _type != "taker")   // (#2) FLANK: each foe owns a persistent side (golden-angle) and approaches from it —
+        {                                                   // wide offset when closing (the horde fans into a NET around you) → tightens to a body-hit when adjacent.
             float ang = NetId * 2.3999632f;
-            _tgt = realTarget + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * (Radius * 2f + 1.6f);
+            float minOff = Radius * 2f + 1.2f;   // big foes (boss/miniboss/power-scaled) have minOff > 7 — Max-then-Min instead of Clamp so min never exceeds max (was a ThrowMinMaxException crash)
+            float off = Mathf.Max(minOff, Mathf.Min(distToTgt * 0.4f, 7f));
+            _tgt = realTarget + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * off;
+        }
+        // (#3) INTERCEPTION: fast CLOSERS (divers, bombers, fleet-footed melee ≥8 spd) path to where you'll BE — cutting you off from the front instead of trailing.
+        // NOT flyers: they're ranged kiters, not closers, and leading their orbit both misfits the intent and (via _tgt.Y) broke their hover.
+        bool leadsTarget = _behav == EBehav.Diver || _behav == EBehav.Bomber || (_behav == EBehav.Melee && _type != "taker" && Speed >= 8f);
+        if (leadsTarget && _tgtVel.LengthSquared() > 1f)
+        {
+            Vector3 hv = _tgtVel; hv.Y = 0f;   // lead on the ground plane ONLY — adding vertical velocity to _tgt is what perturbed flyer/diver hover height
+            float lead = Mathf.Clamp(distToTgt / Mathf.Max(Speed, 4f), 0f, 1.3f);   // ≈ time-to-reach, capped so they don't over-lead a juking target
+            _tgt += hv * lead;
         }
         if (Game.I.InExpedition) _tgt = Game.I.ExpoNavTarget(GlobalPosition, _tgt, ((NetId * 2654435761u) % 1000u) / 1000f);   // route through doorways, fanned across the gap
         if (Game.I.InMaze) _tgt = Game.I.MazeWaypoint(GlobalPosition, _tgt);   // follow corridors instead of b-lining into hedges (NEW)
+        // (REMOVED the keep-STAIRS detour: routing every ground foe to one ramp base was unreliable — half of them milled
+        // around a spot nowhere near the stairs. Foes now scale the wall directly instead, slowly and at their own peril.)
         if (_hasteT > 0f) _hasteT -= dt;
-        float spdMul = ((RootT > 0 || FrozenT > 0f) ? 0f : (SlowT > 0 ? SlowMul : 1f)) * (_hasteT > 0f ? 1.4f : 1f) * (Game.I.InWater(GlobalPosition, GlobalPosition.Y - Radius) ? 0.7f : 1f);   // frozen/rooted → held in place; totem haste; hip-deep water wades them down (NEW)
+        float spdMul = ((RootT > 0 || FrozenT > 0f) ? 0f : (SlowT > 0 ? SlowMul : 1f)) * (_hasteT > 0f ? 1.4f : 1f) * (Game.I.InWater(GlobalPosition, GlobalPosition.Y - Radius) ? 0.7f : 1f) * (_climbing ? 0.5f : 1f);   // frozen/rooted → held in place; totem haste; hip-deep water wades them down; scaling a wall is half speed (NEW)
         if (Affix == 3) { _affixTick -= dt; if (_affixTick <= 0f) { _affixTick = 0.8f; VampHeal(); } }   // vampiric
         float pdist = (_tgt - GlobalPosition).Length();
         // catch-up speed ONLY for enemies that close distance — never boost kiters/fleers (they'd outrun you forever)
-        _catchMul = ((_behav == EBehav.Melee || _behav == EBehav.Bomber || _behav == EBehav.Boss) && pdist > 34f)
-            ? Mathf.Min(4.5f, 1f + (pdist - 34f) * 0.11f) : 1f;
+        _catchMul = ((_behav == EBehav.Melee || _behav == EBehav.Bomber || _behav == EBehav.Boss) && pdist > 40f)
+            ? Mathf.Min(3.0f, 1f + (pdist - 40f) * 0.07f) : 1f;   // (TUNE) gentler + later — was min(4.5, +0.11/u past 34), which read as "ultra fast" when a foe chased a far target in MP
+        // (NEW REFLOW) how long this foe has been stuck trailing the party. Catch-up speed alone can't close the gap on a
+        // witch who keeps running, so once this stews long enough the director picks the foe up and re-inserts it AHEAD of
+        // her instead (see Game.RunReflowDirector). Closing the distance drains it fast so a brief gap never counts.
+        if (pdist > 40f) _chaseFarT += dt; else _chaseFarT = Mathf.Max(0f, _chaseFarT - dt * 2.5f);
 
         // swarmer idle/alert (L4D-style): idle + facing a fixed direction until it SEES (or, Batch 2, HEARS) you
         bool swarmerIdle = false;
@@ -970,10 +1709,16 @@ public partial class Enemy : Node3D
             }
             if (_alerted)   // lost sight for a while → back to idle (phase 1); phase 2 they never let go
             {
-                Vector3 eye2 = GlobalPosition + new Vector3(0, Radius + 0.4f, 0);
-                bool los = !Game.I.SightBlocked(eye2, new Vector3(realTarget.X, 1.2f, realTarget.Z));
+                _losCacheT -= dt;
+                if (_losCacheT <= 0f)   // (PERF) SightBlocked steps the whole Decks list — recompute ~5Hz, staggered across enemies, and reuse between
+                {
+                    _losCacheT = 0.2f + (GetInstanceId() % 7) * 0.02f;
+                    Vector3 eye2 = GlobalPosition + new Vector3(0, Radius + 0.4f, 0);
+                    _losCache = !Game.I.SightBlocked(eye2, new Vector3(realTarget.X, 1.2f, realTarget.Z));
+                }
+                bool los = _losCache;
                 if (los) _losLostT = 0f; else _losLostT += dt;
-                if (!Game.I.MazeAggroPhase && _losLostT > 1.8f) { _alerted = false; _heard = 0f; _losLostT = 0f; }
+                if (Game.I.InExpedition && !Game.I.MazeAggroPhase && _losLostT > 1.8f) { _alerted = false; _heard = 0f; _losLostT = 0f; }   // de-aggro is a maze-only mechanic; in endless waves zombies never go back to idle (esp. important in the jungle where trees keep breaking line-of-sight)
                 else
                 {
                     float td = (realTarget - GlobalPosition).Length();
@@ -992,7 +1737,7 @@ public partial class Enemy : Node3D
 
         if (_creature != null && !takerActive)
         {
-            if (swarmerIdle) { _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, _faceYaw, dt * 2f), 0); _creature.Animate(dt, 0f); }
+            if (swarmerIdle) { _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, _faceYaw, dt * 2f), 0); AnimStep(dt, 0f); }
             else
             {
                 var fd = (_behav == EBehav.Melee && _type != "taker" ? realTarget : _tgt) - GlobalPosition; fd.Y = 0;   // face the PLAYER, not the surround slot (so hits land, not air)
@@ -1001,7 +1746,7 @@ public partial class Enemy : Node3D
                     float yaw = Mathf.Atan2(fd.X, fd.Z);
                     _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, yaw, dt * 8f), 0);
                 }
-                _creature.Animate(dt, spdMul);
+                AnimStep(dt, spdMul);
             }
         }
 
@@ -1017,7 +1762,7 @@ public partial class Enemy : Node3D
             }
         }
 
-        if (!swarmerIdle && !takerActive)
+        if (!swarmerIdle && !takerActive && FrozenT <= 0f)   // (NEW) FROZEN = a total lockout: no moving, firing, casting, diving, or abilities — encased in ice
         switch (_behav)
         {
             case EBehav.Melee: MoveMelee(p, dt, spdMul); break;
@@ -1031,7 +1776,10 @@ public partial class Enemy : Node3D
             case EBehav.Diver: MoveDiver(p, dt, spdMul); break;
             case EBehav.Hexer: MoveHexer(p, dt, spdMul); break;
             case EBehav.Sapper: MoveSapper(p, dt, spdMul); break;
+            case EBehav.Lobber: MoveLobber(p, dt, spdMul); break;   // (NEW) croc: kite to range, lob a timed bomb
             case EBehav.Totem: MoveTotem(p, dt, spdMul); break;
+            case EBehav.Phalanx: MovePhalanx(p, dt, spdMul); break;   // (NEW) warded formation: siege line while warded, charging bruiser once broken
+            case EBehav.Archer: MoveArcher(p, dt, spdMul); break;     // (NEW) volleys from inside the ward; cowers/re-enlists once it breaks
             case EBehav.Boss: if (!_bossCharging) MoveMelee(p, dt, spdMul * Mathf.Lerp(1f, 1.5f, _bossHeat)); BossFire(p, dt); break;   // freeze while telegraphing; hotter → faster (NEW)
         }
 
@@ -1041,15 +1789,26 @@ public partial class Enemy : Node3D
             float feet = GlobalPosition.Y - Radius;
             float support = Game.I.SurfaceHeight(GlobalPosition, feet);
             float targetFeet = support;
+            bool climbing = false;
             if (_tgt.Y > feet + 1.2f)   // player is up high — scale toward them
             {
                 var hdir = _tgt - GlobalPosition; hdir.Y = 0;
                 if (hdir.LengthSquared() > 0.01f) hdir = hdir.Normalized(); else hdir = Vector3.Forward;
                 var ahead = GlobalPosition + hdir * (Radius + 1.6f);
-                float deckAhead = Game.I.SurfaceHeight(ahead, 1e9f);   // tallest surface just ahead (ignores step limit)
-                if (deckAhead > feet + 0.3f) targetFeet = Mathf.Clamp(deckAhead, support, Mathf.Max(support, _tgt.Y));   // ceiling is at least the support height, so min can never exceed max (fixes ThrowMinMaxException on tall decks) (NEW)
+                // (CHANGE) full-height surface query — foes CAN scale a vertical face again (the step-limited version left
+                // them stuck at the wall, and the stairs detour that was meant to fix it clumped them up). Anything beyond
+                // a normal step up counts as a real CLIMB: half the rise rate, half their ground speed (spdMul), and they
+                // hang there exposed — a crit, knockback or fling peels them off for the fall (PeelOffWall).
+                float deckAhead = Game.I.SurfaceHeight(ahead, 1e9f);
+                if (deckAhead > feet + 0.3f)
+                {
+                    targetFeet = Mathf.Clamp(deckAhead, support, Mathf.Max(support, _tgt.Y));   // ceiling is at least the support height, so min can never exceed max (fixes ThrowMinMaxException on tall decks) (NEW)
+                    climbing = !Game.I.InSky && deckAhead > feet + 1.7f;   // sky islands keep the free, full-speed climb
+                    if (climbing) _climbDir = hdir;
+                }
             }
-            float newFeet = Mathf.MoveToward(feet, targetFeet, 9f * dt);
+            _climbing = climbing;
+            float newFeet = Mathf.MoveToward(feet, targetFeet, (climbing ? 4.5f : 9f) * dt);
             GlobalPosition = new Vector3(GlobalPosition.X, newFeet + Radius, GlobalPosition.Z);
             Game.I.MaybeWaterTrail(GlobalPosition, GlobalPosition.Y - Radius, dt);   // enemy ripples while wading (NEW)
         }
@@ -1058,41 +1817,51 @@ public partial class Enemy : Node3D
             SeparateFromPlayers();
             SeparateFromEnemies(dt);   // (NEW) spread the horde so bodies don't stack
         }
-        if (Game.I.InExpedition && !(_type == "taker" && _takerState == 1)) ExpoWallClamp();   // charge handles walls itself (stun)
-    }
-
-    // Expedition-only solid collision: push out of cover pillars (Blockers) and walls (tall Decks),
-    // mirroring the player's clamp so surge bodies route around obstacles instead of ghosting through
-    // them. Low walkable pads (TopY < 1.8) and airborne foes (above a wall's top) are exempt.
-    private void ExpoWallClamp()
-    {
-        var p = GlobalPosition;
-        float m = Radius;
-        foreach (var b in Game.I.Blockers)
+        // hard-collide with trees + structure walls EVERY frame, all modes (was Expedition-only, so foes ghosted
+        // through fort/ruin walls in the world). A charging Taker plows through (its charge resolves walls via stun).
+        if (!(_type == "taker" && _takerState == 1))
         {
-            float ox = p.X - b.Pos.X, oz = p.Z - b.Pos.Z;
-            float dd = Mathf.Sqrt(ox * ox + oz * oz);
-            float rr = b.Radius + m * 0.8f;
-            if (dd < rr) { float k = rr / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + ox * k; p.Z = b.Pos.Z + oz * k; }
-        }
-        foreach (var d in Game.I.Decks)
-        {
-            if (d.TopY < 1.8f) continue;                       // walkable pad, not a wall
-            if (GlobalPosition.Y >= d.TopY - 0.6f) continue;   // on/above the top (e.g. a flyer) — don't body-block
-            float ex = d.Half.X + m, ez = d.Half.Y + m;
-            float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
-            if (Mathf.Abs(dx) < ex && Mathf.Abs(dz) < ez)
+            GlobalPosition = ClampArena(GlobalPosition);
+            _stuckChk += dt;
+            if (_stuckChk > 0.5f)   // wedged against geometry while trying to move → reverse our swerve side to escape
             {
-                if (ex - Mathf.Abs(dx) < ez - Mathf.Abs(dz)) p.X = d.Center.X + Mathf.Sign(dx) * ex;
-                else p.Z = d.Center.Z + Mathf.Sign(dz) * ez;
+                if (_avoidSign != 0f && GlobalPosition.DistanceSquaredTo(_stuckRef) < (Radius * 0.5f) * (Radius * 0.5f)) _avoidSign = -_avoidSign;
+                _stuckRef = GlobalPosition; _stuckChk = 0f;
             }
         }
-        GlobalPosition = new Vector3(p.X, GlobalPosition.Y, p.Z);
+    }
+
+    private float _rushCd = 3f, _rushWind = 0f, _rushLunge = 0f; private Vector3 _rushDir;   // (NEW) jungle-troll charge
+
+    // (NEW) jungle troll: periodic RUSH — rear back (telegraph), then dash forward fast; the rush hit deals bonus damage and
+    // staggers you (jtroll HitTarget applies the stun). Returns true while it's busy so MoveMelee yields.
+    private bool TrollRush(float dt, float reach)
+    {
+        Vector3 tt = _tgt - GlobalPosition; tt.Y = 0; float td = tt.Length();
+        if (_rushLunge > 0f)
+        {
+            _rushLunge -= dt;
+            GlobalPosition += _rushDir * (Speed * 3.8f) * dt;
+            if (td < reach + 0.6f) { _creature?.Strike(); HitTarget(Dmg * 1.4f); _rushLunge = 0f; _rushCd = 4.5f * Pace; }
+            else if (_rushLunge <= 0f) _rushCd = 3.5f * Pace;
+            return true;
+        }
+        if (_rushWind > 0f)
+        {
+            _rushWind -= dt;
+            _creature?.SetSwing(Mathf.Clamp(1f - _rushWind / 0.55f, 0f, 1f));   // rear back
+            if (_rushWind <= 0f) { _creature?.SetSwing(0f); _rushDir = td > 0.1f ? tt.Normalized() : Vector3.Forward; _rushLunge = 0.55f; Game.I.Sfx?.EnemyGrowl(GlobalPosition); }
+            return true;
+        }
+        _rushCd -= dt;
+        if (_rushCd <= 0f && td < 18f && td > 4f) { _rushWind = 0.55f; return true; }
+        return false;
     }
 
     private void MoveMelee(Player p, float dt, float spdMul)
     {
         float reach = Radius + 1.4f;
+        if (_type == "jtroll" && TrollRush(dt, reach)) return;   // (NEW) charging rush
         if (MeleeAttack(dt, reach)) return;   // winding up — hold position so the swing reads as a telegraph
         Vector3 to = _tgt - GlobalPosition; to.Y = 0;
         float dist = to.Length();
@@ -1100,8 +1869,19 @@ public partial class Enemy : Node3D
         {
             float sp = Speed * _catchMul * spdMul;
             if (_type == "swarmer" && Game.I.Player != null) sp *= Game.I.Player.MoveSpeedFactor;   // (NEW) keep pace with a fast player
-            GlobalPosition += to.Normalized() * sp * dt;
+            Vector3 mv = AvoidBlockers(to);   // (NEW) route around trees/pillars instead of jamming into them
+            GlobalPosition = ClampArena(GlobalPosition + mv * sp * dt);
         }
+    }
+
+    // (NEW) vertical reach gate. Reach/touch checks used XZ distance only, so an enemy could hit a player who had
+    // jumped or flown well above (or below) it. The player origin sits at their feet; this enemy's body spans about
+    // [-Radius, +2.4*Radius] around its origin. Require the player to be within that band (plus a little jump/arm slack)
+    // before a swing or touch can land — a normal hop still gets hit, but flying up / standing on a high ledge doesn't.
+    private bool VertReach()
+    {
+        float dy = _tgt.Y - GlobalPosition.Y;
+        return dy <= Radius * 2.4f + 1.5f && dy >= -(Radius + 1.5f);
     }
 
     // Telegraphed melee swing (melee + bosses): once in reach, rear back over a wind-up, then strike.
@@ -1121,12 +1901,12 @@ public partial class Enemy : Node3D
                 _swinging = false;
                 _creature?.SetSwing(0f);
                 _creature?.Strike();
-                if (dist < reach + 0.7f) HitTarget(Dmg);
-                _atkCd = 1.0f;
+                if (dist < reach + 0.7f && VertReach()) HitTarget(Dmg);   // (NEW) whiff if the target jumped/flew out of vertical reach
+                _atkCd = 1.0f * Pace;
             }
             return true;
         }
-        if (dist < reach && _atkCd <= 0f)
+        if (dist < reach && _atkCd <= 0f && VertReach())   // (NEW) don't wind up a swing at a player who's out of vertical reach
         {
             _swinging = true; _atkWind = WindUpDur;
             ulong now = Time.GetTicksMsec();
@@ -1148,23 +1928,47 @@ public partial class Enemy : Node3D
             foreach (var ap in net.AllyPositions()) PushOutOfBody(ap);
     }
 
-    // (NEW) soft mutual repulsion so the horde spreads around the target instead of stacking/clipping into one body
+    // (NEW) soft mutual repulsion so the horde spreads around the target instead of stacking/clipping into one body.
+    // (PERF) the O(n) scan over all enemies is the O(n²) director cost — recompute the push only ~15Hz (staggered so
+    // not every enemy scans the same frame), but APPLY the cached push every frame so movement stays smooth.
+    private float _sepT = 0f; private Vector3 _sepPush = Vector3.Zero;
+    private Vector3 _lastTgtPos = Vector3.Zero, _tgtVel = Vector3.Zero; private bool _tgtVelInit = false;   // (#3) self-tracked target velocity → fast-foe interception
+    // (PERF) procedural animation writes ~15-30 part transforms per enemy per frame (real CPU across the C#→engine boundary).
+    // In a big swarm, throttle it to ~30Hz staggered — imperceptible on a churning horde. Small fights animate at full rate
+    // (best look for a lone foe). Accumulated dt is passed so the walk cycle keeps real-time speed despite skipped frames.
+    private float _animAcc = 0f;
+    private void AnimStep(float dt, float amt)
+    {
+        if (_creature == null) return;
+        _animAcc += dt;
+        float gate = (Game.I != null && Game.I.Enemies.Count > 40) ? 0.03f + (GetInstanceId() % 3) * 0.004f : 0f;
+        if (_animAcc < gate) return;
+        _creature.Animate(_animAcc, amt);
+        _animAcc = 0f;
+    }
+
     private void SeparateFromEnemies(float dt)
     {
         if (_behav == EBehav.Flyer || _behav == EBehav.Diver || Game.I == null) return;
-        float px = 0f, pz = 0f;
-        var list = Game.I.Enemies;
-        for (int i = 0; i < list.Count; i++)
+        _sepT -= dt;
+        if (_sepT <= 0f)
         {
-            var o = list[i];
-            if (o == null || o == this || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
-            float md = (Radius + o.Radius) * 0.9f;   // allow gentle overlap so they can pack in
-            float ox = GlobalPosition.X - o.GlobalPosition.X, oz = GlobalPosition.Z - o.GlobalPosition.Z;
-            float dd = ox * ox + oz * oz;
-            if (dd < md * md && dd > 0.0001f) { float d = Mathf.Sqrt(dd); float f = (md - d) / md; px += ox / d * f; pz += oz / d * f; }
+            _sepT = 0.07f + (GetInstanceId() % 4) * 0.008f;
+            float px = 0f, pz = 0f;
+            var list = Game.I.QueryEnemies(GlobalPosition.X, GlobalPosition.Z, Radius + 4f);   // (PERF) only neighbours in the nearby cells, not the whole horde (was O(N²))
+            for (int i = 0; i < list.Count; i++)
+            {
+                var o = list[i];
+                if (o == null || o == this || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
+                float md = (Radius + o.Radius) * 1.35f + 0.5f;   // (#1) personal space LARGER than the bodies → they push apart before touching, fanning the horde into a wide crescent instead of a stacked blob
+                float ox = GlobalPosition.X - o.GlobalPosition.X, oz = GlobalPosition.Z - o.GlobalPosition.Z;
+                float dd = ox * ox + oz * oz;
+                if (dd < md * md && dd > 0.0001f) { float d = Mathf.Sqrt(dd); float f = (md - d) / md; px += ox / d * f; pz += oz / d * f; }
+            }
+            _sepPush = new Vector3(px, 0f, pz);
         }
-        var push = new Vector3(px, 0f, pz);
-        if (push.LengthSquared() > 0.0001f) GlobalPosition += push.LimitLength(2.5f * dt);   // < seek speed → seek wins, no gridlock
+        // cap the push as a fraction of THIS unit's own speed so seek always wins — a flat cap (was 3.2) exceeded slow heavies' move speed (sentinel 2.0, sieger 2.2, brute 2.6) and froze them in place.
+        if (_sepPush.LengthSquared() > 0.0001f) GlobalPosition += _sepPush.LimitLength(Mathf.Min(3.2f, Speed * 0.55f) * dt);
     }
     private void PushOutOfBody(Vector3 c)
     {
@@ -1189,19 +1993,39 @@ public partial class Enemy : Node3D
         want += new Vector3(-dir.Z, 0, dir.X) * _strafe * 0.6f;   // strafe
         if (want.LengthSquared() > 0.001f && spdMul > 0f)
         {
-            var np = GlobalPosition + want.Normalized() * Speed * _catchMul * spdMul * dt;
-           
+            var np = GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt;   // (NEW) steer around trunks so ranged foes don't wedge on trees
             GlobalPosition = ClampArena(np);
         }
-        if (Dmg > 0 && dist < Radius + 1.4f && _touchCd <= 0f) { HitTarget(Dmg); _touchCd = 0.7f; }
+        if (Dmg > 0 && dist < Radius + 1.4f && _touchCd <= 0f && VertReach()) { HitTarget(Dmg); _touchCd = 0.7f * Pace; }
 
         // fire
         if (charged)
         {
             if (_chargeT > 0f) { _chargeT -= dt; if (_chargeT <= 0f) FireAt(p, _boltSpeed, _boltDmg, _boltRadius); }
-            else if (_fireCd <= 0f && dist < _range) { _chargeT = _chargeDur; _fireCd = _fireEvery; }
+            else if (_fireCd <= 0f && dist < _range) { _chargeT = _chargeDur; _fireCd = _fireEvery * Pace; }
         }
-        else if (_fireCd <= 0f && dist < _range) { FireAt(p, _boltSpeed, _boltDmg, _boltRadius); _fireCd = _fireEvery; }
+        else if (_fireCd <= 0f && dist < _range) { FireAt(p, _boltSpeed, _boltDmg, _boltRadius); _fireCd = _fireEvery * Pace; }
+    }
+
+    // (NEW) croc: kite to range, then LOB a timed bomb that arcs onto the target's feet and blasts ~2s after landing
+    private void MoveLobber(Player p, float dt, float spdMul)
+    {
+        Vector3 to = _tgt - GlobalPosition; to.Y = 0;
+        float dist = to.Length();
+        Vector3 dir = dist > 0.01f ? to.Normalized() : Vector3.Forward;
+        Vector3 want = Vector3.Zero;
+        if (dist > _preferDist + 2f) want += dir;
+        else if (dist < _preferDist - 2f) want -= dir;
+        _strafeT -= dt; if (_strafeT <= 0) { _strafe = -_strafe; _strafeT = (float)GD.RandRange(1.5, 3.0); }
+        want += new Vector3(-dir.Z, 0, dir.X) * _strafe * 0.4f;
+        if (want.LengthSquared() > 0.001f && spdMul > 0f) GlobalPosition = ClampArena(GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt);   // (NEW) steer around trunks
+        if (Dmg > 0 && dist < Radius + 1.4f && _touchCd <= 0f && VertReach()) { HitTarget(Dmg); _touchCd = 0.7f * Pace; }
+        if (_fireCd <= 0f && dist < _range)
+        {
+            _fireCd = _fireEvery * Pace;
+            var at = new Vector3(_tgt.X, Game.I.SurfaceHeight(_tgt, _tgt.Y), _tgt.Z);
+            Game.I.SpawnCrocBomb(GlobalPosition + Vector3.Up * 1.5f, at, _boltDmg, _boltRadius);
+        }
     }
 
     private void MoveFlyer(Player p, float dt, float spdMul)
@@ -1218,7 +2042,42 @@ public partial class Enemy : Node3D
             np.Y = _tgt.Y + 3.6f + Mathf.Sin(Time.GetTicksMsec() * 0.003f) * 0.6f;   // hover above the player (follows you onto platforms)
             GlobalPosition = ClampArena(np);
         }
-        if (_fireCd <= 0f && dist < _range) { FireAt(p, _boltSpeed, _boltDmg, _boltRadius); _fireCd = _fireEvery; }
+        if (_fireCd <= 0f && dist < _range) { FireAt(p, _boltSpeed, _boltDmg, _boltRadius); _fireCd = _fireEvery * Pace; }
+    }
+
+    private MeshInstance3D _healTether;
+    // a glowing green beam from the healer to the ally it's currently mending, so the player can tell WHO to focus.
+    // Purely visual → runs on host + clients (ally is picked locally from synced positions). Freed with the healer.
+    private void UpdateHealerTether()
+    {
+        // match the heal logic: the nearest HURT, non-goblin ally within heal range is who it's actually mending
+        Enemy ally = null; float best = 12f;
+        var list = Game.I.Enemies;
+        for (int i = 0; i < list.Count; i++)
+        {
+            var e = list[i];
+            if (e == this || e == null || e.Dead || !GodotObject.IsInstanceValid(e) || e.IsGoblin) continue;
+            if (e.Hp >= e.MaxHp) continue;   // only foes that actually need topping up
+            float d = GlobalPosition.DistanceTo(e.GlobalPosition);
+            if (d < best) { best = d; ally = e; }
+        }
+        if (ally == null) { if (_healTether != null) _healTether.Visible = false; return; }
+        if (_healTether == null)
+        {
+            var gc = DamageTypes.Col(DamageType.Holy);
+            var m = Game.ToonEmissive(gc, 2.6f, 0f); m.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; m.AlbedoColor = new Color(gc.R, gc.G, gc.B, 0.6f);
+            _healTether = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.07f, BottomRadius = 0.07f, Height = 1f, RadialSegments = 5 }, MaterialOverride = m, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, TopLevel = true };
+            AddChild(_healTether);   // child of the healer → auto-freed on death; TopLevel → world-space, ignores the healer's facing
+        }
+        _healTether.Visible = true;
+        Vector3 a = GlobalPosition + Vector3.Up * (Radius * 0.8f);
+        Vector3 b = ally.GlobalPosition + Vector3.Up * (ally.Radius * 0.8f);
+        Vector3 dir = b - a; float len = dir.Length();
+        if (len < 0.05f) { _healTether.Visible = false; return; }
+        Vector3 yb = dir / len;
+        Vector3 xb = yb.Cross(Vector3.Forward); if (xb.LengthSquared() < 1e-4f) xb = yb.Cross(Vector3.Right); xb = xb.Normalized();
+        Vector3 zb = xb.Cross(yb).Normalized();
+        _healTether.GlobalTransform = new Transform3D(new Basis(xb, yb * len, zb), (a + b) * 0.5f);   // Y-scaled to span a→b
     }
 
     private void MoveHealer(Player p, float dt, float spdMul)
@@ -1232,13 +2091,13 @@ public partial class Enemy : Node3D
             want = toa.Length() > 5f ? toa.Normalized() : -pfrom.Normalized() * 0.5f;   // hover near ally, drift from player
         }
         else want = pfrom.LengthSquared() > 0.01f ? -pfrom.Normalized() : Vector3.Forward;   // flee player if alone
-        if (spdMul > 0f) { var np = GlobalPosition + want.Normalized() * Speed * _catchMul * spdMul * dt; GlobalPosition = ClampArena(np); }
+        if (spdMul > 0f) { var np = GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt; GlobalPosition = ClampArena(np); }   // (NEW) steer around trunks
 
         _healCd -= dt;
         if (_healCd <= 0f && ally != null && ally.GlobalPosition.DistanceTo(GlobalPosition) < 12f)
         {
             ally.Heal(_healAmt);
-            _healCd = _healEvery;
+            _healCd = _healEvery * Pace;
             var v = new Vfx(); Game.I.AddChild(v);
             v.GlobalPosition = ally.GlobalPosition + new Vector3(0, ally.Radius, 0);
             v.Init(new SphereMesh { Radius = ally.Radius * 0.6f, Height = ally.Radius * 1.2f }, DamageTypes.Col(DamageType.Holy), 0.4f, 2f);
@@ -1338,7 +2197,7 @@ public partial class Enemy : Node3D
     // (NEW) hitting high — the head or a shoulder goblin — always crits THE HOLLOW MOON
     public bool IsCritZone(Vector3 hitPos)
     {
-        if (IsBoss && _type == "boss") return (hitPos.Y - GlobalPosition.Y) > Radius * 0.7f;   // THE HOLLOW MOON's head/shoulders
+        if (IsBoss && _type == "boss") return (hitPos.Y - GlobalPosition.Y) > Radius * 1.9f;   // THE HOLLOW MOON's head/shoulders/upper chest (~2R+ above origin) — the waist/pelvis (~0.9R) no longer counts
         if (_type == "sentinel" && _sentinelCore != null && GodotObject.IsInstanceValid(_sentinelCore))
             return hitPos.DistanceTo(_sentinelCore.GlobalPosition) < Radius * 0.9f;   // (NEW) strike the exposed core → auto-crit through the armor
         return false;
@@ -1349,11 +2208,37 @@ public partial class Enemy : Node3D
     // whole body spine (feet → head) so any point on the model registers. Radial girth stays ~Radius (matches the mesh width).
     public bool HitBy(Vector3 point, float pad)
     {
-        Vector3 a = GlobalPosition + Vector3.Down * Radius * 0.7f;   // near the feet
-        Vector3 b = GlobalPosition + Vector3.Up * Radius * 1.9f;     // near the top of the head
+        // The model builds UP from ~the feet: the origin sits ~Radius above the feet and the model's head reaches
+        // ~2.4*Radius above the origin (matching the melee aim band in AimHitOnEnemy). A fixed 1.9R spine left the upper
+        // body/head un-hittable — worst on the boss, whose bespoke model is taller still (head ~2.6R above origin), so
+        // shots only landed below the waist. Scale the spine to the real model, extending it further for the boss.
+        float hi = _type == "boss" ? 3.0f : 2.4f;
+        float lo = _type == "boss" ? 1.0f : 0.7f;
+        Vector3 a = GlobalPosition + Vector3.Down * Radius * lo;   // near the feet
+        Vector3 b = GlobalPosition + Vector3.Up * Radius * hi;     // top of the head
         Vector3 ab = b - a;
         float t = Mathf.Clamp((point - a).Dot(ab) / ab.LengthSquared(), 0f, 1f);
         return point.DistanceTo(a + ab * t) < Radius + pad;
+    }
+
+    // (NEW) ray-vs-body — for BEAMS and travelling projectiles, so the WHOLE model (feet→head) blocks/collides with the ray,
+    // not just a sphere at the low origin (which let shots sail over a tall boss's head). Returns the entry distance `t`.
+    public bool RayHitsBody(Vector3 o, Vector3 dir, float maxLen, float pad, out float t)
+    {
+        t = maxLen;
+        float hi = _type == "boss" ? 3.0f : 2.4f, lo = _type == "boss" ? 1.0f : 0.7f;
+        Vector3 a = GlobalPosition + Vector3.Down * Radius * lo;
+        Vector3 b = GlobalPosition + Vector3.Up * Radius * hi;
+        float r = Radius + pad; bool any = false;
+        const int N = 6;
+        for (int i = 0; i <= N; i++)
+        {
+            Vector3 p = a.Lerp(b, i / (float)N);
+            float proj = (p - o).Dot(dir);
+            if (proj < 0.5f || proj > maxLen) continue;
+            if ((p - o - dir * proj).Length() < r && proj < t) { t = proj; any = true; }
+        }
+        return any;
     }
     public string PingName => !string.IsNullOrEmpty(Label) ? Label : _type switch   // (NEW) nice name for the ping nameplate
     {
@@ -1396,7 +2281,7 @@ public partial class Enemy : Node3D
             else if (_bossPatPending == 5) { _bossStompCd = Mathf.Lerp(10f, 6f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.8f); }   // stomp 10→6s
             else if (_bossPatPending == 6) { _bossRockCd = Mathf.Lerp(12f, 8f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.8f); }    // rock throw 12→8s (orc)
             else if (_bossPatPending == 7) { _bossMineCd = Mathf.Lerp(20f, 12f, _bossHeat); _goblinBufferCd = Mathf.Lerp(15f, 10f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.8f); }   // mines 20→12s (goblin)
-            else _fireCd = _fireEvery * Mathf.Lerp(1f, 0.55f, _bossHeat);
+            else _fireCd = _fireEvery * Mathf.Lerp(1f, 0.55f, _bossHeat) * Pace;
             return;
         }
 
@@ -1682,7 +2567,7 @@ public partial class Enemy : Node3D
         want += new Vector3(-dir.Z, 0, dir.X) * _strafe * 0.6f;
         if (want.LengthSquared() > 0.001f && spdMul > 0f && _zapTele <= 0f)   // freeze while telegraphing
         {
-            var np = GlobalPosition + want.Normalized() * Speed * _catchMul * spdMul * dt;
+            var np = GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt;   // (NEW) steer around trunks
             GlobalPosition = ClampArena(np);
         }
 
@@ -1696,7 +2581,7 @@ public partial class Enemy : Node3D
         else if (_fireCd <= 0f && dist < _range)
         {
             _zapTarget = _tgt; _zapTarget.Y = 0f;
-            _zapTele = 1.05f; _fireCd = _fireEvery;
+            _zapTele = 1.05f; _fireCd = _fireEvery * Pace;
             _zapMark = MakeZapMark(_zapTarget);
             Game.I.NetMgr?.BroadcastZap(_zapTarget, false);   // allies see the telegraph
         }
@@ -1714,8 +2599,8 @@ public partial class Enemy : Node3D
             var np = GlobalPosition + (_tgt - GlobalPosition).Normalized() * Speed * 2.6f * dt;   // fast swoop
             GlobalPosition = ClampArena(np);
             _diveT -= dt;
-            if (dist < Radius + 1.8f && _touchCd <= 0f) { HitTarget(Dmg); _touchCd = 0.7f; }
-            if (_diveT <= 0f || GlobalPosition.Y <= _tgt.Y + 0.7f) { _diving = false; _diveCd = 2.6f; }   // climb back out
+            if (dist < Radius + 1.8f && _touchCd <= 0f && VertReach()) { HitTarget(Dmg); _touchCd = 0.7f * Pace; }
+            if (_diveT <= 0f || GlobalPosition.Y <= _tgt.Y + 0.7f) { _diving = false; _diveCd = 2.6f * Pace; }   // climb back out
         }
         else
         {
@@ -1731,6 +2616,7 @@ public partial class Enemy : Node3D
                 _diving = true; _diveT = 1.5f;
                 var dc = new Color(0.9f, 0.6f, 1f);
                 Game.I.VfxRing(_tgt, dc, 3f, 0.7f);                              // dive marker — glide or dash clear
+                Game.I.Sfx?.Incoming(GlobalPosition);                            // (NEW) audible swoop warning (HUD shows an arrow/bracket too)
                 Game.I.NetMgr?.BroadcastVfx(0, _tgt, Vector3.Up, 3f, 0.7f, dc);
             }
         }
@@ -1748,13 +2634,13 @@ public partial class Enemy : Node3D
         want += new Vector3(-dir.Z, 0, dir.X) * _strafe * 0.6f;
         if (want.LengthSquared() > 0.001f && spdMul > 0f && _hexTele <= 0f)
         {
-            var np = GlobalPosition + want.Normalized() * Speed * _catchMul * spdMul * dt;
+            var np = GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt;   // (NEW) steer around trunks
             GlobalPosition = ClampArena(np);
         }
         if (_hexTele > 0f) { _hexTele -= dt; if (_hexTele <= 0f) HexStrike(); }
         else if (_hexCd <= 0f && dist < _range)
         {
-            _hexTele = 1.0f; _hexCd = _fireEvery;
+            _hexTele = 1.0f; _hexCd = _fireEvery * Pace;
             var cc = DamageTypes.Col(DamageType.Curse);
             Game.I.VfxRing(_tgt, cc, 3.5f, 1.0f);                              // telegraph: ring at the target — dash out before it lands
             Game.I.NetMgr?.BroadcastVfx(0, _tgt, Vector3.Up, 3.5f, 1.0f, cc); // all peers see it
@@ -1780,11 +2666,11 @@ public partial class Enemy : Node3D
         _strafeT -= dt; if (_strafeT <= 0) { _strafe = -_strafe; _strafeT = (float)GD.RandRange(1.2, 2.4); }
         want += new Vector3(-dir.Z, 0, dir.X) * _strafe * 0.6f;
         if (want.LengthSquared() > 0.001f && spdMul > 0f && _hexTele <= 0f)
-            GlobalPosition = ClampArena(GlobalPosition + want.Normalized() * Speed * _catchMul * spdMul * dt);
+            GlobalPosition = ClampArena(GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt);   // (NEW) steer around trunks
         if (_hexTele > 0f) { _hexTele -= dt; if (_hexTele <= 0f) SapStrike(); }
         else if (_hexCd <= 0f && dist < _range)
         {
-            _hexTele = 1.1f; _hexCd = _fireEvery;
+            _hexTele = 1.1f; _hexCd = _fireEvery * Pace;
             var cc = new Color(0.6f, 0.3f, 0.85f);
             Game.I.VfxRing(_tgt, cc, 3.2f, 1.0f);                              // telegraph: dispel ring — break line of sight or eat the strip
             Game.I.NetMgr?.BroadcastVfx(0, _tgt, Vector3.Up, 3.2f, 1.0f, cc); // all peers see it
@@ -1878,10 +2764,10 @@ public partial class Enemy : Node3D
         float dist = to.Length();
         if (dist > 0.01f && spdMul > 0f)
         {
-            var np = GlobalPosition + to.Normalized() * Speed * _catchMul * spdMul * dt;
+            var np = GlobalPosition + AvoidBlockers(to) * Speed * _catchMul * spdMul * dt;   // (NEW) steer around trunks
             GlobalPosition = ClampArena(np);
         }
-        if (dist < Radius + 2.4f) Explode(p);
+        if (dist < Radius + 2.4f && VertReach()) Explode(p);   // (NEW) don't self-detonate on a player who's flown out of reach above
     }
 
     private void Explode(Player p)
@@ -1941,20 +2827,130 @@ public partial class Enemy : Node3D
         return best;
     }
 
+    // (NEW) obstacle-avoidance steering: bend a desired horizontal move direction around nearby tree/pillar blockers so
+    // enemies slip AROUND trunks instead of grinding straight into them (the ClampArena push-out alone just cancels their
+    // forward progress and they stick). Cheap — only blockers within a short look-ahead of the travel direction matter.
+    // Especially important in the dense jungle for ranged foes that would otherwise wedge on a tree and never reach you.
+    private float _avoidSign = 0f;   // committed swerve side while routing around an obstacle (0 = path is clear)
+    private Vector3 _stuckRef;       // position checkpoint for the anti-stuck flip
+    private float _stuckChk = 0f;
+
+    // Smarter local steering: instead of summing EVERY nearby trunk (which jitters and jams in dense jungle), find the
+    // SINGLE most-threatening obstacle directly in our path — a tree/pillar (Blocker) or a structure wall (Deck) — and
+    // commit to going around ONE side of it. The committed side (_avoidSign) persists so we don't oscillate, and the
+    // per-frame anti-stuck flip (in the mover) reverses it if we end up wedged, letting foes escape local minima.
+    private Vector3 AvoidBlockers(Vector3 dir)
+    {
+        if (Game.I == null) return dir;
+        dir.Y = 0f;
+        if (dir.LengthSquared() < 0.0001f) { _avoidSign = 0f; return dir; }
+        dir = dir.Normalized();
+        var gp = GlobalPosition;
+        float feel = Radius + 4.0f;                              // how far ahead we look
+
+        float bestThreat = 0.12f; Vector3 bestAway = Vector3.Zero; float bestGap = 0f; bool found = false;
+        void Consider(float bx, float bz, float brad)
+        {
+            float ox = gp.X - bx, oz = gp.Z - bz;
+            if (ox > feel + 2f || ox < -(feel + 2f) || oz > feel + 2f || oz < -(feel + 2f)) return;   // cheap reject before sqrt
+            float d = Mathf.Sqrt(ox * ox + oz * oz);
+            float gap = d - (brad + Radius * 0.9f);
+            if (gap > feel) return;                             // too far to matter
+            Vector3 away = d > 0.001f ? new Vector3(ox / d, 0f, oz / d) : -dir;   // obstacle → us
+            float ahead = dir.Dot(-away);                       // 1 = obstacle dead ahead of our travel
+            if (ahead <= 0.1f) return;                           // beside/behind us — no need to swerve
+            float threat = ahead * Mathf.Clamp(1f - gap / feel, 0f, 1f);
+            if (threat > bestThreat) { bestThreat = threat; bestAway = away; bestGap = gap; found = true; }
+        }
+        var bl = Game.I.Blockers;
+        var nb = Game.I.QueryBlockers(gp.X, gp.Z, feel + 2f);        // (PERF) only nearby trees/rocks, not the whole jungle list
+        for (int i = 0; i < nb.Count; i++) { var b = bl[nb[i]]; Consider(b.Pos.X, b.Pos.Z, b.Radius); }
+        var wb = Game.I.WallBlockers;                                // (NEW) route around frost walls too (small list — stays linear)
+        for (int i = 0; i < wb.Count; i++) Consider(wb[i].Pos.X, wb[i].Pos.Z, wb[i].Radius);
+        // are we ON a ramp/staircase? then DON'T steer around the wall it climbs — let us ride the stairs up onto the deck
+        bool onRamp = false;
+        var rmps = Game.I.Ramps;
+        for (int i = 0; i < rmps.Count; i++)
+        {
+            var r = rmps[i];
+            if (Mathf.Abs(gp.X - r.Center.X) <= r.Half.X + Radius + 0.5f && Mathf.Abs(gp.Z - r.Center.Z) <= r.Half.Y + Radius + 0.5f) { onRamp = true; break; }
+        }
+        // (NEW) target is up on a structure? then the keep isn't an obstacle, it's the DESTINATION — orbiting it was what
+        // left half the horde circling a keep in a clump instead of going up. Only still-taller decks get avoided.
+        bool seekHigh = _tgt.Y > gp.Y - Radius + 1.2f;
+        var dk = Game.I.Decks;
+        var nd = Game.I.QueryDecks(gp.X, gp.Z, feel + 2f);          // (PERF) only nearby structure walls
+        for (int i = 0; i < nd.Count; i++)                     // steer around structure walls too (as their bounding circle)
+        {
+            var d = dk[nd[i]];
+            if (d.TopY < 1.8f || d.LowPad || gp.Y >= d.TopY - 0.6f || onRamp) continue;   // low pads (pedestals) = step up; already climbing/on a ramp = don't get shoved off
+            if (seekHigh && d.TopY <= _tgt.Y + 2f) continue;   // (NEW) this is the thing we're trying to climb — walk into it
+            Consider(d.Center.X, d.Center.Z, Mathf.Max(d.Half.X, d.Half.Y));
+        }
+
+        if (!found) { _avoidSign = 0f; return dir; }
+
+        Vector3 tangent = new Vector3(-dir.Z, 0f, dir.X);
+        if (_avoidSign == 0f) _avoidSign = tangent.Dot(bestAway) < 0f ? 1f : -1f;   // commit to the side we're already offset toward
+        if (_avoidSign < 0f) tangent = -tangent;
+        float w = Mathf.Clamp(1f - bestGap / feel, 0f, 1f);
+        Vector3 steer = tangent * (0.6f + 1.7f * w) + bestAway * (0.45f * w);   // mostly around, a little push-off
+        return (dir + steer).Normalized();
+    }
+
+    // Authoritative SOLID collision + arena bound, applied in EVERY mode (not just Expedition): keeps foes inside the
+    // play area and physically OUT of trees/pillars (Blockers) and structure walls (Decks) — no more ghosting through.
+    // Low walkable pads (TopY < 1.8) and foes already on top of a platform are exempt so ramps still work.
     private Vector3 ClampArena(Vector3 p)
     {
         float keepY = p.Y;
-        var pl = Game.I != null ? Game.I.Player : null;
+        if (Game.I == null) return p;
+        var pl = Game.I.Player;
         Vector3 ctr = pl != null ? pl.GlobalPosition : Vector3.Zero;
         var off = new Vector2(p.X - ctr.X, p.Z - ctr.Z);
         if (off.Length() > 85f) { off = off.Normalized() * 85f; p.X = ctr.X + off.X; p.Z = ctr.Z + off.Y; }
-        // push out of environment blockers so they path around trees/pillars/walls instead of clipping through
-        foreach (var b in Game.I.Blockers)
+        // (FIX) also keep foes inside the bounded overworld disc — the 85u leash is player-relative, so near the edge a foe
+        // could otherwise drift out past the cliff wall. No-op outside the overworld (maze/sky/expedition are their own arenas).
+        var cw = Game.I.ClampToWorld(new Vector3(p.X, keepY, p.Z), 8f); p.X = cw.X; p.Z = cw.Z;
+        // trees / cover pillars — FULL-radius push-out (was 0.6×, which let them sink deep into trunks)
+        var bl = Game.I.Blockers;
+        var nb = Game.I.QueryBlockers(p.X, p.Z, 5.5f);   // (PERF) only nearby trees/rocks
+        for (int i = 0; i < nb.Count; i++)
         {
-            var bo = new Vector2(p.X - b.Pos.X, p.Z - b.Pos.Z);
-            float dd = bo.Length();
-            float minD = b.Radius + Radius * 0.6f;
-            if (dd < minD) { float k = minD / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + bo.X * k; p.Z = b.Pos.Z + bo.Y * k; }
+            var b = bl[nb[i]];
+            float ox = p.X - b.Pos.X, oz = p.Z - b.Pos.Z;
+            if (ox > 5f || ox < -5f || oz > 5f || oz < -5f) continue;   // cheap AABB reject before the sqrt (most trees are far)
+            float dd = Mathf.Sqrt(ox * ox + oz * oz);
+            float minD = b.Radius + Radius * 0.9f;
+            if (dd < minD) { float k = minD / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + ox * k; p.Z = b.Pos.Z + oz * k; }
+        }
+        // frost walls — SOLID: same full-radius push-out so foes can't ghost through, only route around the ends (NEW)
+        var wb = Game.I.WallBlockers;
+        for (int i = 0; i < wb.Count; i++)
+        {
+            var b = wb[i];
+            float ox = p.X - b.Pos.X, oz = p.Z - b.Pos.Z;
+            if (ox > 5f || ox < -5f || oz > 5f || oz < -5f) continue;
+            float dd = Mathf.Sqrt(ox * ox + oz * oz);
+            float minD = b.Radius + Radius * 0.9f;
+            if (dd < minD) { float k = minD / Mathf.Max(dd, 0.001f); p.X = b.Pos.X + ox * k; p.Z = b.Pos.Z + oz * k; }
+        }
+        // structure walls (forts / ruins / maze) — box push-out along the nearest face
+        var dk = Game.I.Decks;
+        var nd = Game.I.QueryDecks(p.X, p.Z, 5.5f);   // (PERF) only nearby structure walls
+        for (int i = 0; i < nd.Count; i++)
+        {
+            var d = dk[nd[i]];
+            if (d.TopY < 1.8f || d.LowPad) continue;      // low walkable pad (incl. pedestals on raised terrain) → step up any side, never a wall push-out
+            if (keepY >= d.TopY - 0.6f) continue;         // already on/above the top (climbed a ramp / flyer)
+            if (d.Floating && keepY < d.TopY - 4.0f) continue;   // (NEW) sky island: only a thin solid rim — don't trap flyers in an invisible column below it
+            float ex = d.Half.X + Radius, ez = d.Half.Y + Radius;
+            float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
+            if (Mathf.Abs(dx) < ex && Mathf.Abs(dz) < ez)
+            {
+                if (ex - Mathf.Abs(dx) < ez - Mathf.Abs(dz)) p.X = d.Center.X + Mathf.Sign(dx) * ex;
+                else p.Z = d.Center.Z + Mathf.Sign(dz) * ez;
+            }
         }
         p.Y = keepY;
         return p;
@@ -1962,19 +2958,27 @@ public partial class Enemy : Node3D
 
     private void UpdateStatusVisual(float dt)
     {
-        if (_flash > 0) { _mat.EmissionEnergyMultiplier = 6f; }
+        if (_flash > 0) { _mat.EmissionEnergyMultiplier = 6f; _emitDirty = true; }
         else
         {
             Color sc = Col; float en = _baseEnergy;
+            bool threat = Diving || SpecialCharging || Telegraphing;   // (NEW) an imminent threat — swoop / grab-charge / winding up a shot
             bool rotv = Remote ? _rotShow : (_bleedT > 0f && _bleedRot);
-            if (rotv) { sc = sc.Lerp(DamageTypes.Col(DamageType.Blood), 0.78f); en = 3.0f + Mathf.Sin(Time.GetTicksMsec() * 0.012f) * 1.4f; }   // pulsing crimson rot
+            if (threat) { sc = new Color(1f, 0.05f, 0.05f); en = 4.8f + Mathf.Sin(Time.GetTicksMsec() * 0.02f) * 2.4f; }   // (NEW) BRIGHT pulsing red body highlight — hard to miss; wins over every other tint
+            else if (rotv) { sc = sc.Lerp(DamageTypes.Col(DamageType.Blood), 0.78f); en = 3.0f + Mathf.Sin(Time.GetTicksMsec() * 0.012f) * 1.4f; }   // pulsing crimson rot
             else if (_chargeT > 0f || _hexTele > 0f) { sc = sc.Lerp(new Color(1f, 1f, 0.8f), 0.6f); en = 2.5f; }   // sieger/hexer wind-up glow
             else if (RootT > 0) { sc = sc.Lerp(DamageTypes.Col(DamageType.Nature), 0.6f); }
             else if (SlowT > 0) { sc = sc.Lerp(DamageTypes.Col(DamageType.Frost), 0.65f); en = _baseEnergy * 0.85f; }
-            if (Cursed) { sc = sc.Lerp(DamageTypes.Col(DamageType.Curse), 0.72f); en = 2.4f + Mathf.Sin(Time.GetTicksMsec() * 0.009f) * 1.3f; }   // (NEW) pulsing curse glow (overrides other tints while cursed)
-            _mat.Emission = sc;
-            _mat.EmissionEnergyMultiplier = en;
-            if (_light != null) _light.LightColor = sc;
+            if (Cursed && !threat) { sc = sc.Lerp(DamageTypes.Col(DamageType.Curse), 0.72f); en = 2.4f + Mathf.Sin(Time.GetTicksMsec() * 0.009f) * 1.3f; }   // (NEW) pulsing curse glow (overrides other tints while cursed — but not the red threat highlight)
+            // (PERF) only WRITE the material when it actually changed — an idle enemy (no status) has constant sc/en,
+            // so this stops dirtying ~50 materials/frame for nothing. Animated statuses still update every frame.
+            if (_emitDirty || !Mathf.IsEqualApprox(en, _lastEmitEn) || !sc.IsEqualApprox(_lastEmit))
+            {
+                _mat.Emission = sc;
+                _mat.EmissionEnergyMultiplier = en;
+                if (_light != null) _light.LightColor = sc;
+                _lastEmit = sc; _lastEmitEn = en; _emitDirty = false;
+            }
         }
 
         bool marked = MarkT > 0;
@@ -2060,6 +3064,17 @@ public partial class Enemy : Node3D
     public void Hurt(float dmg, DamageType type = DamageType.Lunar, bool fromCombo = false, bool crit = false)
     {
         if (Dead) return;
+        // (NEW PHALANX) archers are untouchable for exactly as long as their bearer's ward stands — the ward IS the
+        // fight. Bounce the shot with a spark instead of a number so it reads as "blocked", not "missed".
+        if (IsArcher && WardGuarded) { WardDeflect(); return; }
+        // (ECLIPSE) EVERY lunar hit the local eclipsed Lunar witch lands detonates a shadow-nova. Hooked HERE (not OnHitCore)
+        // so it catches ALL her lunar damage — bolts, charged, finishers, mods, fields, projectiles — and runs on HER machine
+        // (host or client: e.Hurt is called on the attacker's side), so it's MP-correct. The busy flag stops recursion.
+        {
+            var lp = Game.I?.Player;
+            if (lp != null && lp.EclipseOn && !lp.EclipseNovaBusy && type == DamageType.Lunar)
+                lp.EclipseNovaAt(GlobalPosition);
+        }
         if (Remote)
         {
             // a client landed a hit: the host owns this enemy, so route the damage there (but give this machine local feedback)
@@ -2076,9 +3091,24 @@ public partial class Enemy : Node3D
         float dealt = dmg * MarkAmp;
         if (CurseT > 0f && (type == _curseBonusType || (int)type == _curseBonusType2)) dealt *= _curseBonusMul;   // (NEW) cursed foes take extra from the curse-bonus type(s) — Curse by default; Cursebrand adds a 2nd
         if (_armorDR > 0f && !crit) dealt *= (1f - _armorDR);                 // armored: crits punch through
+        // (NEW PHALANX) every point you land on the bearer feeds the ward pool first — its own HP is untouchable until
+        // the barrier falls. This is the tanky "break the shield" phase; crits are still your best tool against it.
+        if (IsPhalanx && _wardHp > 0f)
+        {
+            _wardHp -= dealt;
+            if (Game.I.DmgNumbers) { _popAccum += dealt; _popCol = new Color(0.62f, 0.45f, 1f); if (crit) _popCrit = true; }
+            _flash = 0.12f;
+            HitFeedback(crit);
+            if (_lastAttackerPeer != 0) _damagers.Add(_lastAttackerPeer);   // chipping the ward still earns you a share of the kill
+            Game.I.NoteEnemyDamage(dealt);
+            if (_wardHp <= 0f) BreakWard();
+            return;
+        }
         if (_shield > 0f) { float s = Mathf.Min(_shield, dealt); _shield -= s; dealt -= s; }   // shielded soak
         // (REMOVED the frozen "blue bank" — frozen foes now take NORMAL damage; a charged-RMB spear SHATTERS them for a flat burst + execute, no banking step)
         Hp -= dealt;
+        if (dealt > 0f && _lastAttackerPeer != 0) _damagers.Add(_lastAttackerPeer);   // (NEW) record every damage contributor → all earn a soul when this foe dies
+        DamageInvestigate();   // (NEW) ANY damage (beam / AoE / DoT, not just projectiles) makes an idle zombie investigate the source
         Game.I.NoteEnemyDamage(dealt);   // (NEW) feeds the boss-wave DPS director + heat
         if (CurseGroup != 0 && !_curseShareGuard && _curseShareFrac > 0f && dealt > 0.5f)   // (NEW) tethered curse group shares this damage instance
         {
@@ -2106,11 +3136,23 @@ public partial class Enemy : Node3D
             if (crit) _popCrit = true;
         }
         HitFeedback(crit);   // (NEW) universal hit tick / crit plink for ALL damage sources (melee, spells, AoE, bolts, DoTs)
+        if (crit && _climbing && Hp > 0) PeelOffWall(-_climbDir * 5f);   // (NEW) a crit shakes a wall-scaling foe loose — it falls and takes the drop
         if (Hp <= 0)
         {
             if (pl != null && pl.Ult == Player.UltKind.Eclipse && pl.UltActive) pl.OnEclipseKill(GlobalPosition);
             Die();
         }
+    }
+
+    // (NEW) owner-attributed damage — DoT ticks run on the HOST but may belong to a client's spell, so stamp the source
+    // peer around the Hurt call. This keeps both the kill-contribution set AND the kill credit pointed at the DoT's caster.
+    private void HurtFrom(long owner, float dmg, DamageType type, bool fromCombo = false)
+    {
+        if (Game.I == null) { Hurt(dmg, type, fromCombo); return; }
+        long prev = Game.I.AttackerPeer;
+        Game.I.AttackerPeer = owner != 0 ? owner : Game.I.LocalPeer;
+        Hurt(dmg, type, fromCombo);
+        Game.I.AttackerPeer = prev;
     }
 
     public int StatusMask()
@@ -2132,6 +3174,7 @@ public partial class Enemy : Node3D
         if (CurseT > 0f) m |= 1 << 21;                               // (NEW) cursed
         m |= (Mathf.Min((int)CurseStacks, 63) & 0x3F) << 22;         // (NEW) curse stacks (overhead counter)
         m |= (CurseGroup & 0x7) << 28;                               // (NEW) low 3 bits of the tether group (for drawing links on all machines)
+        if (ArcaneMarked) m |= unchecked((int)0x80000000);           // (NEW) bit 31 (the last free bit) — arcane-marked, for the client pip + turret targeting
         return m;
     }
 
@@ -2139,7 +3182,8 @@ public partial class Enemy : Node3D
 
     public void Slow(float dur, float mul) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 1, dur, mul, 0f); return; } SlowT = Mathf.Max(SlowT, dur); SlowMul = mul; }
     public void Root(float dur) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 2, dur, 0f, 0f); return; } RootT = Mathf.Max(RootT, dur); }
-    public void Mark(float dur, float amp, int jumps) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 3, dur, amp, jumps); return; } MarkT = Mathf.Max(MarkT, dur); MarkAmp = amp; MarkJumps = jumps; }
+    public void Mark(float dur, float amp, int jumps, float doom = 0f) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 3, dur, amp, jumps); return; } MarkT = Mathf.Max(MarkT, dur); MarkAmp = amp; MarkJumps = jumps; if (doom > 0f) _markDoom = doom; }
+
 
     // (NEW) The suck-beam builds curse; when it spreads, callers pass the same group id to tether foes together.
     // Tether/curse duration = the stack count in seconds (5 stacks → 5s), floored at 2s.
@@ -2194,7 +3238,7 @@ public partial class Enemy : Node3D
 
     private void Freeze()
     {
-        FrozenT = 5f + _freezeDurBonus; FreezeStacks = 0f; _freezeExpT = 0f;
+        FrozenT = 5f + _freezeDurBonus; _frozenDur = FrozenT; FreezeStacks = 0f; _freezeExpT = 0f;
         _frozenBlueMax = 0f; _frozenBlue = 0f; _frozenBlueDmg = 0f;   // no blue bank anymore (FrozenBlueFrac stays 0 → the bar isn't drawn)
         if (IsTaker && _grabPeer != 0) ReleaseGrab();   // (NEW) freezing a Taker (a hard stun, not slow/root) makes it drop its captive
         RootT = Mathf.Max(RootT, FrozenT);   // held in place
@@ -2204,54 +3248,56 @@ public partial class Enemy : Node3D
     }
 
     public void ShatterInstant() { if (FrozenT <= 0f) return; ShatterFreeze(true); }   // full-charge spear / Glacial Impaler DETONATES the accrued blue bar (explosion + AoE)
-    public void ShatterFreeze() => ShatterFreeze(false);   // freeze timer ran out → melt (banked damage, no explosion)
+    public void ShatterFreeze() => MeltFreeze();   // freeze timer ran out → quiet melt (no explosion, no damage)
 
-    // Break the ice. detonate=true → a Frost witch's spear set it off: convert banked blue damage, explode it as an AoE, spread frost.
-    // detonate=false → the freeze just melted: the enemy takes the banked damage but there's NO explosion, AoE, or spread.
+    // the freeze wore off without anyone shattering it: thaw the ice away with a light crack — NO damage, AoE, or spread.
+    // Idempotent + safe to call after FrozenT has already hit 0 (that's exactly the natural-expiry case).
+    public void MeltFreeze()
+    {
+        bool wasIced = FrozenT > 0f || _iceBlock != null;
+        FrozenT = 0f; _radiatesCold = false;
+        _freezeThreshMul = 1f; _freezeDurBonus = 0f;   // next freeze accumulates its profile fresh
+        EnsureIceBlock(false);                          // remove the ice block
+        if (wasIced && Game.I != null) { Game.I.SpawnFrostShatter(GlobalPosition, Radius * 0.5f); Game.I.Sfx?.IceShatter(GlobalPosition); }   // quiet crack
+    }
+
+    // Break the ice by DETONATION — a Frost witch's spear set it off: a flat, player-scaled burst + %-max-HP execute,
+    // an AoE splash, and frost spread. (The melt/thaw case lives in MeltFreeze.)
     public void ShatterFreeze(bool detonate)
     {
+        if (!detonate) { MeltFreeze(); return; }
         if (FrozenT <= 0f) return;
         var pw = Game.I.Player;
         // (REDESIGN) No blue-bank at all. A frozen foe takes normal damage; a DETONATE (full-charge spear) SHATTERS it for a
         // flat, player-scaled burst + a %-max-HP execute — an immediate payoff the moment you see the ice, no pre-banking.
-        float burst = 0f;
-        if (detonate)
-        {
-            float missing = MaxHp > 0f ? Mathf.Clamp(1f - Hp / MaxHp, 0f, 1f) : 0f;
-            float powMul = pw != null ? pw.ShatterPowerMul : 1f;
-            burst = ((pw != null ? pw.ShatterBurstDmg() : 24f) + MaxHp * (0.05f + 0.15f * missing)) * powMul;
-        }
-        float real = burst;   // detonate = the burst; melt = 0 (the foe already took its damage normally while frozen)
-        FrozenT = 0f; _radiatesCold = false; if (_iceBlock != null) _iceBlock.Visible = false;
+        float missing = MaxHp > 0f ? Mathf.Clamp(1f - Hp / MaxHp, 0f, 1f) : 0f;
+        float powMul = pw != null ? pw.ShatterPowerMul : 1f;
+        float hpFrac = 0.05f + 0.15f * missing;
+        if (IsBoss) hpFrac = Mathf.Min(hpFrac, 0.12f);   // (NEW) cap the %-max-HP execute vs bosses/minibosses — the shatter is reliably landable now, so this keeps it from nuking MP-inflated boss pools (mirrors Life Curse's boss cap)
+        float real = ((pw != null ? pw.ShatterBurstDmg() : 24f) + MaxHp * hpFrac) * powMul;
+        FrozenT = 0f; _radiatesCold = false; EnsureIceBlock(false);   // (FIX) remove the ice block, don't just hide it
         _freezeThreshMul = 1f; _freezeDurBonus = 0f;   // next freeze accumulates its profile fresh
-        if (detonate)
+        Game.I.SpawnFrostShatter(GlobalPosition, Radius);
+        Game.I.Sfx?.IceShatter(GlobalPosition);
+        Game.I.NetMgr?.BroadcastVfx(49, GlobalPosition, Vector3.Zero, Radius, 0f, DamageTypes.Col(DamageType.Frost));
+        float area = 7.5f * (pw != null ? pw.S.SpellArea : 1f);   // bigger shatter burst radius; still scales with AoE cards
+        float shard = real * 0.3f;                               // modest AoE splash — Frost's strength is the single-target snipe (Forsaken keeps the AoE crown)
+        bool cascade = pw != null && pw.ShatterCascade;
+        ulong cfr = Engine.GetProcessFrames();
+        if (cfr != _cascFrame) { _cascFrame = cfr; _cascBudget = 24; _cascWarned = false; }   // per-frame ceiling on chained shatters (a huge cluster can't blow up the frame)
+        foreach (var o in Game.I.Enemies.ToArray())
         {
-            Game.I.SpawnFrostShatter(GlobalPosition, Radius);
-            Game.I.Sfx?.IceShatter(GlobalPosition);
-            Game.I.NetMgr?.BroadcastVfx(49, GlobalPosition, Vector3.Zero, Radius, 0f, DamageTypes.Col(DamageType.Frost));
-            float area = 7.5f * (pw != null ? pw.S.SpellArea : 1f);   // bigger shatter burst radius; still scales with AoE cards
-            float shard = burst * 0.3f;                               // modest AoE splash — Frost's strength is the single-target snipe (Forsaken keeps the AoE crown)
-            bool cascade = pw != null && pw.ShatterCascade;
-            ulong cfr = Engine.GetProcessFrames();
-            if (cfr != _cascFrame) { _cascFrame = cfr; _cascBudget = 24; _cascWarned = false; }   // per-frame ceiling on chained shatters (a huge cluster can't blow up the frame)
-            foreach (var o in Game.I.Enemies.ToArray())
+            if (o == null || o == this || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
+            if (o.GlobalPosition.DistanceTo(GlobalPosition) < area + o.Radius)
             {
-                if (o == null || o == this || o.Dead || !GodotObject.IsInstanceValid(o)) continue;
-                if (o.GlobalPosition.DistanceTo(GlobalPosition) < area + o.Radius)
-                {
-                    if (cascade && o.Frozen && _cascBudget <= 0 && !_cascWarned) { _cascWarned = true; GD.PushWarning($"[perf] shatter-cascade budget exhausted this frame ({Game.I.Enemies.Count} enemies) — capping the chain to avoid a hang"); }
-                    if (cascade && o.Frozen && _cascBudget > 0) { _cascBudget--; o.ShatterInstant(); }   // Shatter Cascade legendary chains the detonation (budget-capped)
-                    else { o.Hurt(Mathf.Min(shard, o.MaxHp * 0.5f), DamageType.Frost); o.AddFreeze(pw != null ? pw.ShatterFreezeStacks : 1f, pw != null ? pw.FreezeThreshMul : 1f, pw != null ? pw.FrostDurBonus : 0f); }
-                }
+                if (cascade && o.Frozen && _cascBudget <= 0 && !_cascWarned) { _cascWarned = true; GD.PushWarning($"[perf] shatter-cascade budget exhausted this frame ({Game.I.Enemies.Count} enemies) — capping the chain to avoid a hang"); }
+                if (cascade && o.Frozen && _cascBudget > 0) { _cascBudget--; o.ShatterInstant(); }   // Shatter Cascade legendary chains the detonation (budget-capped)
+                else { o.Hurt(Mathf.Min(shard, o.MaxHp * 0.5f), DamageType.Frost); o.AddFreeze(pw != null ? pw.ShatterFreezeStacks : 1f, pw != null ? pw.FreezeThreshMul : 1f, pw != null ? pw.FrostDurBonus : 0f); }
             }
-            bool willDie = Hp - real <= 0f;
-            if (pw != null && real > 0f) pw.OnHitDirect(this, willDie, real, DamageType.Frost);   // detonation builds combo + charges finishers
         }
-        else
-        {
-            Game.I.SpawnFrostShatter(GlobalPosition, Radius * 0.5f); Game.I.Sfx?.IceShatter(GlobalPosition);   // freeze wore off — a quiet crack as the ice melts (no damage/AoE)
-        }
-        Hp -= real;   // detonated → the shatter burst; melted → 0 (the foe took its damage normally while frozen)
+        bool willDie = Hp - real <= 0f;
+        if (pw != null && real > 0f) pw.OnHitDirect(this, willDie, real, DamageType.Frost);   // detonation builds combo + charges finishers
+        Hp -= real;
         if (Hp <= 0f) { var pl = Game.I.Player; if (pl != null && pl.Ult == Player.UltKind.Eclipse && pl.UltActive) pl.OnEclipseKill(GlobalPosition); Die(); }
     }
 
@@ -2273,6 +3319,7 @@ public partial class Enemy : Node3D
         _remoteCursed = (mask & (1 << 21)) != 0;   // (NEW) mirror cursed glow + overhead counter + tether group
         CurseStacks = (mask >> 22) & 0x3F;
         CurseGroup = (mask >> 28) & 0x7;
+        _markShow = (mask & unchecked((int)0x80000000)) != 0;   // (NEW) arcane-mark pip mirror on the client
         if ((_type == "swarmer" || _type == "taker") && _creature != null)   // (NEW) mirror idle/wall-stun pose + scream on the client proxy
         {
             _creature.IdlePose = (mask >> 7) & 3;
@@ -2283,10 +3330,13 @@ public partial class Enemy : Node3D
     }
 
     private long _lastAttackerPeer = 1;   // (NEW) who dealt the most recent damage — for host-authoritative kill credit
+    private readonly System.Collections.Generic.HashSet<long> _damagers = new();   // (NEW) EVERY peer that dealt any damage to this foe — for contribution-based soul credit on death
     private void Die()
     {
         Dead = true;
+        Fx.SparkBurst(GlobalPosition + Vector3.Up * Radius * 0.5f, Vector3.Up, Col.Lerp(Colors.White, 0.3f), Radius * 0.5f, 8);   // (PHASE 3) GPU shard death-pop
         Game.I?.CreditKill(_lastAttackerPeer, Game.I != null && Game.I.IsNight);   // (NEW) exact MP kill attribution (host/solo only reaches Die)
+        if (_type == "snake") Game.I?.NotifySnakeDied(NetId);   // (NEW) free anyone this snake had rooted
         if (_livingBombStacks > 0 && Game.I != null)   // (NEW) Ember Living Bomb: on death, erupt Z times ~0.2s apart at the death spot — each blast % of MAX hp, chaining through the crowd
         {
             var burst = new EmberDeathBurst(); Game.I.AddChild(burst);
@@ -2294,6 +3344,8 @@ public partial class Enemy : Node3D
         }
         if (_type == "swarmer") Game.I.Sfx?.ZombieDeath(GlobalPosition);   // (NEW)
         if (_type == "taker") { ReleaseGrab(); Game.I.Sfx?.TakerDeath(GlobalPosition); }   // (NEW) free the captive
+        if (IsPhalanx && _wardHp > 0f) BreakWard();          // (NEW) executed/deleted while warded → still release the rank
+        if (IsArcher && _leader != null) { _leader._squad.Remove(this); _leader.RecomputeWard(false); _leader = null; }   // (NEW) a fallen archer weakens the ward it was feeding
         if (Affix == 4 || (Game.I != null && Game.I.ActiveMutator == WaveMutator.Volatile && !IsBoss && !IsGoblin)) Explode();   // volatile affix OR the Volatile mutator: blast on death (players only, never other enemies)
         if (_splitter) { for (int i = 0; i < 2; i++) Game.I.SpawnEnemyAt("spawnling", GlobalPosition); }   // splitter: spawn two (host → synced)
         Game.I.Player?.OnBloodAuraKill(GlobalPosition);        // local blood witch: ANY death in her aura banks a stack
@@ -2301,7 +3353,7 @@ public partial class Enemy : Node3D
         // a bleeding victim ruptures; a ROT victim also spreads the bleed to nearby foes (Blood Rot chains)
         if (_bleedT > 0f)
         {
-            float burst = _bleedDps * 1.2f;
+            float burst = _bleedDps * 1.2f * _bleedBurstMul;   // (OVERHAUL) Hemorrhage Rupture amplifies this
             foreach (var e in Game.I.Enemies.ToArray())
             {
                 if (e == null || e == this || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
@@ -2326,6 +3378,10 @@ public partial class Enemy : Node3D
         if (IsBoss) Game.I.DropBossToken(this);
 
         Game.I.Kills++;
+        if (_damagers.Count == 0) _damagers.Add(_lastAttackerPeer);   // (NEW) untracked kill (execute/environmental) → at least credit the last dealer
+        // (HAUNT ECONOMY) souls now come ONLY from kills inside a Haunt — NoteHauntKill credits the contributors AND feeds
+        // the break meter. Kills out in the world no longer pay souls; the hot-zone is the sole faucet.
+        if (!IsBoss && !IsSpecial) Game.I.NoteHauntKill(GlobalPosition, _damagers);
 
         if (MarkT > 0 && MarkJumps > 0)
         {
@@ -2338,15 +3394,39 @@ public partial class Enemy : Node3D
             }
             if (best != null) { best.Mark(2.5f, MarkAmp, MarkJumps - 1); best.Hurt(MaxHp * 0.18f, DamageType.Curse, false); }
         }
+        if (MarkT > 0 && _markDoom > 0f)   // (OVERHAUL) Doombrand: a marked foe detonates on death
+        {
+            foreach (var e in Game.I.Enemies.ToArray())
+                if (e != null && e != this && !e.Dead && GodotObject.IsInstanceValid(e) && GlobalPosition.DistanceTo(e.GlobalPosition) < 5f) e.Hurt(_markDoom, DamageType.Curse, false);
+            var dv = new Vfx(); Game.I.AddChild(dv); dv.GlobalPosition = new Vector3(GlobalPosition.X, 0.6f, GlobalPosition.Z);
+            dv.Init(new SphereMesh { Radius = 2.5f, Height = 5f }, DamageTypes.Col(DamageType.Curse), 0.3f, 6f);
+        }
 
         int orbs = IsBoss ? 8 : (Elite ? 3 : 1);
         for (int i = 0; i < orbs; i++)
         {
-            var orb = new Orb { Xp = (Score * 0.5f + 2.5f) / orbs, Tint = Col, NetId = Game.I.NextPickupId() };   // XP per kill trimmed (was Score*0.6+4) — slows early leveling; the flat term dominated trash-heavy waves (NEW)
+            var orb = new Orb { Xp = (Score * 0.5f + 2.5f) * Game.I.XpKillMul * Game.I.HauntXpMul(GlobalPosition) / orbs, Tint = Col, NetId = Game.I.NextPickupId() };   // (NEW) XpKillMul folds in the global frenzied→lvl-25 trim + the party-density damp; HauntXpMul = 2× inside the hot-zone
             Game.I.AddChild(orb);
             Game.I.AddXpOrb(orb);   // capped add — persistent orbs can't pile up unbounded
             var off = new Vector3((float)GD.RandRange(-1.5, 1.5), 1.2f, (float)GD.RandRange(-1.5, 1.5));
             orb.GlobalPosition = new Vector3(GlobalPosition.X, 1.2f, GlobalPosition.Z) + off;
+        }
+
+        // (MAGNET DROP) a witchy lodestone that vacuums every XP shard on the map when grabbed — base boss/miniboss 5%, elite 4%, normal 1.5%,
+        // scaled by the BEST Luck among everyone who damaged this foe (×(1+luck), capped 25%). Only rolls when the lobby-wide cooldown is ready.
+        if (Game.I.IsAuthority && Game.I.MagnetDropReady && _type != "spawnling" && _type != "goblin")
+        {
+            float mBase = IsBoss ? 0.0125f : (Elite ? 0.01f : 0.00375f);   // (HALVED AGAIN ×2 — lodestones were still landing too often)
+            float mChance = Mathf.Min(0.25f, mBase * (1f + Mathf.Max(0f, Game.I.BestContributorLuck(_damagers))));
+            if (GD.Randf() < mChance) Game.I.SpawnMagnet(new Vector3(GlobalPosition.X, 1.1f, GlobalPosition.Z));
+        }
+        // (NEW) WARD PLATING — same odds shape as the lodestone, but the cooldown is PER WARDEN (60s) rather than one
+        // shared lobby timer, so a bigger party genuinely sees more of them. Credited to whoever landed the kill.
+        if (Game.I.IsAuthority && Game.I.WardDropReady(_lastAttackerPeer) && _type != "spawnling" && _type != "goblin")
+        {
+            float wBase = IsBoss ? 0.0125f : (Elite ? 0.01f : 0.00375f);   // (HALVED AGAIN ×2 — same as lodestone)
+            float wChance = Mathf.Min(0.25f, wBase * (1f + Mathf.Max(0f, Game.I.BestContributorLuck(_damagers))));
+            if (GD.Randf() < wChance) Game.I.SpawnWardArmor(new Vector3(GlobalPosition.X, 1.1f, GlobalPosition.Z), _lastAttackerPeer);
         }
 
         if (_type == "boss") { BossDeathSequence(); return; }   // THE HOLLOW MOON gets a dramatic drawn-out death; frees itself after

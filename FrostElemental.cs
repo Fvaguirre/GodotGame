@@ -50,7 +50,7 @@ public partial class FrostElemental : Node3D
 
     public override void _Process(double delta)
     {
-        var g = Game.I; if (g == null || g.State != GameState.Playing) return;
+        var g = Game.I; if (g == null || !g.SimActive) return;
         float dt = (float)delta; _life += dt;
         if (_ball != null) _ball.RotationDegrees += new Vector3(dt * 220f, 0, 0);   // roll forward (both host + ghost)
         if (!_remote)

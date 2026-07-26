@@ -5,7 +5,7 @@ using System.Collections.Generic;
 // maps each enemy type string to a kind (e.g. brute/boss -> Orc, flyer/diver -> Mosquito). Add a new
 // kind here only if a new enemy needs a distinct body; otherwise reuse an existing one. Handles the
 // mesh build + walk/attack animation for the enemy.
-public enum CreatureKind { Goblin, Orc, Spider, Mosquito, Bomber, Zapper, Zombie, HollowBoss }
+public enum CreatureKind { Goblin, Orc, Spider, Mosquito, Bomber, Zapper, Zombie, HollowBoss, Crocodile, Troll, Pigmy, Pterodactyl, Bat, Snake }   // Crocodile + jungle set (NEW)
 
 // Procedurally-built, procedurally-animated enemy models (primitive-based, but layered limbs with a
 // walk/flap cycle and knee-bend so they read as creatures). Each instance is randomly varied so no
@@ -38,6 +38,7 @@ public partial class Creature : Node3D
     private float _scream;                          // (NEW) zombie shriek-to-sky overlay (arms up, lean back)
     public void Scream() { _scream = 1f; }
     public int IdlePose = 0;                        // (NEW) 0 stand, 1 lie on floor, 2 slump, 3 snicker (idle swarmers)
+    public bool AnimSuspended = false;              // (PERF) set by Enemy when far + off-camera → skip the skeletal pose writes entirely
 
     private void ZombieIdlePose()   // lie / slump / snicker (idle, non-alerted swarmers)
     {
@@ -75,12 +76,38 @@ public partial class Creature : Node3D
     private static Mesh Sph(float r) => new SphereMesh { Radius = r, Height = r * 2f };
     private static float R(float a, float b) => (float)GD.RandRange(a, b);
 
+    private readonly List<MeshInstance3D> _detail = new();   // (PERF) the small trim parts — hidden as a group on far enemies (LOD)
+    private readonly List<MeshInstance3D> _shadowParts = new();   // (PERF) the big shadow-casting parts (torso/head/limbs) — stop casting on far enemies
+    private Material _limbMat;   // (FIX) limb material — limb parts are the silhouette (legs/arms) and must NEVER be culled as "trim"
+    private bool _lodFar = false;
     private MeshInstance3D Part(Node3D parent, Mesh m, Material mat, Vector3 pos, Vector3 rotDeg, Vector3 scl)
     {
         var mi = new MeshInstance3D { Mesh = m, MaterialOverride = mat };
+        // (PERF) small detail parts (teeth, warts, eyes, fingers…) don't cast shadows — the torso/head/limbs still do,
+        // so the silhouette reads the same, but we stop redrawing ~15 tiny meshes per enemy into all 4 shadow cascades.
+        var s = m.GetAabb().Size;
+        bool small = Mathf.Max(s.X * Mathf.Abs(scl.X), Mathf.Max(s.Y * Mathf.Abs(scl.Y), s.Z * Mathf.Abs(scl.Z))) < 0.62f;
+        if (small && mat != _limbMat)   // (FIX) never treat LIMBS as cullable trim — small creatures' legs/arms were vanishing at range
+        {
+            mi.CastShadow = GeometryInstance3D.ShadowCastingSetting.Off;
+            _detail.Add(mi);   // …and drop these tiny trim parts once the foe is far enough that they're sub-pixel (LOD)
+        }
+        else _shadowParts.Add(mi);   // (PERF) limbs + big parts: always draw; far-LOD only stops their shadow-casting
         parent.AddChild(mi);
         mi.Position = pos; mi.RotationDegrees = rotDeg; mi.Scale = scl;
         return mi;
+    }
+    // (PERF) LOD: on distant enemies hide the dozens of tiny trim meshes (teeth/warts/eyes/fingers/spikes). The torso,
+    // head and limbs keep drawing so the silhouette is unchanged; we just shed ~half the draw calls per far-off foe.
+    public void SetLodFar(bool far)
+    {
+        if (far == _lodFar) return;
+        _lodFar = far;
+        for (int i = 0; i < _detail.Count; i++)
+            if (_detail[i] != null && GodotObject.IsInstanceValid(_detail[i])) _detail[i].Visible = !far;
+        var sh = far ? GeometryInstance3D.ShadowCastingSetting.Off : GeometryInstance3D.ShadowCastingSetting.On;   // (PERF) far foes stop feeding the shadow cascades
+        for (int i = 0; i < _shadowParts.Count; i++)
+            if (_shadowParts[i] != null && GodotObject.IsInstanceValid(_shadowParts[i])) _shadowParts[i].CastShadow = sh;
     }
     private Node3D Pivot(Node3D parent, Vector3 pos, Vector3 rotDeg = default)
     {
@@ -92,6 +119,7 @@ public partial class Creature : Node3D
 
     public void Build(CreatureKind kind, float radius, Material body, Material limb, Material accent)
     {
+        _limbMat = limb;   // (FIX) so Part() can exempt limbs from the size-based trim cull
         _kind = kind; _scale = radius;
         _phase = R(0f, 6.28f);
         switch (kind)
@@ -104,6 +132,213 @@ public partial class Creature : Node3D
             case CreatureKind.Spider: Spider(radius, body, limb, accent); break;
             case CreatureKind.Mosquito: Mosquito(radius, body, limb, accent); break;
             case CreatureKind.Zapper: Zapper(radius, body, limb, accent); break;
+            case CreatureKind.Crocodile: Crocodile(radius, body, limb, accent); break;
+            case CreatureKind.Troll: Troll(radius, body, limb, accent); break;
+            case CreatureKind.Pigmy: Pigmy(radius, body, limb, accent); break;
+            case CreatureKind.Pterodactyl: Pterodactyl(radius, body, limb, accent); break;
+            case CreatureKind.Bat: Bat(radius, body, limb, accent); break;
+            case CreatureKind.Snake: Snake(radius, body, limb, accent); break;
+        }
+    }
+
+    // ---- jungle troll: hulking, hunched, HUGE dragging arms, underbite tusks, warty; a rushing bruiser ----
+    private void Troll(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.95f, 1.2f);
+        float gh = s * 1.5f * v;
+        _body = Pivot(this, new Vector3(0, gh, 0));
+        _bodyBaseY = gh;
+        float bw = s * 2.0f * v;
+        Part(_body, Box(bw, gh, bw * 0.9f), body, Vector3.Zero, new Vector3(R(10, 18), 0, 0), Vector3.One);                       // massive hunched torso
+        Part(_body, Sph(s * 0.9f), body, new Vector3(0, gh * 0.35f, -bw * 0.35f), Vector3.Zero, new Vector3(1.2f, 1f, 1f));       // hunchback
+        Part(_body, Box(bw * 1.2f, gh * 0.4f, bw * 0.6f), limb, new Vector3(0, gh * 0.42f, 0), Vector3.Zero, Vector3.One);        // shoulders
+        for (int i = 0; i < 5; i++) Part(_body, Sph(s * R(0.14f, 0.26f)), limb, new Vector3(R(-0.5f, 0.5f) * bw, R(-0.2f, 0.4f) * gh, R(-0.5f, -0.2f) * bw), Vector3.Zero, Vector3.One);   // warty lumps
+        var head = Part(_body, Sph(s * 0.55f), body, new Vector3(0, gh * 0.5f, s * 0.25f), Vector3.Zero, new Vector3(1.1f, 0.9f, 1f));
+        Part(head, Box(s * 0.8f, s * 0.2f, s * 0.3f), limb, new Vector3(0, s * 0.2f, s * 0.3f), new Vector3(-12, 0, 0), Vector3.One);   // heavy brow
+        Part(head, Sph(s * 0.08f), accent, new Vector3(s * 0.18f, s * 0.05f, s * 0.42f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.08f), accent, new Vector3(-s * 0.18f, s * 0.05f, s * 0.42f), Vector3.Zero, Vector3.One);
+        Part(head, Box(s * 0.7f, s * 0.28f, s * 0.32f), body, new Vector3(0, -s * 0.28f, s * 0.34f), new Vector3(8, 0, 0), Vector3.One);   // jutting jaw
+        Part(head, Cone(s * 0.11f, s * R(0.4f, 0.55f)), accent, new Vector3(s * 0.24f, -s * 0.2f, s * 0.42f), new Vector3(-20, 0, 0), Vector3.One);   // underbite tusks
+        Part(head, Cone(s * 0.11f, s * R(0.4f, 0.55f)), accent, new Vector3(-s * 0.24f, -s * 0.2f, s * 0.42f), new Vector3(-20, 0, 0), Vector3.One);
+        float legLen = gh * 0.4f, armLen = gh * 0.8f;   // stubby legs, huge dragging arms
+        for (int i = 0; i < 2; i++)
+        {
+            float sx = i == 0 ? 1 : -1;
+            var hip = Pivot(this, new Vector3(sx * bw * 0.32f, gh * 0.32f, 0));
+            Part(hip, Cyl(s * 0.4f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            var knee = Pivot(hip, new Vector3(0, -legLen, 0));
+            Part(knee, Cyl(s * 0.36f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(knee, Box(s * 0.6f, s * 0.2f, s * 0.85f), limb, new Vector3(0, -legLen, s * 0.14f), Vector3.Zero, Vector3.One);
+            _hips.Add(hip); _knees.Add(knee); _hipBase.Add(Vector3.Zero); _kneeBase.Add(Vector3.Zero);
+            var arm = Pivot(_body, new Vector3(sx * bw * 0.6f, gh * 0.42f, 0));
+            Part(arm, Cyl(s * 0.36f, armLen), limb, new Vector3(0, -armLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(arm, Sph(s * 0.5f), limb, new Vector3(0, -armLen, 0), Vector3.Zero, Vector3.One);   // huge fists
+            _arms.Add(arm);
+        }
+    }
+
+    // ---- pigmy: little tribal humanoid, big head with warpaint + a feather topknot, carries a spear/blowpipe ----
+    private void Pigmy(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.85f, 1.1f);
+        float gh = s * 0.85f * v;
+        _body = Pivot(this, new Vector3(0, gh, 0));
+        _bodyBaseY = gh;
+        float bw = s * 0.5f * v;
+        Part(_body, Box(bw, gh * 0.8f, bw * 0.7f), body, Vector3.Zero, new Vector3(R(4, 10), 0, 0), Vector3.One);   // little torso
+        var head = Part(_body, Sph(s * 0.4f), body, new Vector3(0, gh * 0.55f, s * 0.05f), Vector3.Zero, Vector3.One);
+        Part(head, Box(s * 0.5f, s * 0.1f, s * 0.1f), accent, new Vector3(0, s * 0.02f, s * 0.3f), Vector3.Zero, Vector3.One);   // warpaint stripe
+        Part(head, Sph(s * 0.06f), accent, new Vector3(s * 0.12f, s * 0.08f, s * 0.32f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.06f), accent, new Vector3(-s * 0.12f, s * 0.08f, s * 0.32f), Vector3.Zero, Vector3.One);
+        Part(head, Cone(s * 0.06f, s * 0.5f), accent, new Vector3(0, s * 0.4f, -s * 0.1f), new Vector3(-20, 0, 0), Vector3.One);   // feather topknot
+        float legLen = gh * 0.4f, armLen = gh * 0.45f;
+        for (int i = 0; i < 2; i++)
+        {
+            float sx = i == 0 ? 1 : -1;
+            var hip = Pivot(this, new Vector3(sx * bw * 0.32f, gh * 0.3f, 0));
+            Part(hip, Cyl(s * 0.12f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            var knee = Pivot(hip, new Vector3(0, -legLen, 0));
+            Part(knee, Cyl(s * 0.1f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(knee, Box(s * 0.24f, s * 0.1f, s * 0.34f), limb, new Vector3(0, -legLen, s * 0.1f), Vector3.Zero, Vector3.One);
+            _hips.Add(hip); _knees.Add(knee); _hipBase.Add(Vector3.Zero); _kneeBase.Add(Vector3.Zero);
+            var arm = Pivot(_body, new Vector3(sx * bw * 0.55f, gh * 0.32f, 0));
+            Part(arm, Cyl(s * 0.09f, armLen), limb, new Vector3(0, -armLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(arm, Sph(s * 0.12f), limb, new Vector3(0, -armLen, 0), Vector3.Zero, Vector3.One);
+            _arms.Add(arm);
+        }
+        // spear/blowpipe in the right hand — parented to the arm so it thrusts on the jab
+        var weapon = Part(_arms[0], Cyl(s * 0.05f, s * 1.9f), accent, new Vector3(0, -armLen, s * 0.35f), new Vector3(82, 0, 0), Vector3.One);
+        Part(weapon, Cone(s * 0.08f, s * 0.3f), limb, new Vector3(0, s * 0.95f, 0), Vector3.Zero, Vector3.One);   // tip
+    }
+
+    // ---- pterodactyl: leathery flyer, long beaked head + back crest, big membrane wings, tail ----
+    private void Pterodactyl(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.9f, 1.15f); s *= v;
+        _body = Pivot(this, Vector3.Zero);
+        _bodyBaseY = 0f;
+        Part(_body, Sph(s * 0.5f), body, Vector3.Zero, Vector3.Zero, new Vector3(1, 0.9f, 1.4f));   // body
+        Part(_body, Cyl(s * 0.14f, s * 0.8f), body, new Vector3(0, s * 0.25f, s * 0.4f), new Vector3(50, 0, 0), Vector3.One);   // neck
+        var head = Part(_body, Sph(s * 0.24f), body, new Vector3(0, s * 0.5f, s * 0.75f), Vector3.Zero, Vector3.One);
+        Part(head, Cone(s * 0.1f, s * 0.9f), limb, new Vector3(0, -s * 0.02f, s * 0.5f), new Vector3(90, 0, 0), Vector3.One);   // long beak
+        Part(head, Cone(s * 0.12f, s * 0.5f), accent, new Vector3(0, s * 0.1f, -s * 0.2f), new Vector3(-60, 0, 0), Vector3.One);   // head crest
+        Part(head, Sph(s * 0.06f), accent, new Vector3(s * 0.12f, s * 0.05f, s * 0.1f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.06f), accent, new Vector3(-s * 0.12f, s * 0.05f, s * 0.1f), Vector3.Zero, Vector3.One);
+        Part(_body, Cone(s * 0.1f, s * 1.0f), body, new Vector3(0, 0, -s * 0.85f), new Vector3(-90, 0, 0), Vector3.One);   // tail
+        for (int i = 0; i < 2; i++)
+        {
+            float sx = i == 0 ? 1 : -1;
+            var w = Pivot(_body, new Vector3(sx * s * 0.35f, s * 0.15f, 0));
+            Part(w, Box(s * 2.2f, s * 0.05f, s * 1.0f), limb, new Vector3(sx * s * 1.1f, 0, 0), Vector3.Zero, Vector3.One);   // membrane
+            Part(w, Cyl(s * 0.06f, s * 2.0f), body, new Vector3(sx * s * 1.0f, 0, s * 0.3f), new Vector3(0, 0, sx * 90f), Vector3.One);   // leading-edge bone
+            _wings.Add(w);
+        }
+        for (int i = 0; i < 2; i++) { float sx = i == 0 ? 1 : -1; Part(_body, Cyl(s * 0.05f, s * 0.4f), limb, new Vector3(sx * s * 0.2f, -s * 0.4f, -s * 0.2f), Vector3.Zero, Vector3.One); }
+    }
+
+    // ---- bat: round furry body, big ears + fangs, membrane wings ----
+    private void Bat(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.85f, 1.15f); s *= v;
+        _body = Pivot(this, Vector3.Zero);
+        _bodyBaseY = 0f;
+        Part(_body, Sph(s * 0.45f), body, Vector3.Zero, Vector3.Zero, new Vector3(1, 1.1f, 1));   // furry body
+        var head = Part(_body, Sph(s * 0.3f), body, new Vector3(0, s * 0.35f, s * 0.1f), Vector3.Zero, Vector3.One);
+        Part(head, Cone(s * 0.12f, s * 0.5f), body, new Vector3(s * 0.15f, s * 0.3f, 0), new Vector3(-10, 0, 10), Vector3.One);   // ears
+        Part(head, Cone(s * 0.12f, s * 0.5f), body, new Vector3(-s * 0.15f, s * 0.3f, 0), new Vector3(-10, 0, -10), Vector3.One);
+        Part(head, Sph(s * 0.07f), accent, new Vector3(s * 0.12f, s * 0.02f, s * 0.24f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.07f), accent, new Vector3(-s * 0.12f, s * 0.02f, s * 0.24f), Vector3.Zero, Vector3.One);
+        Part(head, Cone(s * 0.03f, s * 0.1f), accent, new Vector3(s * 0.06f, -s * 0.16f, s * 0.22f), new Vector3(180, 0, 0), Vector3.One);   // fangs
+        Part(head, Cone(s * 0.03f, s * 0.1f), accent, new Vector3(-s * 0.06f, -s * 0.16f, s * 0.22f), new Vector3(180, 0, 0), Vector3.One);
+        for (int i = 0; i < 2; i++)
+        {
+            float sx = i == 0 ? 1 : -1;
+            var w = Pivot(_body, new Vector3(sx * s * 0.3f, s * 0.1f, 0));
+            Part(w, Box(s * 1.6f, s * 0.04f, s * 0.9f), limb, new Vector3(sx * s * 0.8f, 0, -s * 0.1f), Vector3.Zero, Vector3.One);
+            _wings.Add(w);
+        }
+        for (int i = 0; i < 2; i++) { float sx = i == 0 ? 1 : -1; Part(_body, Cyl(s * 0.04f, s * 0.25f), limb, new Vector3(sx * s * 0.12f, -s * 0.4f, 0), Vector3.Zero, Vector3.One); }
+    }
+
+    // ---- snake: a chain of tapering segments low to the ground; forked tongue; SLITHERS via a travelling yaw wave ----
+    private void Snake(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.9f, 1.2f); s *= v;
+        _bodyBaseY = s * 0.3f;
+        Node3D prev = this;
+        int segs = 7; float segLen = s * 0.55f, r = s * 0.32f;
+        for (int i = 0; i < segs; i++)
+        {
+            var seg = Pivot(prev, i == 0 ? new Vector3(0, s * 0.3f, s * 0.2f) : new Vector3(0, 0, -segLen));
+            float rr = r * (1f - i * 0.09f);
+            // a smooth capsule per segment (overlapping caps fill the joints) → a continuous body, not caterpillar beads
+            Part(seg, new CapsuleMesh { Radius = rr, Height = segLen + rr * 2.1f, RadialSegments = 12, Rings = 5 }, body, new Vector3(0, 0, -segLen * 0.5f), new Vector3(90, 0, 0), Vector3.One);
+            _hips.Add(seg); _knees.Add(null); _hipBase.Add(Vector3.Zero); _kneeBase.Add(Vector3.Zero);
+            if (i == 0) _body = seg;
+            prev = seg;
+        }
+        var head = _body;
+        Part(head, Sph(s * 0.36f), body, new Vector3(0, 0, s * 0.15f), Vector3.Zero, new Vector3(1.2f, 0.85f, 1.2f));
+        Part(head, Sph(s * 0.07f), accent, new Vector3(s * 0.14f, s * 0.12f, s * 0.28f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.07f), accent, new Vector3(-s * 0.14f, s * 0.12f, s * 0.28f), Vector3.Zero, Vector3.One);
+        Part(head, Box(s * 0.03f, s * 0.03f, s * 0.4f), accent, new Vector3(0, -s * 0.02f, s * 0.5f), Vector3.Zero, Vector3.One);   // forked tongue
+        Part(head, Box(s * 0.03f, s * 0.03f, s * 0.15f), accent, new Vector3(s * 0.05f, -s * 0.02f, s * 0.68f), new Vector3(0, 20, 0), Vector3.One);
+        Part(head, Box(s * 0.03f, s * 0.03f, s * 0.15f), accent, new Vector3(-s * 0.05f, -s * 0.02f, s * 0.68f), new Vector3(0, -20, 0), Vector3.One);
+    }
+
+    // ---- crocodile humanoid: bipedal, LONG SNOUT with teeth, back scutes, thick tapering tail ----
+    private void Crocodile(float s, Material body, Material limb, Material accent)
+    {
+        float v = R(0.9f, 1.12f);
+        float gh = s * 1.15f * v;
+        _body = Pivot(this, new Vector3(0, gh, 0));
+        _bodyBaseY = gh;
+        float bw = s * 1.1f * v;
+        Part(_body, Box(bw, gh, bw * 0.8f), body, Vector3.Zero, new Vector3(R(4, 10), 0, 0), Vector3.One);                     // torso
+        Part(_body, Box(bw * 1.15f, gh * 0.35f, bw * 0.55f), limb, new Vector3(0, gh * 0.42f, -s * 0.05f), Vector3.Zero, Vector3.One);   // shoulders
+        Part(_body, Box(bw * 0.7f, gh * 0.5f, bw * 0.45f), accent, new Vector3(0, gh * 0.05f, s * 0.42f), Vector3.Zero, Vector3.One);    // pale belly plate
+        for (int sp = 0; sp < 5; sp++)   // ridged back scutes
+            Part(_body, Cone(s * 0.14f, s * 0.28f), accent, new Vector3(0, gh * (0.0f + sp * 0.14f), -bw * 0.42f), new Vector3(-110, 0, 0), Vector3.One);
+
+        // flat wide head + a LONG SNOUT jutting forward, upper + lower jaw with teeth, bulging eyes on top
+        var head = Part(_body, Box(s * 0.5f, s * 0.32f, s * 0.5f), body, new Vector3(0, gh * 0.5f, s * 0.2f), Vector3.Zero, Vector3.One);
+        Part(head, Box(s * 0.4f, s * 0.2f, s * 1.15f), body, new Vector3(0, s * 0.06f, s * 0.72f), Vector3.Zero, Vector3.One);          // upper snout
+        Part(head, Box(s * 0.36f, s * 0.14f, s * 1.05f), limb, new Vector3(0, -s * 0.14f, s * 0.68f), Vector3.Zero, Vector3.One);       // lower jaw
+        Part(head, Sph(s * 0.13f), accent, new Vector3(s * 0.18f, s * 0.24f, s * 0.1f), Vector3.Zero, Vector3.One);                     // eye
+        Part(head, Sph(s * 0.13f), accent, new Vector3(-s * 0.18f, s * 0.24f, s * 0.1f), Vector3.Zero, Vector3.One);
+        Part(head, Sph(s * 0.06f), limb, new Vector3(s * 0.18f, s * 0.28f, s * 0.12f), Vector3.Zero, Vector3.One);                      // pupils
+        Part(head, Sph(s * 0.06f), limb, new Vector3(-s * 0.18f, s * 0.28f, s * 0.12f), Vector3.Zero, Vector3.One);
+        for (int t = 0; t < 5; t++)   // teeth along the snout
+        {
+            float tz = s * (0.3f + t * 0.17f);
+            Part(head, Cone(s * 0.05f, s * 0.15f), accent, new Vector3(s * 0.17f, -s * 0.02f, tz), new Vector3(180, 0, 0), Vector3.One);
+            Part(head, Cone(s * 0.05f, s * 0.15f), accent, new Vector3(-s * 0.17f, -s * 0.02f, tz), new Vector3(180, 0, 0), Vector3.One);
+        }
+        Part(head, Sph(s * 0.06f), limb, new Vector3(s * 0.09f, s * 0.14f, s * 1.24f), Vector3.Zero, Vector3.One);                      // nostrils
+        Part(head, Sph(s * 0.06f), limb, new Vector3(-s * 0.09f, s * 0.14f, s * 1.24f), Vector3.Zero, Vector3.One);
+
+        // thick tapering tail sweeping back and down
+        var tail = Pivot(_body, new Vector3(0, -gh * 0.15f, -bw * 0.5f));
+        float seg = s * 0.42f;
+        for (int t = 0; t < 4; t++)
+            Part(tail, Box(s * (0.42f - t * 0.08f), s * (0.36f - t * 0.07f), seg), body, new Vector3(0, -t * s * 0.1f, -seg * 0.5f - t * seg * 0.55f), new Vector3(t * 7f, 0, 0), Vector3.One);
+
+        // bipedal legs + short clawed arms
+        float legLen = gh * 0.4f, armLen = gh * 0.45f;
+        for (int i = 0; i < 2; i++)
+        {
+            float sx = i == 0 ? 1 : -1;
+            var hip = Pivot(this, new Vector3(sx * bw * 0.3f, gh * 0.3f, 0));
+            Part(hip, Cyl(s * 0.24f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            var knee = Pivot(hip, new Vector3(0, -legLen, 0));
+            Part(knee, Cyl(s * 0.2f, legLen), limb, new Vector3(0, -legLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(knee, Box(s * 0.42f, s * 0.16f, s * 0.65f), limb, new Vector3(0, -legLen, s * 0.16f), Vector3.Zero, Vector3.One);
+            _hips.Add(hip); _knees.Add(knee); _hipBase.Add(Vector3.Zero); _kneeBase.Add(Vector3.Zero);
+
+            var arm = Pivot(_body, new Vector3(sx * bw * 0.55f, gh * 0.38f, 0));
+            Part(arm, Cyl(s * 0.18f, armLen), limb, new Vector3(0, -armLen / 2f, 0), Vector3.Zero, Vector3.One);
+            Part(arm, Sph(s * 0.22f), limb, new Vector3(0, -armLen, 0), Vector3.Zero, Vector3.One);
+            _arms.Add(arm);
         }
     }
 
@@ -380,16 +615,20 @@ public partial class Creature : Node3D
 
     public void Animate(float dt, float move)
     {
+        if (AnimSuspended) return;   // (PERF) invisible foe (far + outside the frustum) → freeze the pose, skip all the per-part transform writes
         move = Mathf.Clamp(move, 0f, 1f);
         switch (_kind)
         {
             case CreatureKind.Goblin:
             case CreatureKind.Bomber:
             case CreatureKind.Orc:
+            case CreatureKind.Crocodile:
+            case CreatureKind.Troll:
+            case CreatureKind.Pigmy:
                 {
-                    float spd = _kind == CreatureKind.Orc ? 3f : (_kind == CreatureKind.Bomber ? 6f : 4.5f);
+                    float spd = (_kind == CreatureKind.Orc || _kind == CreatureKind.Troll) ? 3f : (_kind == CreatureKind.Bomber || _kind == CreatureKind.Pigmy ? 6f : 4.5f);
                     _phase += dt * (1.5f + move * spd);
-                    float sw = (8f + move * (_kind == CreatureKind.Orc ? 30f : 40f));
+                    float sw = (8f + move * ((_kind == CreatureKind.Orc || _kind == CreatureKind.Troll) ? 30f : 40f));
                     for (int i = 0; i < _hips.Count; i++)
                     {
                         float a = Mathf.Sin(_phase + i * Mathf.Pi);
@@ -531,6 +770,33 @@ public partial class Creature : Node3D
                         _hips[i].RotationDegrees = new Vector3(Mathf.Sin(_phase + i) * 6f, b.Y, b.Z + Mathf.Sin(_phase + i) * 4f);
                     }
                     if (_body != null) _body.Position = new Vector3(0, Mathf.Sin(_phase * 0.7f) * _scale * 0.12f, 0);
+                }
+                break;
+
+            case CreatureKind.Pterodactyl:
+            case CreatureKind.Bat:
+                {
+                    _cast = Mathf.MoveToward(_cast, _castTarget, dt * 3f);
+                    bool charging = _kind == CreatureKind.Pterodactyl && _cast > 0.02f;   // ptero winding up its stun bolt
+                    _wing += dt * (_kind == CreatureKind.Bat ? 22f : 13f) * (charging ? 2.4f : 1f);   // beat frantically while charging
+                    float flap = Mathf.Sin(_wing) * (_kind == CreatureKind.Bat ? 46f : 40f);
+                    for (int i = 0; i < _wings.Count; i++)
+                        _wings[i].RotationDegrees = new Vector3(0, 0, (i == 0 ? 1 : -1) * (flap + (charging ? 35f * _cast : 0f)));   // wings sweep UP as it winds up
+                    _phase += dt * 2f;
+                    if (_body != null)
+                    {
+                        _body.RotationDegrees = new Vector3(charging ? -50f * _cast : 0f, 0f, 0f);                                   // rear back to cast — clear tell
+                        _body.Position = new Vector3(0, Mathf.Sin(_phase) * _scale * 0.1f + (charging ? _cast * _scale * 0.35f : 0f), 0);   // rise as it charges
+                        _body.Scale = Vector3.One * (charging ? 1f + Mathf.Sin(_phase * 11f) * 0.07f * _cast : 1f);                  // electric shudder
+                    }
+                }
+                break;
+
+            case CreatureKind.Snake:
+                {
+                    _phase += dt * (2f + move * 6f);
+                    for (int i = 0; i < _hips.Count; i++)   // a travelling S-wave yaws each segment → slither
+                        _hips[i].RotationDegrees = new Vector3(0, Mathf.Sin(_phase - i * 0.8f) * (7f + move * 15f), 0);
                 }
                 break;
         }

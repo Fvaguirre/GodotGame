@@ -7,44 +7,51 @@ public partial class CharSelect : Control
 {
     private struct W
     {
-        public string Name; public DamageType Elem; public string Role, Desc; public string[] Passives; public int Power, Resil, Mobi;
+        public string Name; public DamageType Elem; public string Role, Desc;
+        public string[] Passives;
+        public int Dmg, Move, Resil, Sustain;      // the four honest axes (1-5)
+        public int Hp; public float Speed, Resist, DmgMul;   // real numbers, shown as chips
     }
 
-    // roster order matches ConfigureWitch indices 0..6
+    // roster order matches ConfigureWitch indices 0..8; numbers match the per-witch stat spread
     private static readonly W[] Witches =
     {
-        new W { Name = "The Lunar Witch", Elem = DamageType.Lunar, Role = "Versatile",
-                Desc = "The moon's chosen. Balanced lunar bolts and orbiting crescent blades — and she waxes ever stronger beneath the night sky.",
-                Passives = new[]{ "Nightfall — grows stronger at night", "Orbiting crescent blades", "Well-rounded offense and defense" },
-                Power = 3, Resil = 4, Mobi = 3 },
-        new W { Name = "The Divine Witch", Elem = DamageType.Holy, Role = "Support",
-                Desc = "A radiant healer-warrior. She sears foes with a sweeping ray of holy light and drags her allies back from the brink of death.",
-                Passives = new[]{ "Divine Intervention — cheat death once", "Sweeping holy ray", "Blesses and mends nearby allies" },
-                Power = 2, Resil = 3, Mobi = 3 },
+        new W { Name = "The Lunar Witch", Elem = DamageType.Lunar, Role = "Moon-tank Caster",
+                Desc = "The moon's chosen — a near-unkillable moonlit duelist. She brands the field with lunar power day and night, out-lasting every foe behind the coven's toughest hide.",
+                Passives = new[]{ "Moonlight — innate +Lunar damage, day AND night (doubled at night)", "Moon-tank — the coven's highest resistance & second-highest HP", "Crescent blades & a night-charged ultimate" },
+                Dmg = 3, Move = 2, Resil = 5, Sustain = 2, Hp = 125, Speed = 8.4f, Resist = 0.24f, DmgMul = 1.00f },
+        new W { Name = "The Divine Witch", Elem = DamageType.Holy, Role = "Support Battlemage",
+                Desc = "A radiant healer-warrior. Her sweeping holy ray blesses allies and Radiantly Smites the nearest foes; when a warden falls, she drags them back from death.",
+                Passives = new[]{ "Divine Intervention — cheat death, again and again", "Radiant Smite — a full charge chains a pillar to two foes & mends you", "Blesses & heals nearby allies" },
+                Dmg = 2, Move = 2, Resil = 4, Sustain = 5, Hp = 120, Speed = 9.0f, Resist = 0.13f, DmgMul = 0.90f },
         new W { Name = "The Crimson Witch", Elem = DamageType.Blood, Role = "Glass Cannon",
-                Desc = "A ravenous glass cannon. She trades all her armor for raw, savage power, sustained only by draining the blood of the slain.",
-                Passives = new[]{ "Bloodthirst — lifesteal aura", "Highest raw damage of the coven", "Perilously fragile — minimal armor" },
-                Power = 5, Resil = 1, Mobi = 3 },
-        new W { Name = "The Verdant Witch", Elem = DamageType.Nature, Role = "Summoner",
-                Desc = "Warden of the Grove. Her true power is her forest — towering tree-ents and creeping poison do the fighting for her.",
-                Passives = new[]{ "The Grove — summons tree-ents", "Creeping poison damage-over-time", "Durable, but low personal damage" },
-                Power = 2, Resil = 4, Mobi = 3 },
-        new W { Name = "The Gale Witch", Elem = DamageType.Wind, Role = "Skirmisher",
-                Desc = "A tempest on foot. Swiftest of the coven, she hurls foes aside with gusts and spinning cyclones — and grows deadlier the moment her feet leave the ground.",
-                Passives = new[]{ "Tailwind — faster, with an extra dash", "Jetstream — bonus damage while airborne", "Knockback gusts and cyclones" },
-                Power = 3, Resil = 2, Mobi = 5 },
-        new W { Name = "The Frost Witch", Elem = DamageType.Frost, Role = "Sniper",
-                Desc = "A patient long-range sniper. Her beam locks foes in solid ice; a charged icicle spear then shatters them for a devastating burst.",
-                Passives = new[]{ "Freeze — the beam encases foes in ice", "Shatter — a charged spear detonates them", "Fragile and slow — keep your distance" },
-                Power = 3, Resil = 2, Mobi = 2 },
-        new W { Name = "The Forsaken Witch", Elem = DamageType.Curse, Role = "Controller",
-                Desc = "A cursed puppeteer. Her lock-on beam tethers foes into groups that share every wound — melt one and you melt the whole pack.",
-                Passives = new[]{ "Curse tethers — foes share damage", "Voodoo Crush — detonate stacked curses", "Low direct damage, immense control" },
-                Power = 2, Resil = 3, Mobi = 3 },
-        new W { Name = "The Ember Witch", Elem = DamageType.Ember, Role = "Pyromancer",
-                Desc = "A gleeful arsonist. Her flamethrower coats foes in burn; enough stacks turn them into a Living Bomb that erupts — again on death, chaining fire through the horde.",
-                Passives = new[]{ "Flamethrower — stacking burn (faster with cast speed)", "Living Bomb — foes detonate at max burn & on death", "Meteor — an aimed sky-strike that seeds burn" },
-                Power = 3, Resil = 2, Mobi = 3 },
+                Desc = "A ravenous glass cannon — the coven's highest raw damage, paid for in armor. She lives by draining the blood of the slain, and hits harder the closer she is to death.",
+                Passives = new[]{ "Sanguine Thirst — a real lifesteal aura, plus heals on every kill", "Highest raw damage of the coven", "Perilously fragile — the lowest armor of the nine" },
+                Dmg = 5, Move = 4, Resil = 1, Sustain = 3, Hp = 95, Speed = 9.6f, Resist = 0.08f, DmgMul = 1.18f },
+        new W { Name = "The Verdant Witch", Elem = DamageType.Nature, Role = "Durable Summoner",
+                Desc = "Warden of the Grove and the coven's stoutest wall. Her forest fights for her — tree-ents trickle up on their own and creeping poison melts the horde.",
+                Passives = new[]{ "Living Grove — auto-summons tree-ents (a slow trickle even without combo)", "Walking fortress — the coven's highest HP", "Creeping poison damage-over-time" },
+                Dmg = 2, Move = 2, Resil = 5, Sustain = 3, Hp = 135, Speed = 8.3f, Resist = 0.20f, DmgMul = 0.90f },
+        new W { Name = "The Gale Witch", Elem = DamageType.Wind, Role = "Mobility Skirmisher",
+                Desc = "A tempest on foot — swiftest of the coven, with an extra jump and dash. She hurls foes aside with gusts and grows deadlier the moment her feet leave the ground.",
+                Passives = new[]{ "Tailwind — fastest, +1 dash, +1 jump, a guard window after each dash", "Airborne bonus damage", "Knockback gusts & cyclones" },
+                Dmg = 3, Move = 5, Resil = 2, Sustain = 2, Hp = 95, Speed = 10.1f, Resist = 0.12f, DmgMul = 0.98f },
+        new W { Name = "The Frost Witch", Elem = DamageType.Frost, Role = "Immovable Sniper",
+                Desc = "A patient siege-sniper. Her beam locks foes in ice, a charged spear shatters them — and anything that reaches her leaves chilled to the bone.",
+                Passives = new[]{ "Frost Armor — attackers who close on her are chilled & slowed", "Freeze → Shatter — a charged spear detonates the frozen", "Slowest of the coven, but hard to reach" },
+                Dmg = 4, Move = 1, Resil = 3, Sustain = 1, Hp = 105, Speed = 8.0f, Resist = 0.14f, DmgMul = 0.95f },
+        new W { Name = "The Forsaken Witch", Elem = DamageType.Curse, Role = "Wraith Controller",
+                Desc = "A cursed puppeteer. Her lock-on beam tethers foes into groups that share every wound — and cursed foes bleed their life straight back into her.",
+                Passives = new[]{ "Soul Siphon — cursed foes passively bleed life back to her", "Curse tethers — bound foes share all damage", "A creeping wraith — control over raw power" },
+                Dmg = 3, Move = 2, Resil = 3, Sustain = 4, Hp = 105, Speed = 8.8f, Resist = 0.15f, DmgMul = 0.88f },
+        new W { Name = "The Ember Witch", Elem = DamageType.Ember, Role = "Mobile Arsonist",
+                Desc = "A gleeful arsonist wreathed in her own fire. Her flames stack into Living Bombs that erupt and chain through the horde — and the blaze mends her as it burns.",
+                Passives = new[]{ "Cinder Skin — retaliatory heat singes attackers; her burns mend her", "Living Bomb — foes detonate at max burn & on death, chaining fire", "Innate burn power — no longer reliant on cards" },
+                Dmg = 4, Move = 3, Resil = 2, Sustain = 2, Hp = 100, Speed = 9.2f, Resist = 0.12f, DmgMul = 0.92f },
+        new W { Name = "The Arcane Witch", Elem = DamageType.Arcane, Role = "Precision Battlemage",
+                Desc = "She channels raw arcane — a homing-missile marksman who brands foes into Conduits, then chains plasma through them all at once, healing off every crit.",
+                Passives = new[]{ "Arcane Feedback — crits heal her; her missiles shoot down incoming bolts", "Conduits & Chain Lightning — marks that a charged bolt arcs through", "Crits on Conduits land twice as often" },
+                Dmg = 3, Move = 3, Resil = 3, Sustain = 4, Hp = 105, Speed = 9.0f, Resist = 0.14f, DmgMul = 0.95f },
     };
 
     private static readonly Color Ink = new Color(0.93f, 0.88f, 0.72f);
@@ -54,18 +61,18 @@ public partial class CharSelect : Control
     private bool _confirmed = false;
     private VBoxContainer _detail;
     private Button[] _rows;
-    private Button _confirm;
+    private Button _confirm, _back;
     private Label _waiting;
 
     public override void _Ready()
     {
-        SetAnchorsPreset(LayoutPreset.FullRect);
+        SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
         MouseFilter = MouseFilterEnum.Stop;
         var bg = new ColorRect { Color = new Color(0.03f, 0.028f, 0.055f, 1f) };
-        bg.SetAnchorsPreset(LayoutPreset.FullRect); AddChild(bg);
+        bg.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect); AddChild(bg);
 
         var outer = new MarginContainer();
-        outer.SetAnchorsPreset(LayoutPreset.FullRect);
+        outer.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
         outer.AddThemeConstantOverride("margin_left", 48); outer.AddThemeConstantOverride("margin_right", 48);
         outer.AddThemeConstantOverride("margin_top", 30); outer.AddThemeConstantOverride("margin_bottom", 26);
         AddChild(outer);
@@ -119,14 +126,26 @@ public partial class CharSelect : Control
         _detail.AddThemeConstantOverride("separation", 13);
         dmargin.AddChild(_detail);
 
-        // bottom: confirm + waiting
+        // bottom: back + confirm + waiting
         var confirmCenter = new CenterContainer();
         confirmCenter.SizeFlagsHorizontal = SizeFlags.ExpandFill;
         root.AddChild(confirmCenter);
+        var btnRow = new HBoxContainer();
+        btnRow.AddThemeConstantOverride("separation", 14);
+        confirmCenter.AddChild(btnRow);
+        _back = new Button { Text = "Back", CustomMinimumSize = new Vector2(150, 52) };
+        _back.AddThemeFontSizeOverride("font_size", 20);
+        _back.AddThemeColorOverride("font_color", Dim);
+        _back.AddThemeStyleboxOverride("normal", Box(new Color(0.11f, 0.10f, 0.17f, 0.95f), new Color(0.5f, 0.5f, 0.6f, 0.6f), 2, 12));
+        _back.AddThemeStyleboxOverride("hover", Box(new Color(0.18f, 0.16f, 0.24f, 1f), new Color(0.7f, 0.7f, 0.8f, 0.9f), 2, 12));
+        _back.AddThemeStyleboxOverride("pressed", Box(new Color(0.16f, 0.14f, 0.22f, 1f), new Color(0.7f, 0.7f, 0.8f, 1f), 2, 12));
+        _back.AddThemeStyleboxOverride("focus", new StyleBoxEmpty());
+        _back.Pressed += OnBack;
+        btnRow.AddChild(_back);
         _confirm = new Button { Text = "Confirm", CustomMinimumSize = new Vector2(320, 52) };
         _confirm.AddThemeFontSizeOverride("font_size", 22);
         _confirm.Pressed += OnConfirm;
-        confirmCenter.AddChild(_confirm);
+        btnRow.AddChild(_confirm);
 
         _waiting = new Label { Text = "", HorizontalAlignment = HorizontalAlignment.Center };
         _waiting.AddThemeFontSizeOverride("font_size", 16);
@@ -222,9 +241,27 @@ public partial class CharSelect : Control
             _detail.AddChild(prow);
         }
 
-        _detail.AddChild(StatBar("POWER", w.Power, col));
+        // real numbers, as chips
+        var stats = new HBoxContainer(); stats.AddThemeConstantOverride("separation", 8);
+        stats.AddChild(StatChip($"{w.Hp} HP", col));
+        stats.AddChild(StatChip($"{w.Speed:0.0} spd", col));
+        stats.AddChild(StatChip($"{Mathf.RoundToInt(w.Resist * 100)}% resist", col));
+        stats.AddChild(StatChip($"×{w.DmgMul:0.00} dmg", col));
+        _detail.AddChild(stats);
+
+        _detail.AddChild(StatBar("DAMAGE", w.Dmg, col));
+        _detail.AddChild(StatBar("MOVEMENT", w.Move, col));
         _detail.AddChild(StatBar("RESILIENCE", w.Resil, col));
-        _detail.AddChild(StatBar("MOBILITY", w.Mobi, col));
+        _detail.AddChild(StatBar("SUSTAIN", w.Sustain, col));
+    }
+
+    private Label StatChip(string text, Color col)
+    {
+        var l = new Label { Text = "  " + text + "  ", VerticalAlignment = VerticalAlignment.Center };
+        l.AddThemeFontSizeOverride("font_size", 13);
+        l.AddThemeColorOverride("font_color", Ink);
+        l.AddThemeStyleboxOverride("normal", Box(new Color(0.13f, 0.12f, 0.19f, 1f), new Color(col.R, col.G, col.B, 0.55f), 1, 8));
+        return l;
     }
 
     private HBoxContainer StatBar(string label, int filled, Color col)
@@ -250,6 +287,19 @@ public partial class CharSelect : Control
         _confirm.Disabled = true;
         _confirm.Text = "Locked In";
         Game.I.ConfirmWitch(_sel);
+    }
+
+    // leave char-select → main menu (also cancels a pending host/join). Works even after "Locked In" in co-op.
+    private void OnBack() => Game.I?.BackToLobbyFromSelect();
+
+    public override void _Input(InputEvent e)
+    {
+        if (!Visible) return;
+        if (e is InputEventKey k && k.Pressed && !k.Echo && k.Keycode == Key.Escape)
+        {
+            OnBack();
+            GetViewport().SetInputAsHandled();
+        }
     }
 
     public override void _Process(double delta)

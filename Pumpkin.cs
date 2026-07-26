@@ -8,14 +8,20 @@ public partial class Pumpkin : Node3D
 {
     private bool _smashed = false;
     public float Hp = 1f;   // (NEW) hidden health — any damage source that reaches this shatters it (world-damageable prop)
-    private float _size = 0.8f;
-    private MeshInstance3D _body, _stem;
-    private Color _col;
+    protected float _size = 0.8f;
+    protected MeshInstance3D _body, _stem;   // (protected so PepperBush can supply its own visual and still reuse Smash)
+    protected Color _col;
 
     public void Init(float size, bool lit, ulong seed)
     {
         _size = size;
         var rng = new RandomNumberGenerator(); rng.Seed = seed;
+        BuildVisual(lit, rng);
+    }
+
+    // Override to give a subclass (PepperBush) its own look. Set _col/_body(/_stem); the smash reuses them.
+    protected virtual void BuildVisual(bool lit, RandomNumberGenerator rng)
+    {
         _col = new Color(0.85f, 0.35f, 0.05f).Lerp(new Color(0.7f, 0.45f, 0.08f), rng.Randf());
 
         _body = new MeshInstance3D { Mesh = new SphereMesh { Radius = _size, Height = _size * 1.3f } };

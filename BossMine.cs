@@ -17,8 +17,9 @@ public partial class BossMine : Node3D
         float gy = Game.I != null ? Game.I.SurfaceHeight(pos, 1e9f) : pos.Y;
         GlobalPosition = new Vector3(pos.X, gy + 0.35f, pos.Z);
 
-        _body = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.5f, Height = 1f }, MaterialOverride = Game.ToonEmissive(new Color(0.55f, 0.62f, 0.24f), 1.3f, 0.05f) };
+        _body = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.42f, Height = 0.84f }, MaterialOverride = Game.ToonEmissive(new Color(0.5f, 0.56f, 0.22f), 0.9f, 0.05f) };
         AddChild(_body);
+        Game.AddSpikes(_body, Game.Emissive(new Color(0.82f, 0.88f, 0.34f), 1.3f), 0.42f, 0.32f, 9);   // (PHASE 3) spiked sea-mine casing
         _ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = radius * 0.9f, OuterRadius = radius }, MaterialOverride = Game.Emissive(new Color(1f, 0.16f, 0.1f), 2f) };
         _ring.Position = new Vector3(0, -0.3f, 0);
         AddChild(_ring);
@@ -29,7 +30,7 @@ public partial class BossMine : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta; _age += dt; if (_arm > 0f) _arm -= dt;
 
         bool bossAlive = false;

@@ -15,10 +15,15 @@ public partial class RemoteAvatar : Node3D
     public bool Downed = false;
     public int StunState = 0;   // (NEW) 0 none, 1 stunned by a mob, 2 grabbed by a Taker
     public float HpFrac = 1f, ManaFrac = 0f, ShieldFrac = 0f, Blessed = 0f;
+    public float Luck = 0f;   // (NEW) synced so the host can bias magnet drops by the best contributor's luck
     public int BloodStacks = 0, ArmorCount = 0, ArmorThorn = 0;
     public float Bark = 0f;
 
     private WitchModel _model;
+    private MenuBubble _menuBubble;   // (NEW) witchy rune bubble + meditation pose while this ally is in a menu
+    private bool _menuing = false;
+    private bool _eclipsed = false;   // (ECLIPSE MP) mirror of the ally's eclipse state → drives the black/white model recolour
+    private bool _specter = false;    // (REWORK) mirror of the ally's LifeCurse Specter state → violet projection recolour
     private MeshInstance3D _bubble, _thorns, _bloodMoon;
     private Node3D _gust;   // Stormform tell: wind rings swirling around this ally, shown to all (NEW)
     private StandardMaterial3D _bubbleMat;
@@ -29,13 +34,24 @@ public partial class RemoteAvatar : Node3D
     private Vector3 _prevPos;
     private float _speed01 = 0f;
 
-    public void SetVitals(float hp, float mana, float shield, float blessed, int blood, int armorPacked, int witch, float bark, float eclipse, float storm)
+    public void SetVitals(float hp, float mana, float shield, float blessed, int blood, int armorPacked, int witch, float bark, float eclipse, float storm, float luck)
     {
-        HpFrac = hp; ManaFrac = mana; ShieldFrac = shield; Blessed = blessed; BloodStacks = blood; Bark = bark;
+        HpFrac = hp; ManaFrac = mana; ShieldFrac = shield; Blessed = blessed; BloodStacks = blood; Bark = bark; Luck = luck;
         ArmorCount = armorPacked & 0xF; ArmorThorn = (armorPacked >> 4) & 0xF;
         StunState = (armorPacked >> 8) & 0x3;   // (NEW) 0 none, 1 stunned, 2 grabbed
+        bool menuing = ((armorPacked >> 10) & 0x1) != 0;   // (NEW) bit 10 = this ally is in a menu → bubble + meditation float
+        if (menuing != _menuing)
+        {
+            _menuing = menuing;
+            if (_menuBubble != null) _menuBubble.Visible = menuing;
+            _model?.Meditate(menuing);
+        }
+        bool specter = ((armorPacked >> 11) & 0x1) != 0;   // (REWORK) bit 11 = LifeCurse Specter → violet translucent projection
+        if (specter != _specter) { _specter = specter; _model?.SetSpectral(specter); }
         if (_thorns != null) _thorns.Visible = bark > 0f;
         if (_bloodMoon != null) _bloodMoon.Visible = eclipse > 0f;
+        bool eclipsed = eclipse > 0f;   // (ECLIPSE MP) recolour the ally's model black-with-white-outline while eclipsed
+        if (eclipsed != _eclipsed) { _eclipsed = eclipsed; _model?.SetEclipse(eclipsed); }
         if (_gust != null) _gust.Visible = storm > 0f;   // Stormform tell (NEW)
         if (_bubble != null)
         {
@@ -51,6 +67,8 @@ public partial class RemoteAvatar : Node3D
         if (witch != _witch) ApplyWitch(witch);
     }
     public Color WitchCol => _col;   // this ally's witch color (for the minimap dot)
+    public int Slot => _slot;        // team slot (nameplate = "Warden {slot+2}")
+    public int WitchIdx => _witch;   // which witch this ally is (used by the ult-cast overlay)
 
     public override void _Ready()
     {
@@ -153,6 +171,9 @@ public partial class RemoteAvatar : Node3D
         _tag.Position = new Vector3(0, 2.35f, 0);
         AddChild(_tag);
 
+        // (NEW) menu-immunity bubble — element-tinted rune sigil, hidden until this ally opens a menu (synced via vitals bit 10)
+        _menuBubble = new MenuBubble(); AddChild(_menuBubble); _menuBubble.Build(_col); _menuBubble.Visible = false;
+
         ApplyColor();
     }
 
@@ -164,6 +185,7 @@ public partial class RemoteAvatar : Node3D
         AddChild(_model);
         if (_silMat != null) Game.AddModelSilhouette(_model, _silMat);   // re-trace the x-ray ghost on the new model
         if (Downed) _model.Collapse(true);
+        if (_menuing) _model.Meditate(true);   // keep the meditation pose across a witch/model rebuild
     }
 
     public void SetTeamColor(int slot) { _slot = slot; if (_tag != null) _tag.Text = $"Warden {_slot + 2}"; }
@@ -182,6 +204,7 @@ public partial class RemoteAvatar : Node3D
     {
         if (_silMat != null && !Downed) { _silMat.AlbedoColor = new Color(_col.R, _col.G, _col.B, 0.42f); _silMat.Emission = _col; }
         if (_tag != null && !Downed) { _tag.Text = $"Warden {_slot + 2}"; _tag.Modulate = _col.Lerp(Colors.White, 0.35f); }
+        _menuBubble?.Retint(_col);
     }
 
     public void SetDowned(bool d)
@@ -199,6 +222,9 @@ public partial class RemoteAvatar : Node3D
             _tag.Modulate = d ? new Color(1f, 0.5f, 0.5f) : _col.Lerp(Colors.White, 0.35f);
         }
     }
+
+    // fire this ally's upper-body cast overlay (net-triggered when the remote player casts)
+    public void Cast() { if (!Downed) _model?.Cast(); }
 
     public void SetTarget(Vector3 pos, float yaw)
     {
@@ -225,6 +251,6 @@ public partial class RemoteAvatar : Node3D
             airborne = (GlobalPosition.Y - gy) > 0.35f;
         }
         if (_gust != null && _gust.Visible) _gust.RotateY(dt * 3f);   // Stormform: swirl the wind rings (NEW)
-        if (!Downed) _model?.Animate(dt, _speed01, airborne);
+        if (!Downed) _model?.Animate(dt, _speed01, airborne, mv);   // mv = world move dir → strafe clip when moving off-facing
     }
 }

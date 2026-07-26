@@ -25,12 +25,13 @@ public class RunStats
         5 => "Foes Shattered",    // Frost
         6 => "Foes Cursed",       // Forsaken
         7 => "Bombs Detonated",   // Ember
+        8 => "Foes Marked",       // Arcane
         _ => "Night Kills",       // Lunar
     };
     public string HighlightValue() => WitchIdx == 4 ? $"{Highlight:0}s" : $"{(int)Highlight}";
 
     public static string WitchName(int witch) => witch switch
     {
-        1 => "Divine", 2 => "Crimson", 3 => "Verdant", 4 => "Gale", 5 => "Frost", 6 => "Forsaken", 7 => "Ember", _ => "Lunar",
+        1 => "Divine", 2 => "Crimson", 3 => "Verdant", 4 => "Gale", 5 => "Frost", 6 => "Forsaken", 7 => "Ember", 8 => "Arcane", _ => "Lunar",
     };
 }

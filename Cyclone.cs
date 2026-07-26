@@ -19,36 +19,81 @@ public partial class Cyclone : Node3D
     private float _dmgT = 0f, _pullT = 0f;   // tick timers for grind damage + drag-in (NEW)
     private Node3D _spin;          // the rotating funnel visual
 
+    // (SHARED) a realistic-but-stylized tornado material — fbm noise scrolled UP + swirled AROUND the funnel, wispy alpha,
+    // fresnel edge glow. Reused for any tornado-adjacent effect. `speed` = how fast this layer whips.
+    private static Shader _tornadoShader;
+    public static ShaderMaterial TornadoMat(Color tint, float speed)
+    {
+        _tornadoShader ??= new Shader { Code = TornadoCode };
+        var m = new ShaderMaterial { Shader = _tornadoShader };
+        m.SetShaderParameter("spin", speed);
+        m.SetShaderParameter("tint", new Vector3(tint.R, tint.G, tint.B));
+        return m;
+    }
+    private const string TornadoCode = @"
+shader_type spatial;
+render_mode cull_disabled, unshaded, blend_add, depth_draw_never, shadows_disabled;
+uniform float spin = 1.0;
+uniform vec3 tint : source_color = vec3(0.6,0.85,1.0);
+float h(vec2 p){ return fract(sin(dot(p,vec2(41.3,289.1)))*43758.5453); }
+float vn(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);
+  return mix(mix(h(i),h(i+vec2(1,0)),f.x),mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x),f.y); }
+float fbm(vec2 p){ float v=0.0,a=0.5; for(int i=0;i<4;i++){ v+=a*vn(p); p=p*2.03+1.7; a*=0.5; } return v; }
+varying vec3 vn3; varying vec3 vv; varying vec2 uv;
+void vertex(){ uv=UV; vn3=NORMAL; vv=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz; }
+void fragment(){
+    float t=TIME;
+    float twist=(1.0-uv.y)*2.4;                                  // spins faster toward the throat
+    float ang=uv.x*7.0 + t*spin*(1.5+twist) + uv.y*3.5;
+    float rise=uv.y*5.0 - t*spin*1.7;
+    float d = fbm(vec2(ang,rise))*0.6 + fbm(vec2(ang*2.2+t*spin, rise*2.1 - t*spin*2.0))*0.4;
+    float prof = smoothstep(0.0,0.12,uv.y) * (1.0-smoothstep(0.7,1.0,uv.y));   // wispy at the very top
+    float a = smoothstep(0.42,0.95,d) * prof;
+    float fres = pow(1.0-abs(dot(normalize(vn3), normalize(vv-CAMERA_POSITION_WORLD))), 2.5);
+    vec3 col = tint*(0.5+d) + fres*mix(tint,vec3(1.0),0.4)*0.5;
+    ALBEDO = col; ALPHA = clamp(a,0.0,0.9);
+}
+";
+
     // funnel dimensions + spiraling debris, animated in _Process for a real vortex look (NEW)
     private float _topR, _baseR, _colH = 6.0f;
     private readonly List<MeshInstance3D> _debris = new();
     private readonly List<float> _dAng = new(), _dH = new(), _dRise = new(), _dSpin = new(), _dRadJit = new();
 
-    public void Init(Player caster, Vector3 pos, float radius, float dur, float dps, bool maelstrom, bool visualOnly, float pullMul = 1f, bool suppressVisual = false)
+    public void Init(Player caster, Vector3 pos, float radius, float dur, float dps, bool maelstrom, bool visualOnly, float pullMul = 1f, bool suppressVisual = false, bool eatsProjectiles = false)
     {
         _caster = caster; _radius = radius; _dur = dur; _dps = dps; _maelstrom = maelstrom; _visualOnly = visualOnly; _pullMul = pullMul;
         GlobalPosition = new Vector3(pos.X, 0f, pos.Z);
+        if (eatsProjectiles && !visualOnly) Game.I.RegisterWindRing(new Vector3(pos.X, 0f, pos.Z), radius, dur);   // (NEW) its swirling wall swallows enemy projectiles
 
         if (suppressVisual) return;   // (NEW) mechanics-only funnel (Implosion supplies its own WindOrb look) — no tornado meshes
 
         var col = DamageTypes.Col(DamageType.Wind);
         _topR = _radius * 0.95f; _baseR = _radius * 0.14f;
+        _colH = Mathf.Max(11f, _radius * 1.25f);   // (NEW) a towering funnel — scales tall with the (now much bigger) radius
 
         _spin = new Node3D();
         AddChild(_spin);
 
-        // --- translucent funnel body: a tall cone, narrow at the base and flaring toward the top -------------
-        var bodyMat = Game.ToonEmissive(col, 0.8f, 0.0f);
-        bodyMat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
-        bodyMat.AlbedoColor = new Color(col.R, col.G, col.B, 0.10f);
-        bodyMat.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        // --- funnel body: a tall cone with a PROCEDURAL TORNADO shader — swirling fbm noise scrolled up + around, wispy
+        //     alpha, fresnel-rimmed, so it reads as churning realistic-but-stylized wind (shared TornadoMat helper) -----
         var cone = new MeshInstance3D
         {
-            Mesh = new CylinderMesh { TopRadius = _topR * 1.05f, BottomRadius = _baseR, Height = _colH, RadialSegments = 28 },
-            MaterialOverride = bodyMat
+            Mesh = new CylinderMesh { TopRadius = _topR * 1.05f, BottomRadius = _baseR + 0.4f, Height = _colH, RadialSegments = 32, Rings = 14, CapTop = false, CapBottom = false },
+            MaterialOverride = TornadoMat(col, 1.4f),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
         };
         cone.Position = new Vector3(0, 0.3f + _colH * 0.5f, 0);
-        AddChild(cone);   // symmetric, so it doesn't need to spin
+        AddChild(cone);
+        // a faint inner darker core cone so the throat reads dense, not hollow
+        var core = new MeshInstance3D
+        {
+            Mesh = new CylinderMesh { TopRadius = _topR * 0.5f, BottomRadius = _baseR + 0.2f, Height = _colH * 0.9f, RadialSegments = 20, Rings = 10, CapTop = false, CapBottom = false },
+            MaterialOverride = TornadoMat(col.Lerp(new Color(0.10f, 0.12f, 0.16f), 0.6f), 2.4f),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+        };
+        core.Position = new Vector3(0, 0.3f + _colH * 0.45f, 0);
+        AddChild(core);
 
         // --- helical palisade of thin vertical "wind sheets" wrapping the funnel; the spin sells the swirl ---
         var sheetMat = Game.ToonEmissive(col, 1.6f, 0.0f);
@@ -56,7 +101,7 @@ public partial class Cyclone : Node3D
         sheetMat.AlbedoColor = new Color(col.R, col.G, col.B, 0.26f);
         sheetMat.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
         sheetMat.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
-        int sheets = 26;
+        int sheets = 34;
         for (int i = 0; i < sheets; i++)
         {
             float t = i / (float)(sheets - 1);
@@ -81,18 +126,26 @@ public partial class Cyclone : Node3D
         dustMat.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
         var dust = new MeshInstance3D
         {
-            Mesh = new CylinderMesh { TopRadius = _topR * 0.85f, BottomRadius = _topR * 1.15f, Height = 0.5f, RadialSegments = 24 },
+            Mesh = new CylinderMesh { TopRadius = _topR * 0.85f, BottomRadius = _topR * 1.25f, Height = 0.5f, RadialSegments = 24 },
             MaterialOverride = dustMat
         };
         dust.Position = new Vector3(0, 0.28f, 0);
         _spin.AddChild(dust);
+        // a wide flat ring of kicked-up dust sweeping around the base (rides the spin)
+        var groundRing = new MeshInstance3D
+        {
+            Mesh = new TorusMesh { InnerRadius = _topR * 0.9f, OuterRadius = _topR * 1.5f, Rings = 24, RingSegments = 10 },
+            MaterialOverride = dustMat
+        };
+        groundRing.Position = new Vector3(0, 0.14f, 0);
+        _spin.AddChild(groundRing);
 
         // --- debris specks that spiral upward (animated by hand in _Process; the iconic tornado motion) ------
         var debrisMat = Game.ToonEmissive(col, 2.2f, 0.0f);
         debrisMat.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
         debrisMat.AlbedoColor = new Color(col.R, col.G, col.B, 0.75f);
         debrisMat.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
-        int deb = 18;
+        int deb = 28;
         for (int i = 0; i < deb; i++)
         {
             float sz = 0.12f + GD.Randf() * 0.12f;
@@ -106,7 +159,8 @@ public partial class Cyclone : Node3D
             _dRadJit.Add(0.82f + GD.Randf() * 0.3f);
         }
 
-        AddChild(new OmniLight3D { Position = new Vector3(0, 2.5f, 0), OmniRange = _radius * 1.6f, LightColor = col, LightEnergy = 1.8f });
+        AddChild(new OmniLight3D { Position = new Vector3(0, 2.5f, 0), OmniRange = _radius * 1.8f, LightColor = col, LightEnergy = 2.4f });
+        AddChild(new OmniLight3D { Position = new Vector3(0, _colH * 0.8f, 0), OmniRange = _radius * 1.4f, LightColor = col, LightEnergy = 1.8f });   // (NEW) a second light high up so the tall funnel glows top-to-bottom
 
         Scale = new Vector3(0.2f, 0.2f, 0.2f);
         var tw = CreateTween();
@@ -115,7 +169,7 @@ public partial class Cyclone : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused (NEW)
         float dt = (float)delta;
         _life += dt;
         if (_spin != null) _spin.RotateY(dt * 7f);   // fast swirl

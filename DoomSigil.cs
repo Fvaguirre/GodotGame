@@ -14,8 +14,9 @@ public partial class DoomSigil : Node3D
     private Node3D _rig;
     private OmniLight3D _light;
 
-    public void Init(Vector3 pos, float radius, float dmg, Color col, Player src)
-    { GlobalPosition = pos; _radius = radius; _dmg = dmg; _col = col; _src = src; Build(); }
+    public int Chain = 0;   // (OVERHAUL) Cataclysm Sigil: re-brand + re-detonate this many more generations
+    public void Init(Vector3 pos, float radius, float dmg, Color col, Player src, float fuse = 1.35f, int chain = 0)
+    { GlobalPosition = pos; _radius = radius; _dmg = dmg; _col = col; _src = src; _fuse = fuse; Chain = chain; Build(); }
     public void InitRemote(Vector3 pos, float radius, Color col)
     { Remote = true; GlobalPosition = pos; _radius = radius; _dmg = 0f; _col = col; Build(); }
 
@@ -44,7 +45,7 @@ public partial class DoomSigil : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta; _age += dt;
         if (!_blown)
         {
@@ -69,6 +70,17 @@ public partial class DoomSigil : Node3D
                     !Game.I.SightBlocked(GlobalPosition, e.GlobalPosition))
                     e.Hurt(_dmg, DamageType.Curse, true);
             Game.I.DamageWorld(GlobalPosition, _radius, _dmg);
+            if (Chain > 0)   // (OVERHAUL) Cataclysm Sigil: the blast re-brands the nearest survivor and re-detonates
+            {
+                Enemy tgt = null; float bd = 1e9f;
+                foreach (var e in Game.I.Enemies.ToArray())
+                    if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) { float d = new Vector2(e.GlobalPosition.X - GlobalPosition.X, e.GlobalPosition.Z - GlobalPosition.Z).Length(); if (d > _radius * 0.5f && d < _radius * 2.2f && d < bd) { bd = d; tgt = e; } }
+                if (tgt != null)
+                {
+                    var np = new Vector3(tgt.GlobalPosition.X, GlobalPosition.Y, tgt.GlobalPosition.Z);
+                    var child = new DoomSigil(); Game.I.AddChild(child); child.Init(np, _radius, _dmg, _col, _src, 0.9f, Chain - 1);
+                }
+            }
         }
         // boom: shockwave ring + rising doom pillars + light flash
         Game.I.VfxRing(GlobalPosition, _col, _radius * 1.5f, 0.5f);

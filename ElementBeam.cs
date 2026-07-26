@@ -38,7 +38,7 @@ public partial class ElementBeam : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;   // freeze while paused (NEW)
+        if (Game.I == null || !Game.I.SimActive) return;   // freeze while paused (NEW)
         float dt = (float)delta;
         _life -= dt;
         float t = Mathf.Clamp(_life / _max, 0, 1);

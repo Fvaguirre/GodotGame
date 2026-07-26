@@ -15,7 +15,7 @@ public class Stats
     public float Lifesteal = 0f;
     public float DmgResist = 0f;       // fraction of incoming damage ignored (0..~0.8)
     public float JumpMul = 1f;         // jump-height multiplier
-    public float PickupRange = 1.8f;   // (NEW) XP-orb collection radius — small by default; orbs persist until you're near or a magnet pulls them
+    public float PickupRange = 8.0f;   // (TUNE) XP-orb collection radius — generous base for every witch (was 1.8); Lodestone cards + magnets extend it further
 
     public float ComboPow = 0.03f;
     public int   ComboCap = 8;
@@ -26,7 +26,7 @@ public class Stats
     public float DashCd = 2.6f;
     public int   DashCharges = 1;
 
-    public float ManaMax = 3f;
+    public float ManaMax = 2f;   // (META) base 2 → 3 permanently via the gold meta-tree, → 5 in-run via Deep Reserve
     public float ManaGain = 0.2f;
 
     // crit (direct hits only — not DoTs, not AoE), spell sizing, and luck
@@ -45,8 +45,8 @@ public class Stats
     // resonance (lunar damage meter)
 
     // finishers / modifiers
-    public int   FinSlots = 3;
-    public int   ModSlots = 2;
+    public int   FinSlots = 2;   // (META) base 2 → 3 permanently via the gold meta-tree, → 5 in-run via Coven Bond
+    public int   ModSlots = 1;   // (META) base 1 → 2 permanently via the gold meta-tree, → 3 in-run via Coven's Reach
 
     // hex mark
     public int   MarkJumps = 1;

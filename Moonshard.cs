@@ -50,7 +50,7 @@ public partial class Moonshard : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta; _age += dt;
         if (!_impacted)
         {

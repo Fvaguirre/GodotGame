@@ -7,7 +7,7 @@ public enum RiteType { Ward, Summon, Cleanse }
 public partial class RitualCircle : Node3D
 {
     public RiteType Type;
-    public float Radius = 6f;
+    public float Radius = 12f;   // (NEW) doubled — each skybeam rite needs a bigger arena to fight/ward in
     public bool Active = false;
     public bool Done = false;
     public int NetId = 0;
@@ -78,7 +78,11 @@ public partial class RitualCircle : Node3D
     public override void _Process(double delta)
     {
         if (Done) return;
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive)
+        {
+            if (_wardSounding) { _wardSounding = false; Game.I?.Sfx?.WardChargeStop(); }   // (NEW) don't leave the drone humming through a pause / game-over
+            return;
+        }
         float dt = (float)delta;
 
         if (Remote)
@@ -86,11 +90,11 @@ public partial class RitualCircle : Node3D
             // client ghost: host owns charge/activation; just reflect synced status visually
             if (Active) { if (_decal != null) _decal.EmissionEnergy = 1.4f + Status * 2f; }
             else { if (_decal != null) _decal.EmissionEnergy = 1.2f + 0.6f * Mathf.Sin(Time.GetTicksMsec() * 0.004f); }
+            UpdateWardSound();   // (NEW) drone follows the synced fill for this client's player too
             return;
         }
 
-        _age += dt;
-        if (!Active && _age >= Lifespan) { Despawn(); return; }   // (NEW) only un-activated circles expire; once a rite begins it never times out from Lifespan
+        _age += dt;   // (NEW) NO expiry — rituals persist the whole time you're on a world; they clear only on complete/fail or when you leave for a new map
 
         int insideCount = Game.I.PlayersInRange(GlobalPosition, Radius);
         bool inside = insideCount > 0;
@@ -99,7 +103,7 @@ public partial class RitualCircle : Node3D
         {
             float pulse = 1.2f + 0.6f * Mathf.Sin(Time.GetTicksMsec() * 0.004f);
             if (_decal != null) _decal.EmissionEnergy = pulse;
-            if (inside) Activate();
+            // (NEW) no longer auto-starts on walk-in — the party must walk up + hold E (Game.TryActivateRitual); the pulse just invites them
             return;
         }
 
@@ -113,6 +117,7 @@ public partial class RitualCircle : Node3D
                 Charge = Mathf.Clamp(Charge, 0f, 1f);
                 Status = Charge;
                 if (_decal != null) _decal.EmissionEnergy = 1.4f + Charge * 2f;
+                UpdateWardSound();   // (NEW) charge drone rises with the fill while you stand in it
                 _spawnT -= dt;
                 if (_spawnT <= 0f) { for (int i = 0; i < wc; i++) Game.I.SpawnAdd(); _spawnT = 1.3f; }   // (NEW) bombardment scales with party (solo = 1 add/tick)
                 if (Charge >= 1f) Succeed();
@@ -135,8 +140,25 @@ public partial class RitualCircle : Node3D
         }
     }
 
-    private void Activate()
+    // (NEW) the warding drone — only the WARD rite is "stand in it to charge", so only it hums. Plays for the local player
+    // whenever they're inside (with a little grace past the rim); pitch/volume swell with the fill. Stops on leave/end.
+    private bool _wardSounding = false;
+    private void UpdateWardSound()
     {
+        var pl = Game.I?.Player;
+        bool play = Type == RiteType.Ward && Active && !Done && pl != null
+                    && new Vector2(GlobalPosition.X - pl.GlobalPosition.X, GlobalPosition.Z - pl.GlobalPosition.Z).Length() <= Radius * 1.25f;
+        if (play) { Game.I.Sfx?.WardCharge(Status); _wardSounding = true; }
+        else if (_wardSounding) { _wardSounding = false; Game.I?.Sfx?.WardChargeStop(); }
+    }
+    public override void _ExitTree() { if (_wardSounding) { _wardSounding = false; Game.I?.Sfx?.WardChargeStop(); } }
+
+    // (NEW) souls to begin, scaling with the wave it appears at — shown in the hold-E prompt; the ACTIVATOR pays (souls are per-player)
+    public int ActivationCost => 10 * Mathf.Max(1, Game.I != null ? Game.I.Wave : 1);
+    // begin the rite — host/solo authoritative. Payment is handled by the caller (Game.TryActivateRitual), since souls are per-player.
+    public void BeginRite()
+    {
+        if (Active || Done || Remote) return;
         Active = true;
         _age = 0f;   // (NEW) reset the expiry clock the moment the rite begins
         switch (Type)
@@ -185,15 +207,6 @@ public partial class RitualCircle : Node3D
         if (Done) return;
         Done = true;
         Game.I.Hud?.Banner("ritual skipped");
-        Game.I.RemoveRitual(this);
-        QueueFree();
-    }
-
-    private void Despawn()
-    {
-        if (Done) return;
-        Done = true;
-        if (!Active) Game.I.Hud?.Banner("the ritual fades\u2026");
         Game.I.RemoveRitual(this);
         QueueFree();
     }

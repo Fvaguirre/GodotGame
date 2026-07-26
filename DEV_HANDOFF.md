@@ -365,6 +365,57 @@ this Godot build (crashed even on 3-vertex triangles), so avoid it for HUD glyph
   outward/up fling, mass-scaled → higher rarity flings small foes skyward). Damage/burn route to host; both are MP-visible.
 - FIX: the Ember witch's `UpdateEmberCharge` full-charge release now calls `ApplyChargedMods` (it never did — she couldn't use ANY charged-mod before).
 
+## Levels / Biomes + hard scaling + portal (NEW, big)
+- **Hard ramp:** `Enemy.Configure` tail — `if (wave > 10)` compounds `MaxHp *= 1.062^(w-10)`, `Dmg *= 1.05^(w-10)`, `Speed +up to 50%`
+  for ALL foes + bosses. Elite chance also ramps post-10 (`Game.SpawnEnemy`, cap 0.6). Carries across levels because `Wave` keeps climbing.
+- **Biome/level:** `enum Biome { Grove, Rainforest }`; `Game.CurBiome` + `Game.LevelNum`. `World.BuildChunk` forks on
+  `Game.I.CurBiome == Rainforest` → jungle ground palette + jungle scatter (`JungleGrove/RiverBank/PepperPatch/VineGrove`) +
+  jungle props (`JungleTree/Monstera/Fern/VineTree`, `PepperBush.cs` (subclasses Pumpkin), `Firefly.cs` (clones Wisp)). Fog/env
+  greened in `ApplyDayNight` (`CurBiome` branch).
+- **Portal:** after each boss wave clears, `SpawnLevelPortal` (guard `_portalWave != Wave`). Interact (hold E in `UpdateInteract`)
+  → `AdvanceLevel` → `ApplyLevelAdvance` (LevelNum++, biome, new seed, `_world.Reseed`, reposition to origin, keep party/upgrades/
+  Wave/Heat, `ResetVendorCadence`). MP: `Net.BroadcastPortal`/`RequestAdvanceLevel`/`BroadcastLevelAdvance`.
+- **Vine launch:** `Game.Vines` (managed with chunks like Blockers via `_chunkVines`); `VineTree` registers a launch point; hold-E
+  in `UpdateInteract` → `Player.VineLaunch` (`_vy = 28`).
+- **Jungle enemies (Enemy.cs + RemoteEnemy.Types 21-27):** jtroll (melee, staggers on hit), pigmy (fast fodder), pigmydart
+  (ranged blowdart), ptero (EBehav.Zapper flying stun), bat (Diver), croc (new `EBehav.Lobber`→`MoveLobber`→`CrocBomb.cs` lobbed
+  timed bomb, VFX kind 76), snake (`MaxHp` forced to 1, roots on touch). Taker still special-spawns. Wave roster forks on biome in `NextWave`.
+- FOLLOW-UPS (not done): carved winding rivers (uses basin ponds + monstera banks), bespoke jungle ruins / tree-villages
+  (reuses generic Fort/Ruins), a dedicated jungle boss/miniboss (reuses the Grove's, which now scale via the hard ramp).
+
+## Arcane Witch (index 8, NEW) — burst-MARK → charged CHAIN-LIGHTNING through the marks — runtime-untested
+**Fantasy:** other witches wield a *refined* form of magic; she channels the raw source (jagged plasma). Registered everywhere
+(index-7 Ember checklist): `Player.ArcaneWitch`/`WitchIndex`(prepend `?8`)/`WitchDamage`(`8=>Arcane`), `Game.ConfigureWitch` case 8
+(`DamageMul 0.95`, `DmgResist 0.14`) + both flag-reset chains, `WitchModel.WitchColor`/hat, `CharSelect` roster, `RunStats`
+(`8=>"Foes Marked"`/`"Arcane"`), `PerkTree.WitchCount=9`+`_trees[8]`+`LaneNames`, `DevConsole` (`"arcane"`), `Hud.DrawEnemyBars` pip.
+**Ults STUBBED to Lunar defaults** (falls through `UltChoiceSet`). `DamageType.Arcane` = enum 1, purple.
+- **Primary — 3-round bolt burst (LEFT hand):** Combat `ArcaneWitch` branch (`_arcaneBurst`/`_arcaneBurstT`, 0.085s gap, `_fireCd=S.FireCd*1.7`).
+  `FireArcaneMissile` fires tight w/ aim-assist to `AimTarget()`, `Bolt.ArcaneBurst=true`, restores mana on hit (`normal:true`→`OnHitCore`).
+- **Mark:** `Player.OnHit`→`ArcaneStreakHit`; **3 consecutive same-foe hits** (within 1.2s) → `MarkArcane(e)`. Marks are a caster-side list
+  `_arcaneMarks` — **persistent, cap `ArcaneMaxMarks=4`, FIFO (oldest evicted → `SetArcaneMark(false)`), cleared on death** (`PruneArcaneMarks`).
+  `Enemy._arcaneMarked` bool (no timer); `ArcaneMarked` synced via **StatusMask bit 31** for the pip + client-caster chain targeting; client marks
+  route on/off via `ReportStatus`/`ReceiveStatus` **kind 8** (`a=1 on / 0 off`)→`SetArcaneMark`.
+- **Secondary — charged CHAIN-LIGHTNING (RIGHT hand):** charge-release → `FireArcaneChain(charge)`. Builds a greedy nearest-neighbor path
+  (`OrderedMarkChain`) her→through each live mark; per leg, foes within `DistPointToSeg ≤ radius+0.8` are pierced (normal dmg, base `RollCrit`);
+  each **marked endpoint** takes normal dmg at **2× crit chance** (two `RollCrit` rolls) + `OnHitDirect` (combo/ult/mana). **No marks → single
+  hitscan at `AimTarget()`** (no bounce; wall-stop via `BeamSurfaceHit`). `dmg = Base·1.4·chargeMul·Combo` (`chargeMul` = charged-bolt ramp).
+  **Mana −0.5/+1 on hit** (the `Combat` release sets `_chargedRefund`; `OnHitDirect` pays the +1 on the first connect; whiff clears the flag).
+  **Charged-mods** (`ApplyChargedMods`) fire once on the FIRST foe hit, full-charge only. Jagged VFX `Game.SpawnArcaneLightning(pts,charge)` +
+  per-leg `BroadcastVfx(78)` (`SpawnArcaneBeamSeg`) for allies.
+- **Loop:** burst a foe → 3-on-one marks it (up to 4) → charged RMB zigzags lightning through all marks, critting them 2× as often.
+- **MP:** damage host-authoritative via `Enemy.Hurt`→`ReportHit`; marks route via kind 8. **Runtime-untested** (compiles clean).
+- **Tuning knobs:** chain `Base·1.4`, mark cap 4/streak 3, in-between hit radius `+0.8`, 2× crit = two rolls, burst dmg `Base·0.5`/gap/recovery.
+  Note `Game.SpawnArcaneRupture` is now dead (kept, unused). Charged-mod full-charge gate is easy to loosen if she wants mods on any charge.
+
+## Gamepad support (Xbox) — NEW, runtime-untested
+Layered onto the SAME InputMap actions as keyboard/mouse, so **both input methods are always live**; a controller just works when plugged in (`Game.PadActive => Input.GetConnectedJoypads().Count>0`). Joypad events are added to the existing actions in `Game.SetupInput()` (movement=left stick, `cast`=LT, `charge`=RT, `jump`=A, `dash`+`descend`=B, `ult`=Y, `stats`=Back, `ultmenu`=L3, `release_mouse`=Start; trigger deadzone 0.5).
+- **Right-stick look**: `Player.UpdatePadLook(dt)` (called before the flight/ult early-returns so it works aloft) — radial deadzone `PadLookDead`, squared response curve, exponential smoothing. Sensitivity `Player.PadSensMul` (static), slider "Gamepad Look" in Lobby Sound tab, persisted as `options/padsens`.
+- **R3 = quick-turn 180°** (`_turn180`, snap-rotated in UpdatePadLook). **B while flying = descend** (dash is locked out mid-flight-ult, so no clash).
+- **Spell slots = hold LB + face button**, handled in `Player._Input` (InputEventJoypadButton, chord = `IsJoyButtonPressed(LeftShoulder)` + button): LB+X/Y/B/A/RB → `FireFinisher(0..4)`. Because A/B/Y also drive jump/dash/ult, those consumers are guarded by `!Game.PadSpellHeld()` (jump/dash/float in `Player._Process`, ult in `Game._Process`, interact-X in `Game.UpdateInteract`). `PadSpellHeld()` is LB-held.
+- **Menus**: `Game.UpdatePadCursor` drives a cursor **we own** (`_padCursor`, exposed as `Game.PadCursor`) — the left stick moves it (clamped), we `WarpMouse` the OS cursor to match, and it's drawn as a reticle by `PadCursor.cs` on a **CanvasLayer Layer 100** (above HUD layer 0 AND the lobby screens layer 50). We do NOT accumulate onto `GetMousePosition()` while steering: under **Parsec** the OS cursor is asserted remotely, so a read-back loop drifted off-screen. Idle → follow the real mouse (clamped) so a physical mouse still works. A = select / B = back via `Game.PadMenuButton`, which **mirrors the button's own down/up** into a left-click at `_padCursor` / an Escape (NOT a same-frame press+release — that misses polled `IsActionJustPressed` edges). Presses no-op during gameplay; releases always pass (so a click that enters gameplay still delivers its mouse-up → no stuck `cast`).
+- **Debug**: `Game.PadDebug` (F3) draws a live readout in `Hud.DrawPadDebug` (connected joypads, stick/trigger values, pressed buttons). Default off.
+- **NOT done / gaps**: no aim assist (deferred by request); Join-by-IP still needs a keyboard (no on-screen keypad); finisher rebinding (`BindKey`) is keyboard-only; no rumble; D-pad unbound. Controller detection + input **confirmed working through Parsec**; stick feel / chord timing still want a real-hardware pass.
+
 ## File map (the ones you'll touch most)
 
 - `Player.cs` — the witch: movement, cast pipeline, every witch's primary/secondary/ults/finishers/mods/minors,

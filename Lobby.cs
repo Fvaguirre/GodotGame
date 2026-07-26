@@ -14,15 +14,15 @@ public partial class Lobby : Control
 
     public override void _Ready()
     {
-        SetAnchorsPreset(LayoutPreset.FullRect);
+        SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);   // (FIX) offsets too, so it fills the viewport WITHOUT needing a resize event (broke on scene reload)
         MouseFilter = MouseFilterEnum.Stop;
 
         var bg = new ColorRect { Color = new Color(0.035f, 0.03f, 0.06f, 1f) };
-        bg.SetAnchorsPreset(LayoutPreset.FullRect);
+        bg.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
         AddChild(bg);
 
         var center = new CenterContainer();
-        center.SetAnchorsPreset(LayoutPreset.FullRect);
+        center.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
         AddChild(center);
 
         _main = Column(); center.AddChild(_main);
@@ -33,6 +33,15 @@ public partial class Lobby : Control
         BuildMultiplayer();
         BuildOptions();
         ShowPanel(0);
+    }
+
+    public override void _Process(double delta)
+    {
+        if (Visible)   // (FIX) re-assert full-viewport size — guards against layout-timing edges (scene reload had no resize to trigger it)
+        {
+            var vp = GetViewportRect().Size;
+            if ((Size - vp).LengthSquared() > 1f) SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
+        }
     }
 
     private static VBoxContainer Column()
@@ -164,6 +173,12 @@ public partial class Lobby : Control
         quality.Selected = g != null ? g.GfxQuality : 2;
         quality.ItemSelected += idx => { Game.I?.SetGfxQuality((int)idx); Game.I?.SaveGold(); SyncGraphicsChecks(); };
         v.AddChild(Row("Quality Preset", quality));
+        var shadows = new OptionButton();
+        shadows.AddItem("Low"); shadows.AddItem("Medium"); shadows.AddItem("High");
+        shadows.Selected = g != null ? g.ShadowQuality : 1;
+        shadows.ItemSelected += idx => { Game.I?.SetShadowQuality((int)idx); Game.I?.SaveGold(); };
+        _shadowOpt = shadows;
+        v.AddChild(Row("Shadows", shadows));
         _bloom = Check(g == null || g.GfxBloom, on => { if (Game.I != null) { Game.I.GfxBloom = on; Game.I.ApplyGraphics(); } });
         v.AddChild(Row("Bloom / Glow", _bloom));
         _ssao = Check(g == null || g.GfxSsao, on => { if (Game.I != null) { Game.I.GfxSsao = on; Game.I.ApplyGraphics(); } });
@@ -174,12 +189,14 @@ public partial class Lobby : Control
         return v.GetParent<Control>();
     }
     private CheckBox _bloom, _ssao, _ssil;
+    private OptionButton _shadowOpt;
     private void SyncGraphicsChecks()
     {
         var g = Game.I; if (g == null) return;
         if (_bloom != null) _bloom.SetPressedNoSignal(g.GfxBloom);
         if (_ssao != null) _ssao.SetPressedNoSignal(g.GfxSsao);
         if (_ssil != null) _ssil.SetPressedNoSignal(g.GfxSsil);
+        if (_shadowOpt != null) _shadowOpt.Selected = g.ShadowQuality;   // preset also sets shadows; keep the dropdown in sync
     }
 
     private Control BuildSoundTab()
@@ -192,6 +209,9 @@ public partial class Lobby : Control
         var sens = new HSlider { MinValue = 0, MaxValue = 1, Step = 0.02, Value = g != null ? g.SensSlider : 0.4, CustomMinimumSize = new Vector2(0, 24) };
         sens.ValueChanged += val => { Game.I?.SetSensitivity((float)val); Game.I?.SaveGold(); };
         v.AddChild(Row("Look Sensitivity", sens));
+        var padSens = new HSlider { MinValue = 0, MaxValue = 1, Step = 0.02, Value = g != null ? g.PadSensSlider : 0.4, CustomMinimumSize = new Vector2(0, 24) };
+        padSens.ValueChanged += val => { Game.I?.SetPadSensitivity((float)val); Game.I?.SaveGold(); };
+        v.AddChild(Row("Gamepad Look", padSens));
         return v.GetParent<Control>();
     }
 
@@ -211,9 +231,17 @@ public partial class Lobby : Control
         _res.ItemSelected += idx => { if (Game.I != null) { Game.I.ResIndex = (int)idx; Game.I.ApplyWindow(); Game.I.SaveGold(); } };
         v.AddChild(Row("Resolution", _res));
         v.AddChild(Row("V-Sync", Check(g == null || g.VSync, on => { if (Game.I != null) { Game.I.VSync = on; Game.I.ApplyWindow(); } })));
+        var view = new OptionButton();
+        view.AddItem("Low"); view.AddItem("Medium"); view.AddItem("High");
+        view.Selected = g != null ? g.ViewDist : 1;
+        view.ItemSelected += idx => { Game.I?.SetViewDist((int)idx); Game.I?.SaveGold(); };
+        v.AddChild(Row("Render Distance", view));
         return v.GetParent<Control>();
     }
     private OptionButton _res;
+
+    // reset to the MAIN panel — used when returning here from character-select
+    public void ShowMain() => ShowPanel(0);
 
     // ---- panel switching ---------------------------------------------------
     private void ShowPanel(int which)

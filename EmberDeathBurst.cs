@@ -16,7 +16,7 @@ public partial class EmberDeathBurst : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         _t -= (float)delta;
         if (_left > 0) { if (_t <= 0f) Detonate(); }
         else if (_t <= -0.4f) QueueFree();

@@ -11,6 +11,14 @@ public partial class ShopVendor : Node3D
     private float _bob;
     private Node3D _rig;
 
+    // Persisted inventory — this peddler rolls its stock ONCE (the first time it's opened) and keeps it, including which
+    // slots you've already bought, so leaving and re-opening the shop shows the SAME wares instead of a fresh reroll.
+    public bool OfferBuilt = false;
+    public readonly System.Collections.Generic.List<UpgradeCard> Cards = new();
+    public readonly System.Collections.Generic.List<int> Prices = new();
+    public readonly System.Collections.Generic.List<bool> Sold = new();
+    public readonly System.Collections.Generic.List<int> Section = new();
+
     public override void _Ready()
     {
         var gold = new Color(1f, 0.82f, 0.34f);

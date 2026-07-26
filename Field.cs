@@ -21,14 +21,22 @@ public partial class GroundField : Node3D
     public bool Beam = false;         // force the moonbeam shaft
     public DamageType DType = DamageType.Curse;
     public bool GrantsBlood = false;   // Crimson Pool: banks Blood Stacks for whoever stands in it
+    public float BloodBankMul = 1f;    // (OVERHAUL) Crimson Pool Deep Well: scales the blood-bank / heal rate
     public float SlowMul = 0f;         // >0 = slow enemies inside
+    public float Pull = 0f;            // (OVERHAUL) >0 = drag foes toward the field centre (Moonwell Lunar Tide)
+    public bool Follow = false;        // (OVERHAUL) true = the field trails the caster (Divine Mending Grove Wellspring)
+    public float DeathBurst = 0f;      // (OVERHAUL) >0 = foes dying inside erupt for this much (Consecrated Ground Sanctified)
+    public float Creep = 0f;           // (OVERHAUL) >0 = the field crawls toward the nearest foe (Creeping Blight Miasma)
     public float RotDps = 0f;          // >0 = apply spreading rot-bleed to enemies inside (Blood Rot)
+    public bool RotPersist = false;    // (Blood Rot mod) the rot DoT it applies never times out — bleeds until death
     public float PoisonAdd = 0f;       // >0 = stack additive Nature poison on foes standing inside (Creeping Blight)
     public float BurnAdd = 0f, BurnPer = 0f, BurnBomb = 0f;   // (NEW) >0 = stack Ember burn on foes inside (Meteor Descent inferno)
     public int BurnOwner = 0;          // (NEW) caster peer for the burn's lifesteal attribution
     private float _burnTick = 0f;
     public bool Remote = false;        // client visual copy
     public bool HealAllies = false;    // also heal nearby ally avatars over the network (rez beam)
+    public bool Cleanse = false;       // (LUNAR LIGHT) purge negative statuses off any player standing inside (each machine, its own player)
+    public bool SpeedBoost = false;    // (WIND RUSH) a wind area — any player standing inside gets ×3 move speed (each machine, its own player)
     private bool _announced = false;
     private float _bloodTick = 0f;
     private float _poiTick = 0f;
@@ -81,9 +89,20 @@ public partial class GroundField : Node3D
 
     public override void _Process(double delta)
     {
-        if (Game.I == null || Game.I.State != GameState.Playing) return;
+        if (Game.I == null || !Game.I.SimActive) return;
         float dt = (float)delta;
         _t += dt;
+
+        // (LUNAR LIGHT / WIND RUSH) these run on EVERY machine for ITS OWN local player (before the Remote-visual return)
+        if (Cleanse || SpeedBoost)
+        {
+            var lp = Game.I.Player;
+            if (lp != null && !lp.Downed && Flat(lp.GlobalPosition) < Radius)
+            {
+                if (Cleanse) lp.CleanseNegative();
+                if (SpeedBoost) lp.WindZoneT = 0.25f;   // refreshed while inside → ×3 speed; decays fast once you leave
+            }
+        }
 
         if (Remote)   // client copy: just the visual + lifetime
         {
@@ -100,6 +119,23 @@ public partial class GroundField : Node3D
             Game.I.NetMgr?.BroadcastField((int)Type, GlobalPosition, Radius, Dur, Beam, Tint, (int)DType);
         }
 
+        if (Follow && Src != null && GodotObject.IsInstanceValid(Src))   // (OVERHAUL) Wellspring: the grove trails the caster
+        {
+            var fp = Src.GlobalPosition;
+            GlobalPosition = new Vector3(fp.X, Game.I.SurfaceHeight(fp, GlobalPosition.Y) + 0.05f, fp.Z);
+        }
+        if (Creep > 0f)   // (OVERHAUL) Miasma: the blight crawls toward the nearest foe
+        {
+            Enemy near = null; float nd = 1e9f;
+            foreach (var e in Game.I.Enemies)
+                if (e != null && !e.Dead && GodotObject.IsInstanceValid(e)) { float dd = Flat(e.GlobalPosition); if (dd < nd) { nd = dd; near = e; } }
+            if (near != null && nd > 1f)
+            {
+                var to = near.GlobalPosition - GlobalPosition; to.Y = 0f;
+                if (to.LengthSquared() > 0.01f) { var np = GlobalPosition + to.Normalized() * Mathf.Min(Creep * dt, nd); GlobalPosition = new Vector3(np.X, Game.I.SurfaceHeight(np, GlobalPosition.Y) + 0.05f, np.Z); }
+            }
+        }
+
         if (Type == FieldType.Heal)
         {
             var p = Game.I.Player;
@@ -114,7 +150,7 @@ public partial class GroundField : Node3D
                 foreach (var e in Game.I.Enemies.ToArray())
                 {
                     if (e == null || e.Dead) continue;
-                    if (Flat(e.GlobalPosition) < Radius) { e.Hurt(EnemyDmg * dt, DType, FromCombo); if (FromCombo) Game.I.Player?.ComboFromDot(); }
+                    if (Flat(e.GlobalPosition) < Radius) { e.Hurt(EnemyDmg * dt, DType, FromCombo); if (FromCombo) Game.I.Player?.ComboFromDot(); if (DeathBurst > 0f && e.Dead) { var bp = e.GlobalPosition; Game.I.DamageWorld(bp, Radius * 0.5f, DeathBurst); foreach (var o in Game.I.Enemies.ToArray()) if (o != null && !o.Dead && new Vector2(o.GlobalPosition.X - bp.X, o.GlobalPosition.Z - bp.Z).Length() < Radius * 0.5f) o.Hurt(DeathBurst, DType, FromCombo); Game.I.VfxRing(bp, _baseCol, Radius * 0.5f, 0.35f); } }
                 }
                 Game.I.DamageWorld(GlobalPosition, Radius, EnemyDmg * dt);   // (NEW) fields break props too
             }
@@ -124,7 +160,7 @@ public partial class GroundField : Node3D
             foreach (var e in Game.I.Enemies.ToArray())
             {
                 if (e == null || e.Dead) continue;
-                if (Flat(e.GlobalPosition) < Radius) { e.Hurt(Power * dt, DType, FromCombo); if (FromCombo) Game.I.Player?.ComboFromDot(); if (SlowMul > 0f) e.Slow(0.6f, SlowMul); if (RotDps > 0f) e.Bleed(RotDps, 2.5f, true); }
+                if (Flat(e.GlobalPosition) < Radius) { e.Hurt(Power * dt, DType, FromCombo); if (FromCombo) Game.I.Player?.ComboFromDot(); if (SlowMul > 0f) e.Slow(0.6f, SlowMul); if (Pull > 0f) e.PullToward(GlobalPosition, Pull * dt); if (RotDps > 0f) e.Bleed(RotDps, 2.5f, true, 0, 1f, RotPersist); }
             }
             Game.I.DamageWorld(GlobalPosition, Radius, Power * dt);   // (NEW) damaging fields break props too
         }
@@ -136,8 +172,8 @@ public partial class GroundField : Node3D
             {
                 _bloodTick = 0f;
                 var pl = Game.I.Player;
-                if (pl != null && Flat(pl.GlobalPosition) < Radius) pl.BloodReward(1f);   // local player: Crimson banks a stack, others mend
-                Game.I.NetMgr?.BloodAlliesNear(GlobalPosition, Radius, 1f);                // (NEW) allies inside get it too — each translated to THEIR witch on their end
+                if (pl != null && Flat(pl.GlobalPosition) < Radius) pl.BloodReward(1f * BloodBankMul);   // local player: Crimson banks a stack, others mend
+                Game.I.NetMgr?.BloodAlliesNear(GlobalPosition, Radius, 1f * BloodBankMul);                // (NEW) allies inside get it too — each translated to THEIR witch on their end
             }
         }
 
