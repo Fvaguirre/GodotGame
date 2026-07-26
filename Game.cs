@@ -578,6 +578,7 @@ public partial class Game : Node3D
 
     public override void _Ready()
     {
+        CrashLogger.Install();   // global crash + main-thread-freeze diagnostics → user://crash.log + Output
         I = this;
         _rng.Randomize();
         EnemyBolt.Live = 0;
@@ -7345,6 +7346,7 @@ void fragment() {
 
     public override void _Process(double delta)
     {
+        CrashLogger.Beat("Game._Process");   // heartbeat — the watchdog flags a freeze if this stops
         float dt = (float)delta;
         if (SelectLock > 0f) SelectLock -= dt;
         UpdatePadCursor(dt);

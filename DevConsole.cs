@@ -308,6 +308,15 @@ public partial class DevConsole : CanvasLayer
                 Print(g.Player.ToggleThirdPersonPlay(d, ht, lat));
                 return;
             }
+            case "skindark": case "darkskin":
+            {
+                var g = Game.I; if (g == null || g.Player == null) { Print("no game."); return; }
+                float factor = parts.Length > 1 && float.TryParse(parts[1], out var ff) ? Mathf.Clamp(ff, 0.1f, 1f) : 0.6f;
+                string key = parts.Length > 2 ? parts[2] : WitchModel.KeyFor(g.Player.WitchIndex);
+                if (key == null) { Print("unknown witch."); return; }
+                Print(ModelAssets.BakeBodyDark(key, factor));
+                return;
+            }
             case "fp": case "firstperson":
             {
                 var g = Game.I; if (g == null || g.Player == null) { Print("no game."); return; }

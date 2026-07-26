@@ -810,6 +810,8 @@ public partial class Player : Node3D
             AddChild(_tp3Puppet);
             _tp3Puppet.Position = Vector3.Zero;
             _tp3Puppet.Rotation = new Vector3(0f, Mathf.Pi, 0f);   // mesh faces +Z → +Pi so she faces your aim (-Z), back to the cam
+            // Ground AFTER the AnimationTree ticks (the idle clip repositions her hips vs rest) — a few frames later, then plant.
+            GetTree().CreateTimer(0.15).Timeout += () => { if (GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.GroundAuthored(); };
             SetPrimitiveFpVisible(false);
             _tp3 = true;
         }
@@ -1137,6 +1139,7 @@ public partial class Player : Node3D
 
     public override void _Process(double delta)
     {
+        CrashLogger.Mark("Player._Process");   // breadcrumb for freeze localization
         float dt = (float)delta;
         // menus pause the world (WorldRunning=false) → freeze the authored anim trees to a still frame (this must run even
         // while paused, so it's before the CanControlLocal early-return below)
@@ -1717,6 +1720,7 @@ public partial class Player : Node3D
 
     private void UpdateVertical(float dt, bool floating = false)
     {
+        CrashLogger.Mark("Player.UpdateVertical");
         if (_galeHover)   // Gale: charging a punch in mid-air holds her height (super-slow sink) so she can aim the dive (NEW)
         {
             _vy = -0.3f;
@@ -1755,6 +1759,7 @@ public partial class Player : Node3D
 
     private void Combat(float dt)
     {
+        CrashLogger.Mark("Player.Combat");
         if (_beamT > 0) { Charging = false; ChargeAmt = 0; return; }
         if (HurricaneActive) { Charging = false; ChargeAmt = 0; return; }   // piloting the storm — no casting (NEW)
         if (_specter) { Charging = false; ChargeAmt = 0; return; }          // (REWORK) immaterial Specter cannot attack or damage
@@ -3319,6 +3324,7 @@ public partial class Player : Node3D
     // draw a faint curse link between each pair of tethered group members (local visual; refreshed each frame)
     private void DrawCurseTethers()
     {
+        CrashLogger.Mark("Player.DrawCurseTethers");
         if (TotalTethered() < 2) { if (_tetherVis.Count > 0) ClearTetherVis(); return; }   // (PERF) nothing tethered → bail BEFORE allocating the ToArray + Dictionary + Lists every frame (the common case)
         ClearTetherVis();
         var groups = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<Enemy>>();
@@ -5461,6 +5467,7 @@ public partial class Player : Node3D
 
     private void UpdateBeam(float dt)
     {
+        CrashLogger.Mark("Player.UpdateBeam");
         _beamT -= dt; _beamHeld += dt;
         float beamCrit = _beamOverload > 0 ? Mathf.Min(0.8f, 0.08f * _beamOverload + 0.12f * _beamOverload * _beamHeld) : 0f;   // Overload: crit chance climbs while held
         var dir = _beamDir; var eye = EyePos;
@@ -5728,6 +5735,7 @@ public partial class Player : Node3D
 
     private void AnimateHands(float dt)
     {
+        CrashLogger.Mark("Player.AnimateHands");
         if (_armL == null) return;
         _ht += dt;
         _kickL = Mathf.Max(0, _kickL - dt * 6f);
@@ -7118,6 +7126,7 @@ public partial class Player : Node3D
 
     private void UpdateUlt(float dt)
     {
+        CrashLogger.Mark("Player.UpdateUlt");
         if (_galeGuard > 0f) _galeGuard -= dt;   // Tailwind post-dash window decays (NEW)
         if (WitheringPresence)   // (NEW) legendary: her very presence lightly curses AND rots every foe near her (small tick)
         {

@@ -28,8 +28,12 @@ public partial class WitchModel : Node3D
     private AnimationTree _locoTree;   // AnimationTree driving BlendSpace2D locomotion (+ future cast mask); null → AP fallback
     private Vector2 _blend;            // smoothed BlendSpace2D position
     private Node3D _authoredRoot;          // the imported mesh root
+    private readonly System.Collections.Generic.List<ShaderMaterial> _clothMats = new();   // garment cloth-sway materials, driven each frame
     // witch index → authored-mesh key (0=Lunar … 8=Arcane). Present a res://assets/models/<key>.glb to swap that witch in.
     private static readonly string[] WitchKeys = { "witch_lunar", "witch_divine", "witch_crimson", "witch_verdant", "witch_gale", "witch_frost", "witch_forsaken", "witch_ember", "witch_arcane" };
+
+    // Model-asset key for a witch index (0 Lunar … 8 Arcane), or null if out of range. Used by dev tooling (e.g. `skindark`).
+    public static string KeyFor(int idx) => idx >= 0 && idx < WitchKeys.Length ? WitchKeys[idx] : null;
 
     public static Color WitchColor(int witchIdx) => witchIdx switch
     {
@@ -58,8 +62,15 @@ public partial class WitchModel : Node3D
             {
                 _authored = true;
                 AddChild(authored);
+                ModelAssets.NormalizeBoneNames(authored);   // glTF colon bone names → underscore so borrowed anim tracks bind (else T-pose)
                 ModelAssets.Painterlify(authored);      // opaque + matte
-                ModelAssets.ApplyFallbackAlbedo(authored, WitchKeys[witchIdx]);   // re-apply texture if the FBX import lost it
+                if (ModelAssets.IsOverride(WitchKeys[witchIdx]))
+                {
+                    ModelAssets.RebindOverrideTextures(authored, WitchKeys[witchIdx]);   // skin-darken the body if body_dark.png exists
+                    // ModelAssets.ApplyClothSway(authored, _clothMats);   // DISABLED — jittered at idle + lagged on the move; static gown for now
+                }
+                else
+                    ModelAssets.ApplyFallbackAlbedo(authored, WitchKeys[witchIdx]);   // re-apply texture if the FBX import lost it
                 ModelAssets.FitHeight(authored, 4.8f);  // calibrated game witch height
                 authored.Position -= new Vector3(0f, 0.2f, 0f);   // tiny constant drop → counter the walk/run stride float
                 // library-quality idle/walk/run (meshy_animate presets) — start on idle
@@ -417,6 +428,20 @@ void fragment(){
 #pragma warning restore CS0618
     }
 
+    // Feed the gown cloth-sway materials this frame: hem lags her travel (local-space dir × speed) and billows a little airborne.
+    private void DriveCloth(Vector3 moveDirWorld, float speed01, bool airborne)
+    {
+        if (_clothMats.Count == 0) return;
+        Vector3 cvel = moveDirWorld.LengthSquared() > 1e-6f
+            ? GlobalTransform.Basis.Inverse() * moveDirWorld.Normalized() * speed01
+            : Vector3.Zero;
+        foreach (var m in _clothMats)
+        {
+            m.SetShaderParameter("move_dir", cvel);
+            m.SetShaderParameter("billow", airborne ? 1f : 0f);
+        }
+    }
+
     public void Animate(double delta, float speed01, bool airborne, Vector3 moveDirWorld = default)
     {
         // AnimationTree path (preferred): drive the BlendSpace2D position (true 2D directional blend) + playback speed.
@@ -440,6 +465,7 @@ void fragment(){
             _blend = _blend.Lerp(target, airborne ? 1f : Mathf.Clamp((float)delta * 8f, 0f, 1f));
             _locoTree.Set("parameters/loco/blend_position", _blend);
             _locoTree.Set("parameters/speed/scale", moving ? 0.9f : 1f);              // slower-than-native playback
+            DriveCloth(moving ? moveDirWorld : Vector3.Zero, speed01, airborne);
             return;
         }
         if (_authoredAp != null && GodotObject.IsInstanceValid(_authoredAp))
