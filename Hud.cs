@@ -14,12 +14,8 @@ public partial class Hud : Control
     private static readonly string[] KL = { "1", "2", "3", "4", "5" };
     private const float Tau = Mathf.Pi * 2f;
 
-    public Rect2 RPauseMusic, RPauseSens, RPauseResume, RPauseDmg, ROver, RChangeWitch;
+    public Rect2 RPauseResume, RPauseOptions, RPauseQuit, RPauseRestart, ROver, RChangeWitch;   // pause = Options / Quit Run / Restart Run (+ Resume via Esc)
     public Rect2 ROverRetry, ROverCharSelect, ROverEnd;   // (NEW) MP game-over host options
-    public Rect2 RPauseBloom, RPauseSsao, RPauseSsil;   // (NEW) post-processing toggles
-    public Rect2[] RPauseGfx = new Rect2[3];             // (NEW) LOW / MED / HIGH preset buttons
-    public Rect2[] RPauseView = new Rect2[3];            // (NEW) Render Distance LOW / MED / HIGH — now in the pause menu too, matching the main-menu options
-    public Rect2[] RPauseShadow = new Rect2[3];          // (NEW) independent Shadows LOW / MED / HIGH
     public Rect2[] RPauseBind = new Rect2[5];
     public int PauseBindAt(Vector2 pos)
     {
@@ -790,6 +786,7 @@ public partial class Hud : Control
 
         if (g.State == GameState.Lobby) return;
         if (g.State == GameState.CharSelect) { DrawToast(g, vp, u); return; }   // the CharSelect Control node draws the roster now
+        if (g.State == GameState.ColliderEdit) { if (g.ColEditor != null) DrawColliderEdit(g, vp, u); return; }   // (DEV) clean authoring stage — no gameplay HUD
 
         // (NEW) full-screen damage feedback — red vignette on hits, a pulsing alarm while low, a cyan flash when the shield breaks
         if (p != null)
@@ -927,7 +924,7 @@ public partial class Hud : Control
         if (g.State == GameState.Scroll && p != null) DrawScroll(g, p, vp, u);
         if (g.State == GameState.Shop && p != null) DrawShop(g, p, vp, u);
         if (g.State == GameState.BindKey && p != null) DrawBindKey(g, p, vp, u);
-        if (g.State == GameState.Pause) DrawPause(g, vp, u);
+        if (g.State == GameState.Pause && !g.InGameOptions) DrawPause(g, vp, u);   // options overlay (the full main-menu options panel) hides the pause buttons
 
         if (g.State == GameState.Over)
         {
@@ -1547,75 +1544,29 @@ public partial class Hud : Control
         DrawRect(new Rect2(0, 0, vp.X, vp.Y), new Color(0, 0, 0, 0.78f));
         var col = DamageTypes.Col(DamageType.Lunar);
         T(_head, new Vector2(0, vp.Y * 0.16f), "PAUSED", 46 * u, col, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(4 * u));
-        T(_head, new Vector2(0, vp.Y * 0.28f), "OPTIONS", 20 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(3 * u));
 
-        float bw = Mathf.Min(320 * u, vp.X * 0.5f), bh = 16 * u, bx = (vp.X - bw) / 2f;
-
-        float vol = g.Sfx != null ? g.Sfx.MusicVol : 0.8f;
-        float my = vp.Y * 0.36f;
-        T(_body, new Vector2(0, my - 22 * u), "Music Volume", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        RPauseMusic = new Rect2(bx, my, bw, bh);
-        DrawRect(new Rect2(bx - 1 * u, my - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.5f));
-        DrawRect(new Rect2(bx, my, bw * vol, bh), col);
-        Frame(RPauseMusic, new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
-        T(_body, new Vector2(0, my + bh + 4 * u), $"{Mathf.RoundToInt(vol * 100)}%", 13 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
-
-        float sv = g.SensSlider;
-        float sy = vp.Y * 0.50f;
-        T(_body, new Vector2(0, sy - 22 * u), "Look Sensitivity", 16 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        RPauseSens = new Rect2(bx, sy, bw, bh);
-        DrawRect(new Rect2(bx - 1 * u, sy - 1 * u, bw + 2 * u, bh + 2 * u), new Color(0, 0, 0, 0.5f));
-        DrawRect(new Rect2(bx, sy, bw * sv, bh), col);
-        Frame(RPauseSens, new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
-        T(_body, new Vector2(0, sy + bh + 4 * u), $"{Mathf.RoundToInt(sv * 100)}%", 13 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
-
-        // (NEW) Graphics Quality + Shadows + Render Distance presets — three groups across, per-machine (matches the main-menu options)
-        float qy = vp.Y * 0.56f;
-        string[] qlab = { "LOW", "MED", "HIGH" };
-        float qbw = 46 * u, qbh = 26 * u, qgap = 6 * u;
-        float grpW = 3 * qbw + 2 * qgap, colGap = 28 * u;
-        float totalW = 3 * grpW + 2 * colGap;
-        float x1 = vp.X / 2f - totalW / 2f, x2 = x1 + grpW + colGap, x3 = x2 + grpW + colGap;
-        T(_body, new Vector2(x1, qy - 18 * u), "Graphics", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
-        T(_body, new Vector2(x2, qy - 18 * u), "Shadows", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
-        T(_body, new Vector2(x3, qy - 18 * u), "Render Dist", 13 * u, GoldDim, HorizontalAlignment.Center, grpW, Mathf.RoundToInt(2 * u));
-        void PresetRow(float sx, Rect2[] rects, int cur)
+        // Three run options — Options / Quit Run / Restart Run. Restart is host-or-solo only (a MP client can't restart the shared run).
+        bool canRestart = g.CanRestartRun();
+        float bw = Mathf.Min(300 * u, vp.X * 0.6f), bh = 46 * u, bx = (vp.X - bw) / 2f;
+        float gap = 14 * u, y0 = vp.Y * 0.34f;
+        Vector2 mouse = GetGlobalMousePosition();
+        Rect2 Btn(float y, string label, Color accent, bool enabled)
         {
-            for (int i = 0; i < 3; i++)
-            {
-                var qr = new Rect2(sx + i * (qbw + qgap), qy, qbw, qbh);
-                rects[i] = qr;
-                bool sel = cur == i;
-                DrawRect(qr, sel ? new Color(col.R, col.G, col.B, 0.35f) : new Color(0, 0, 0, 0.4f));
-                Frame(qr, new Color(col.R, col.G, col.B, sel ? 0.9f : 0.5f), 1.5f * u);
-                T(_body, new Vector2(qr.Position.X, qy + 6 * u), qlab[i], 13 * u, sel ? new Color(col.R, col.G, col.B) : GoldDim, HorizontalAlignment.Center, qbw, Mathf.RoundToInt(2 * u));
-            }
+            var r = new Rect2(bx, y, bw, bh);
+            bool hov = enabled && r.HasPoint(mouse);
+            DrawRect(r, enabled ? new Color(accent.R, accent.G, accent.B, hov ? 0.32f : 0.16f) : new Color(0, 0, 0, 0.35f));
+            Frame(r, enabled ? (hov ? Gold : accent) : new Color(accent.R, accent.G, accent.B, 0.25f), 1.5f * u);
+            T(_head, new Vector2(0, y + bh * 0.5f - 13 * u), label, 20 * u, enabled ? (hov ? Colors.White : Gold) : new Color(0.5f, 0.5f, 0.55f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            return r;
         }
-        PresetRow(x1, RPauseGfx, g.GfxQuality);
-        PresetRow(x2, RPauseShadow, g.ShadowQuality);
-        PresetRow(x3, RPauseView, g.ViewDist);
+        RPauseOptions = Btn(y0, "Options", col, true);
+        RPauseQuit = Btn(y0 + (bh + gap), "Quit Run", new Color(0.9f, 0.5f, 0.55f), true);
+        RPauseRestart = Btn(y0 + 2 * (bh + gap), "Restart Run", new Color(0.6f, 0.9f, 0.6f), canRestart);
+        if (!canRestart)
+            T(_body, new Vector2(0, y0 + 2 * (bh + gap) + bh + 3 * u), "only the host can restart", 12 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
 
-        // (NEW) per-effect toggles — damage numbers + post-processing (each independently overridable)
-        float ty = vp.Y * 0.63f;
-        float tw2 = 96 * u, th = 28 * u, tgap = 10 * u;
-        float ttot = 4 * tw2 + 3 * tgap, tsx = vp.X / 2f - ttot / 2f;
-        RPauseDmg = new Rect2(tsx, ty, tw2, th);
-        RPauseBloom = new Rect2(tsx + (tw2 + tgap), ty, tw2, th);
-        RPauseSsao = new Rect2(tsx + 2 * (tw2 + tgap), ty, tw2, th);
-        RPauseSsil = new Rect2(tsx + 3 * (tw2 + tgap), ty, tw2, th);
-        void Tog(Rect2 r, string label, bool onv)
-        {
-            DrawRect(r, onv ? new Color(col.R, col.G, col.B, 0.35f) : new Color(0, 0, 0, 0.4f));
-            Frame(r, new Color(col.R, col.G, col.B, 0.8f), 1.5f * u);
-            T(_body, new Vector2(r.Position.X, r.Position.Y + 5 * u), label, 12 * u, GoldDim, HorizontalAlignment.Center, r.Size.X, Mathf.RoundToInt(1 * u));
-            T(_body, new Vector2(r.Position.X, r.Position.Y + 16 * u), onv ? "ON" : "OFF", 12 * u, onv ? new Color(col.R, col.G, col.B) : GoldDim, HorizontalAlignment.Center, r.Size.X, Mathf.RoundToInt(1 * u));
-        }
-        Tog(RPauseDmg, "Dmg #", g.DmgNumbers);
-        Tog(RPauseBloom, "Bloom", g.GfxBloom);
-        Tog(RPauseSsao, "SSAO", g.GfxSsao);
-        Tog(RPauseSsil, "SSIL", g.GfxSsil);
-
-        float fy = vp.Y * 0.70f;
+        // Spell Combo Keys rebinder — preserved from the old pause menu (click a combo to rebind its key).
+        float fy = vp.Y * 0.72f;
         for (int i = 0; i < RPauseBind.Length; i++) RPauseBind[i] = new Rect2(-1, -1, 0, 0);
         var pp = g.Player;
         int fn = pp != null ? pp.Fin.Count : 0;
@@ -1629,7 +1580,7 @@ public partial class Hud : Control
                 var fr = new Rect2(sx + i * (bwid + bgap), fy, bwid, bhi);
                 RPauseBind[i] = fr;
                 var fc = FinMeta.Col(pp.Fin[i].Type);
-                bool hov = fr.HasPoint(GetGlobalMousePosition());
+                bool hov = fr.HasPoint(mouse);
                 DrawRect(fr, new Color(fc.R, fc.G, fc.B, hov ? 0.32f : 0.16f));
                 Frame(fr, hov ? Gold : fc, 1.5f * u);
                 string nm = FinMeta.Name(pp.Fin[i].Type);
@@ -1639,11 +1590,58 @@ public partial class Hud : Control
             }
         }
 
-        float ry = vp.Y * 0.80f;
+        float ry = vp.Y * 0.84f;
         RPauseResume = new Rect2(vp.X / 2f - 110 * u, ry - 4 * u, 220 * u, 34 * u);
         Frame(RPauseResume, new Color(col.R, col.G, col.B, 0.6f), 1.5f * u);
         T(_body, new Vector2(0, ry), "Resume   [Esc]", 18 * u, Gold, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        T(_body, new Vector2(0, ry + 40 * u), "drag sliders, or hold A / D for music", 13 * u, GoldDim, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(1 * u));
+    }
+
+    private void DrawColliderEdit(Game g, Vector2 vp, float u)
+    {
+        var ed = g.ColEditor;
+        // left info panel (kept off-center so the 3D authoring view stays clear)
+        float px = 16 * u, pw = 340 * u, py = 70 * u;
+        DrawRect(new Rect2(px - 8 * u, py - 34 * u, pw, 250 * u), new Color(0, 0, 0, 0.55f));
+        var accent = DamageTypes.Col(DamageType.Lunar);
+        T(_head, new Vector2(px, py - 30 * u), "COLLIDER EDITOR", 22 * u, accent, HorizontalAlignment.Left, pw, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(px, py), $"near: {ed.NearestModelName()}     colliders: {ed.SelectedCount}", 14 * u, Gold, HorizontalAlignment.Left, pw, 0);
+        var modeCol = ed.Mode == ColliderEditor.XMode.Move ? new Color(0.5f, 0.85f, 1f) : ed.Mode == ColliderEditor.XMode.Rotate ? new Color(1f, 0.75f, 0.4f) : new Color(0.6f, 1f, 0.6f);
+        T(_head, new Vector2(px + 200 * u, py - 30 * u), ed.ModeName, 16 * u, modeCol, HorizontalAlignment.Left, 140 * u, Mathf.RoundToInt(1 * u));
+        // selected collider readout (3 lines)
+        string[] lines = ed.SelInfo().Split('\n');
+        for (int i = 0; i < lines.Length; i++)
+            T(_body, new Vector2(px, py + (24 + i * 18) * u), lines[i], 13 * u, GoldDim, HorizontalAlignment.Left, pw, 0);
+        // controls legend
+        string[] help = {
+            "WASD + mouse = fly  ·  Space/Ctrl = up/down  ·  Shift = fast",
+            "M = new  ·  Tab / [ ] = select  ·  X = delete  ·  Enter = dup",
+            "G / R / T  =  MOVE / ROTATE / SCALE mode",
+            "arrows = X/Z  ·  Q/E = Y  ·  (rotate: ←/→)  ·  Shift = fine",
+            "C = color  ·  V = shape  ·  K = SAVE  ·  Esc = exit",
+        };
+        for (int i = 0; i < help.Length; i++)
+            T(_body, new Vector2(px, py + (92 + i * 16) * u), help[i], 12 * u, new Color(0.7f, 0.7f, 0.8f), HorizontalAlignment.Left, pw, 0);
+        if (!string.IsNullOrEmpty(ed.Status))
+            T(_body, new Vector2(px, py + 180 * u), ed.Status, 13 * u, new Color(0.6f, 0.95f, 0.6f), HorizontalAlignment.Left, pw, 0);
+
+        // center crosshair
+        T(_body, new Vector2(0, vp.Y * 0.5f - 8 * u), "+", 20 * u, new Color(1, 1, 1, 0.6f), HorizontalAlignment.Center, vp.X, 0);
+
+        // palette popup
+        if (ed.PaletteOpen)
+        {
+            float mw = 300 * u, mh = 150 * u, mx = vp.X / 2f - mw / 2f, my = vp.Y / 2f - mh / 2f;
+            DrawRect(new Rect2(mx, my, mw, mh), new Color(0.03f, 0.03f, 0.06f, 0.92f));
+            Frame(new Rect2(mx, my, mw, mh), accent, 2 * u);
+            T(_head, new Vector2(mx, my + 8 * u), "NEW COLLIDER", 18 * u, accent, HorizontalAlignment.Center, mw, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(mx, my + 40 * u), "Shape  (↑/↓)", 13 * u, GoldDim, HorizontalAlignment.Center, mw, 0);
+            for (int i = 0; i < ColliderEditor.ShapeNames.Length; i++)
+                T(_body, new Vector2(mx + (60 + i * 120) * u, my + 58 * u), ColliderEditor.ShapeNames[i].ToUpper(), 15 * u, i == ed.PalShape ? Colors.White : GoldDim, HorizontalAlignment.Left, 120 * u, 0);
+            T(_body, new Vector2(mx, my + 86 * u), "Color / behavior  (←/→)", 13 * u, GoldDim, HorizontalAlignment.Center, mw, 0);
+            var kc = new[] { new Color(1f, 0.35f, 0.35f), new Color(0.4f, 0.7f, 1f), new Color(0.4f, 1f, 0.5f) };
+            T(_body, new Vector2(mx, my + 104 * u), ColliderEditor.KindLabels[ed.PalKind], 15 * u, kc[ed.PalKind], HorizontalAlignment.Center, mw, 0);
+            T(_body, new Vector2(mx, my + 128 * u), "Enter = spawn   ·   Esc = cancel", 12 * u, new Color(0.7f, 0.7f, 0.8f), HorizontalAlignment.Center, mw, 0);
+        }
     }
 
     private void DrawRoulette(Game g, Player p, Vector2 c, Vector2 vp, float u)

@@ -35,6 +35,14 @@ public partial class Creature : Node3D
     private MeshInstance3D _orb;   // zapper focus
     private float _cast, _castTarget;
     private float _swing, _swingTarget, _strike;   // melee wind-up amount (0..1) + brief forward strike impulse
+
+    // ---- authored goblin (GLB mesh + baked walk anim + procedural slash) ----
+    private bool _gobAuthored;
+    private AnimationPlayer _gobAp; private string _gobWalkKey;
+    private Skeleton3D _gobSkel; private GoblinSlashMod _gobSlash;
+    private int _gobArmL = -1, _gobArmR = -1, _gobForeL = -1, _gobForeR = -1;
+    private bool _gobSlashLeft;   // which arm the CURRENT strike uses (randomized per Strike)
+    private MeshInstance3D _slashVfx; private float _slashVfxT; private const float SlashVfxDur = 0.32f;
     private float _scream;                          // (NEW) zombie shriek-to-sky overlay (arms up, lean back)
     public void Scream() { _scream = 1f; }
     public int IdlePose = 0;                        // (NEW) 0 stand, 1 lie on floor, 2 slump, 3 snicker (idle swarmers)
@@ -68,7 +76,145 @@ public partial class Creature : Node3D
     }
     public void SetCast(float t) { _castTarget = Mathf.Clamp(t, 0f, 1f); }
     public void SetSwing(float t) { _swingTarget = Mathf.Clamp(t, 0f, 1f); }
-    public void Strike() { _strike = 1f; }
+    public void Strike()
+    {
+        _strike = 1f;
+        if (_gobAuthored && _gobSlash != null)   // pick + mirror + RANDOMIZE which arm chops this strike
+        {
+            _gobSlashLeft = R(0f, 1f) < 0.5f;
+            _gobSlash.Arm = _gobSlashLeft ? _gobArmL : _gobArmR;
+            _gobSlash.Fore = _gobSlashLeft ? _gobForeL : _gobForeR;
+            _gobSlash.Side = _gobSlashLeft ? -1f : 1f;
+            _slashVfxT = SlashVfxDur;   // fire the crescent arc
+        }
+    }
+
+    public bool IsAuthoredGoblin => _gobAuthored;
+    // (harness) deterministically chop with a chosen arm so a scenario can capture each side.
+    public void DebugSlash(bool left)
+    {
+        if (!_gobAuthored || _gobSlash == null) return;
+        _gobSlashLeft = left;
+        _gobSlash.Arm = left ? _gobArmL : _gobArmR;
+        _gobSlash.Fore = left ? _gobForeL : _gobForeR;
+        _gobSlash.Side = left ? -1f : 1f;
+        _slashVfxT = SlashVfxDur;
+        _strike = 1f; _swing = 0f; _swingTarget = 0f;
+    }
+
+    private const string GoblinGlb = "res://assets/models/enemies/goblin.glb";
+    // Load the authored goblin GLB (mesh + baked walk), scale to match the old silhouette, play the walk, and set up the
+    // procedural-slash modifier. Returns false (→ procedural fallback) if the asset/skeleton/anim is missing.
+    private bool AuthoredGoblin(float s, Material accent)
+    {
+        if (!ResourceLoader.Exists(GoblinGlb)) return false;
+        var model = ResourceLoader.Load<PackedScene>(GoblinGlb)?.Instantiate<Node3D>();
+        if (model == null) return false;
+        AddChild(model);
+        ModelAssets.Painterlify(model);   // opaque + matte (Meshy imports translucent/glossy)
+        _gobSkel = ModelAssets.FindSkeleton(model);
+        _gobAp = ModelAssets.FindAnimPlayer(model);
+        if (_gobSkel == null || _gobAp == null) { model.QueueFree(); return false; }
+        _gobAuthored = true;
+
+        // Scale by the mesh's OWN (skin-space) AABB height — NOT the node-hierarchy one. This rig's Armature carries a 0.01
+        // node scale that the SKINNED mesh ignores (bones compensate), so FitHeight (which measures through the node scale)
+        // would size the goblin ~100× too big. The mesh resource AABB is in true skin space. Target ≈ the intended enemy visual
+        // height (feet at −Radius, head ~Radius*1.9 up ⇒ ~Radius*2.9 tall) so the model fills its hitbox/ground-ring.
+        float target = s * 2.8f * R(0.92f, 1.1f);
+        float nativeH = 1.7f;
+        var meshInst = FindMesh(model);
+        if (meshInst?.Mesh != null) { float h = meshInst.Mesh.GetAabb().Size.Y; if (h > 0.05f) nativeH = h; }
+        model.Scale = Vector3.One * (target / nativeH);
+        // facing: the model's +Z (Meshy walk-forward) already aligns with the Creature's +Z (which Enemy yaws toward the target),
+        // so NO extra rotation — the goblin faces + walks toward the player.
+
+        // GROUND: the enemy origin sits Radius above the feet (Enemy: feet = GlobalPosition.Y − Radius), and this rig's model
+        // origin is BELOW the feet — so shift the model down so its lowest foot bone lands at Creature-local −Radius (the ground).
+        int fl = _gobSkel.FindBone("LeftFoot"), fr = _gobSkel.FindBone("RightFoot");
+        if (fl >= 0 && fr >= 0)
+        {
+            var g = _gobSkel.GlobalTransform;
+            float footWorld = Mathf.Min((g * _gobSkel.GetBoneGlobalPose(fl).Origin).Y, (g * _gobSkel.GetBoneGlobalPose(fr).Origin).Y);
+            float footLocal = footWorld - GlobalPosition.Y;        // foot Y relative to the Creature origin (model currently at 0)
+            model.Position = new Vector3(0, -s - footLocal, 0);
+        }
+
+        ModelAssets.StripHorizontalDrift(_gobAp);                  // freeze the walk clip's forward root drift → walk in place
+        foreach (StringName lib in _gobAp.GetAnimationLibraryList())
+        {
+            var l = _gobAp.GetAnimationLibrary(lib);
+            foreach (StringName a in l.GetAnimationList())
+            {
+                l.GetAnimation(a).LoopMode = Animation.LoopModeEnum.Linear;
+                _gobWalkKey ??= ((string)lib).Length == 0 ? (string)a : $"{(string)lib}/{(string)a}";
+            }
+        }
+        if (_gobWalkKey != null) _gobAp.Play(_gobWalkKey);
+
+        _gobArmL = _gobSkel.FindBone("LeftArm"); _gobForeL = _gobSkel.FindBone("LeftForeArm");
+        _gobArmR = _gobSkel.FindBone("RightArm"); _gobForeR = _gobSkel.FindBone("RightForeArm");
+        int spine = _gobSkel.FindBone("Spine01"); if (spine < 0) spine = _gobSkel.FindBone("Spine");
+        _gobSlash = new GoblinSlashMod { Spine = spine };
+        _gobSkel.AddChild(_gobSlash);
+
+        // slash-arc VFX: a crescent blade in the Creature's OWN frame (broad face toward the player, who the goblin faces), swept
+        // across the front by the strike. Creature-local placement is predictable (unlike an unknown hand-bone axis).
+        Color tint = (accent as StandardMaterial3D)?.AlbedoColor ?? Colors.White;
+        _slashVfx = new MeshInstance3D
+        {
+            Mesh = Game.CrescentBladeMesh(),
+            MaterialOverride = Game.CrescentBladeMat(tint),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Visible = false,
+        };
+        AddChild(_slashVfx);
+        return true;
+    }
+
+    // Sweep the crescent across the goblin's front over the strike, then fade + hide. Creature-local: +Z faces the player, so
+    // the crescent's broad face reads; it arcs from up-back to down-forward on the slashing side, growing then fading.
+    private void UpdateSlashVfx(float dt)
+    {
+        if (_slashVfx == null) return;
+        if (_slashVfxT <= 0f) { if (_slashVfx.Visible) _slashVfx.Visible = false; return; }
+        _slashVfxT -= dt;
+        float k = Mathf.Clamp(_slashVfxT / SlashVfxDur, 0f, 1f);   // 1 → 0 over the strike
+        float side = _gobSlashLeft ? -1f : 1f;
+        _slashVfx.Visible = true;
+        _slashVfx.Position = new Vector3(side * 0.18f * _scale, 0.55f * _scale, 0.7f * _scale);   // by the slashing arm, in front
+        // roll the crescent through the arc (up-back → down-forward); its XY plane already faces the player (+Z)
+        float roll = Mathf.Lerp(-70f, 60f, 1f - k) * side;        // 1−k = progress 0→1
+        _slashVfx.RotationDegrees = new Vector3(0f, 0f, roll);
+        _slashVfx.Scale = Vector3.One * (_scale * (1.0f + (1f - k) * 0.35f));   // grows through the swing
+        _slashVfx.Transparency = Mathf.Clamp(1f - k * 1.6f, 0f, 1f);           // bright early, fades out
+    }
+
+    private static MeshInstance3D FindMesh(Node n)
+    {
+        if (n is MeshInstance3D mi && mi.Mesh != null) return mi;
+        foreach (var c in n.GetChildren()) { var r = FindMesh(c); if (r != null) return r; }
+        return null;
+    }
+
+    private float _gobForceMove = -1f;   // (harness) ≥0 overrides the movement-derived walk speed so a pinned goblin still strides
+    public void DebugWalkSpeed(float m) { _gobForceMove = m; }
+
+    // authored-goblin per-frame: walk playback scaled by movement + the wind-up/strike arm swing (fed to the slash modifier).
+    private void AnimateGoblin(float dt, float move)
+    {
+        if (_gobForceMove >= 0f) move = _gobForceMove;
+        if (_gobAp != null) _gobAp.SpeedScale = AnimSuspended ? 0f : (0.35f + move * 1.4f);   // shuffle idle → faster stride; freeze if culled
+        if (AnimSuspended) return;
+        _swing = Mathf.MoveToward(_swing, _swingTarget, dt * 3.5f);
+        _strike = Mathf.MoveToward(_strike, 0f, dt * 3.2f);   // SLOWER decay → the chop lasts ~0.3s so it READS as a slash
+        if (_gobSlash != null)
+        {
+            _gobSlash.SwingRad = Mathf.DegToRad(_swing * 40f - _strike * 115f);   // + rear back (wind-up), − big chop down/forward
+            _gobSlash.SpineLean = Mathf.DegToRad(_strike * 32f);                  // whole body commits into the swing
+        }
+        UpdateSlashVfx(dt);
+    }
 
     private static Mesh Cone(float r, float h) => new CylinderMesh { TopRadius = 0.001f, BottomRadius = r, Height = h };
     private static Mesh Cyl(float r, float h) => new CylinderMesh { TopRadius = r, BottomRadius = r, Height = h };
@@ -124,7 +270,7 @@ public partial class Creature : Node3D
         _phase = R(0f, 6.28f);
         switch (kind)
         {
-            case CreatureKind.Goblin: Goblin(radius, body, limb, accent, false); break;
+            case CreatureKind.Goblin: if (!AuthoredGoblin(radius, accent)) Goblin(radius, body, limb, accent, false); break;   // authored GLB when present, else procedural
             case CreatureKind.Bomber: Goblin(radius, body, limb, accent, true); break;
             case CreatureKind.Zombie: Goblin(radius, body, limb, accent, false); break;   // humanoid skeleton, zombie shamble in Animate
             case CreatureKind.Orc: Orc(radius, body, limb, accent); break;
@@ -615,8 +761,9 @@ public partial class Creature : Node3D
 
     public void Animate(float dt, float move)
     {
-        if (AnimSuspended) return;   // (PERF) invisible foe (far + outside the frustum) → freeze the pose, skip all the per-part transform writes
         move = Mathf.Clamp(move, 0f, 1f);
+        if (_gobAuthored) { AnimateGoblin(dt, move); return; }   // authored goblin: GLB walk + procedural slash (handles its own cull)
+        if (AnimSuspended) return;   // (PERF) invisible foe (far + outside the frustum) → freeze the pose, skip all the per-part transform writes
         switch (_kind)
         {
             case CreatureKind.Goblin:

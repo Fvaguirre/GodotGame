@@ -308,6 +308,28 @@ public partial class DevConsole : CanvasLayer
                 Print(g.Player.ToggleThirdPersonPlay(d, ht, lat));
                 return;
             }
+            case "colliders": case "collision": case "col":
+            {
+                var g = Game.I; if (g == null || g.ColDebug == null) { Print("no game."); return; }
+                g.ColDebug.Toggle();
+                Print($"collision bounds {(g.ColDebug.On ? "ON (red=solid, blue=deck, green=ramp)" : "OFF")}");
+                return;
+            }
+            case "nospawn": case "nomobs": case "peace":
+            {
+                var g = Game.I; if (g == null) { Print("no game."); return; }
+                g.NoSpawn = !g.NoSpawn;
+                if (g.NoSpawn) g.ClearEnemies();
+                Print($"enemy spawns {(g.NoSpawn ? "OFF (mobs cleared)" : "ON")}");
+                return;
+            }
+            case "cedit": case "collideredit": case "celab":
+            {
+                var g = Game.I; if (g == null || g.ColEditor == null) { Print("no game."); return; }
+                if (g.ColEditor.Active) { g.ColEditor.Exit(); Print("collider editor: EXIT"); }
+                else { Toggle(); g.ColEditor.Enter(); Print("collider editor: ENTER — WASD+mouse fly (Space/Ctrl up-down). G/R/T = move/rotate/scale mode, then arrows = X/Z & Q/E = Y. M=new, Tab=select, C=color, V=shape, X=delete, K=save, Esc=exit"); }
+                return;
+            }
             case "skindark": case "darkskin":
             {
                 var g = Game.I; if (g == null || g.Player == null) { Print("no game."); return; }

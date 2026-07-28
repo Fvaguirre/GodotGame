@@ -428,6 +428,14 @@ void fragment(){
 #pragma warning restore CS0618
     }
 
+    // DEV visual-test harness read-out: authored-mesh + locomotion-blend snapshot (see res://dev/ai).
+    public Godot.Collections.Dictionary GetAiDebugState() => new()
+    {
+        { "authored", _authored },
+        { "blend", new Godot.Collections.Array { _blend.X, _blend.Y } },
+        { "loco_tree_active", _locoTree != null && GodotObject.IsInstanceValid(_locoTree) && _locoTree.Active },
+    };
+
     // Feed the gown cloth-sway materials this frame: hem lags her travel (local-space dir × speed) and billows a little airborne.
     private void DriveCloth(Vector3 moveDirWorld, float speed01, bool airborne)
     {
@@ -462,7 +470,9 @@ void fragment(){
                 target = dir2 * radius;
             }
             // airborne → SNAP the locomotion to idle (no run-cycle bleed showing under the jump); grounded → smooth
-            _blend = _blend.Lerp(target, airborne ? 1f : Mathf.Clamp((float)delta * 8f, 0f, 1f));
+            // clamp the lerp's dt (Min .04) so a frame HITCH doesn't snap the blend to that stalled frame's instantaneous speed
+            // (a big dt → factor 1.0 → the run cycle pops to idle for one frame). Normal frames (<.04) are unaffected.
+            _blend = _blend.Lerp(target, airborne ? 1f : Mathf.Clamp(Mathf.Min((float)delta, 0.04f) * 8f, 0f, 1f));
             _locoTree.Set("parameters/loco/blend_position", _blend);
             _locoTree.Set("parameters/speed/scale", moving ? 0.9f : 1f);              // slower-than-native playback
             DriveCloth(moving ? moveDirWorld : Vector3.Zero, speed01, airborne);

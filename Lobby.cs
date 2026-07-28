@@ -8,6 +8,10 @@ public partial class Lobby : Control
 {
     private VBoxContainer _main, _mp, _opt;
     private LineEdit _ip;
+    private ColorRect _bg;                 // full-screen background — opaque for the main menu, dimmed for the in-game options overlay
+    private bool _inGameMode = false;      // true when shown as an in-game overlay (transparent bg, Back returns to the pause menu)
+    private static readonly Color BgSolid = new Color(0.035f, 0.03f, 0.06f, 1f);
+    private static readonly Color BgOverlay = new Color(0f, 0f, 0f, 0.55f);   // dim, not opaque — the paused game shows through
 
     private static readonly Color Ink = new Color(0.93f, 0.88f, 0.72f);
     private static readonly Color Accent = new Color(0.72f, 0.55f, 1.0f);      // witchy violet
@@ -17,9 +21,9 @@ public partial class Lobby : Control
         SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);   // (FIX) offsets too, so it fills the viewport WITHOUT needing a resize event (broke on scene reload)
         MouseFilter = MouseFilterEnum.Stop;
 
-        var bg = new ColorRect { Color = new Color(0.035f, 0.03f, 0.06f, 1f) };
-        bg.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
-        AddChild(bg);
+        _bg = new ColorRect { Color = BgSolid };
+        _bg.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
+        AddChild(_bg);
 
         var center = new CenterContainer();
         center.SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
@@ -129,7 +133,40 @@ public partial class Lobby : Control
         tabs.AddChild(BuildSoundTab());
         tabs.AddChild(BuildScreenTab());
         _opt.AddChild(tabs);
-        _opt.AddChild(MenuButton("Back", new Color(0.7f, 0.7f, 0.8f), () => { Game.I?.SaveGold(); ShowPanel(0); }, 16));
+        _opt.AddChild(MenuButton("Back", new Color(0.7f, 0.7f, 0.8f), () =>
+        {
+            Game.I?.SaveGold();
+            if (_inGameMode) Game.I?.CloseInGameOptions();   // overlay: back to the pause menu
+            else ShowPanel(0);                               // main menu: back to the main panel
+        }, 16));
+    }
+
+    // ---- in-game options overlay -------------------------------------------
+    // Show the EXACT same OPTIONS page over a paused run, with a transparent (dimmed) background so the game shows behind it.
+    // Rebuilt each time so every control reflects the run's current settings.
+    public void ShowOptionsOverlay()
+    {
+        _inGameMode = true;
+        if (_bg != null) _bg.Color = BgOverlay;
+        RebuildOptions();
+        Show();
+        ShowPanel(2);
+    }
+
+    public void HideOptionsOverlay()
+    {
+        _inGameMode = false;
+        if (_bg != null) _bg.Color = BgSolid;   // restore the opaque menu background for next main-menu use
+        Hide();
+        ShowPanel(0);
+    }
+
+    private void RebuildOptions()
+    {
+        if (_opt == null) return;
+        foreach (var c in _opt.GetChildren()) { _opt.RemoveChild(c); c.QueueFree(); }
+        _bloom = _ssao = _ssil = null; _shadowOpt = null; _res = null;   // drop stale refs before the rebuild repopulates them
+        BuildOptions();
     }
 
     private static VBoxContainer TabBody(string name)
@@ -185,6 +222,13 @@ public partial class Lobby : Control
         v.AddChild(Row("Ambient Occlusion", _ssao));
         _ssil = Check(g == null || g.GfxSsil, on => { if (Game.I != null) { Game.I.GfxSsil = on; Game.I.ApplyGraphics(); } });
         v.AddChild(Row("Indirect Light", _ssil));
+        // (NEW) Texture Quality — caps the resolution the big ground/rock textures load at (High = full 2k, Medium = 1k, Low = 512).
+        // Lower tiers downscale in-engine at load, saving VRAM on weaker GPUs (no extra files shipped).
+        var texq = new OptionButton();
+        texq.AddItem("Low"); texq.AddItem("Medium"); texq.AddItem("High");
+        texq.Selected = g != null ? g.TextureQuality : 2;
+        texq.ItemSelected += idx => { Game.I?.SetTextureQuality((int)idx); Game.I?.SaveGold(); };
+        v.AddChild(Row("Texture Quality", texq));
         v.AddChild(Row("Damage Numbers", Check(g != null && g.DmgNumbers, on => { if (Game.I != null) Game.I.DmgNumbers = on; })));
         return v.GetParent<Control>();
     }
@@ -231,6 +275,12 @@ public partial class Lobby : Control
         _res.ItemSelected += idx => { if (Game.I != null) { Game.I.ResIndex = (int)idx; Game.I.ApplyWindow(); Game.I.SaveGold(); } };
         v.AddChild(Row("Resolution", _res));
         v.AddChild(Row("V-Sync", Check(g == null || g.VSync, on => { if (Game.I != null) { Game.I.VSync = on; Game.I.ApplyWindow(); } })));
+        var fps = new OptionButton();
+        int fpsSel = 1;
+        for (int i = 0; i < Game.FpsChoices.Length; i++) { fps.AddItem($"{Game.FpsChoices[i]} FPS"); if (g != null && g.MaxFps == Game.FpsChoices[i]) fpsSel = i; }
+        fps.Selected = fpsSel;
+        fps.ItemSelected += idx => { Game.I?.SetMaxFps(Game.FpsChoices[(int)idx]); Game.I?.SaveGold(); };
+        v.AddChild(Row("Max FPS", fps));
         var view = new OptionButton();
         view.AddItem("Low"); view.AddItem("Medium"); view.AddItem("High");
         view.Selected = g != null ? g.ViewDist : 1;

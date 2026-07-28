@@ -11,7 +11,7 @@ using System.Collections.Generic;
 // SpawnBolt (rolls crit, broadcasts ghost) -> Bolt hits -> Enemy.Hurt -> OnHit/OnHitCore (combo,
 // mana, lifesteal, ult charge). To add an ability/effect/witch, see DEV_GUIDE.md §6. This file is
 // large; jump by method name (FireBolt, ExecuteFinisher, ApplyChargedMods, ActivateUlt, AddCombo).
-public partial class Player : Node3D
+public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
 {
     public Stats S = new Stats();
     public float Hp;
@@ -256,6 +256,33 @@ public partial class Player : Node3D
     public bool EmberWitch = false;     // (NEW) Ember pyro — flamethrower cone + aimed meteor; stacks burn → Living Bomb
     public bool ArcaneWitch = false;    // (NEW) Arcane — 3-round homing missile burst + a chargeable sustained beam that arcane-marks foes
     public int WitchIndex => ArcaneWitch ? 8 : EmberWitch ? 7 : ForsakenWitch ? 6 : FrostWitch ? 5 : GaleWitch ? 4 : (VerdantWitch ? 3 : (CrimsonWitch ? 2 : (DivineWitch ? 1 : 0)));   // 0 Lunar,1 Divine,2 Crimson,3 Verdant,4 Gale,5 Frost,6 Forsaken,7 Ember,8 Arcane
+
+    // --- DEV visual-test harness read-outs (see res://dev/ai). Read-only exposure of internal state; no behavioural coupling.
+    // (Grounded already exists elsewhere on Player.) ---
+    public float VyDebug => _vy;
+
+    // Semantic snapshot for the AI test runner (opted in via the "ai_observable" group in _Ready). NOT a full property dump.
+    public Godot.Collections.Dictionary GetAiDebugState()
+    {
+        var d = new Godot.Collections.Dictionary
+        {
+            { "witch_index", WitchIndex },
+            { "position", new Godot.Collections.Array { GlobalPosition.X, GlobalPosition.Y, GlobalPosition.Z } },
+            { "grounded", _grounded },
+            { "vy", _vy },
+            { "hp", Hp },
+            { "mana", Mana },
+            { "charging", Charging },
+            { "charge_amt", ChargeAmt },
+            { "ult", Ult.ToString() },
+            { "ult_active", UltActive },
+            { "downed", Downed },
+        };
+        // authored-puppet animation read-out (the tp3 witch), when present
+        if (_tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet))
+            d["tp3_puppet"] = _tp3Puppet.GetAiDebugState();
+        return d;
+    }
     // (NEW) does this witch's PRIMARY fire launch piercing bolts? Lunar/Divine/Crimson/Verdant/Gale do; Frost/Forsaken/Ember use
     // beams/cones (which already hit everything in their path) and Arcane uses homing missiles — so S.Pierce does nothing for them.
     public bool FiresBolts => !FrostWitch && !ForsakenWitch && !EmberWitch && !ArcaneWitch;
@@ -927,11 +954,13 @@ public partial class Player : Node3D
 
     public override void _Ready()
     {
+        AddToGroup(Grove.Dev.Ai.AiObservable.Group);   // opt in to the DEV visual-test harness (inert unless a scenario runs)
         Hp = S.MaxHp; Mana = S.ManaMax; DashStock = S.DashCharges;
         MaxShield = S.MaxHp * S.ShieldPct; Shield = MaxShield;
         _cam = new Camera3D { Position = new Vector3(0, 2.6f, 0), Fov = 78, Current = true };
         AddChild(_cam);
-        AddChild(new OmniLight3D { Position = new Vector3(0, 2.3f, 0), OmniRange = 10f, LightColor = Palette.Lunar, LightEnergy = 0.6f });
+        _witchLight = new OmniLight3D { Position = new Vector3(0, 2.3f, 0), OmniRange = 10f, LightColor = Palette.Lunar, LightEnergy = 0.6f };
+        AddChild(_witchLight);   // personal fill-glow — recolored to the witch's OWN element in RetintHands (was hardcoded Lunar violet → tinted every witch purple)
         BuildHands();
         BuildBodyModel();
     }
@@ -1017,7 +1046,16 @@ public partial class Player : Node3D
         if (_handMeshR != null) _handMeshR.MaterialOverride = Game.ToonEmissive(sc, 0.8f, 0.02f);
         if (_bodyModel != null) BuildBodyModel();   // recolor the body to the witch's damage type
         if (_chargeOrb != null) _chargeOrb.MaterialOverride = Game.ToonEmissive(sc, 2.0f, 0f);
+        // personal fill-glow matches the witch's element (Divine → warm gold, not the old hardcoded Lunar violet). Softer for
+        // authored-mesh witches so a strong colored light doesn't muddy their real textures.
+        if (_witchLight != null)
+        {
+            bool authored = ModelAssets.Has(WitchModel.KeyFor(WitchIndex));
+            _witchLight.LightColor = pc;
+            _witchLight.LightEnergy = authored ? 0.28f : 0.6f;
+        }
     }
+    private OmniLight3D _witchLight;
 
     private Node3D BuildArm(Color skin, out MeshInstance3D handMesh)
     {
@@ -1141,6 +1179,7 @@ public partial class Player : Node3D
     {
         CrashLogger.Mark("Player._Process");   // breadcrumb for freeze localization
         float dt = (float)delta;
+        if (Game.I != null && Game.I.State == GameState.ColliderEdit) { EditorFreeFly(dt); return; }   // (DEV) collider-editor free-fly cam
         // menus pause the world (WorldRunning=false) → freeze the authored anim trees to a still frame (this must run even
         // while paused, so it's before the CanControlLocal early-return below)
         bool worldRunning = Game.I == null || Game.I.WorldRunning;
@@ -1555,6 +1594,26 @@ public partial class Player : Node3D
         if (GaleWitch) _galeGuard = 0.8f;   // Tailwind: brief damage reduction right after dashing (NEW)
     }
 
+    // (DEV) free-fly camera for the collider editor: WASD relative to look, Space/Ctrl up/down, Shift = fast. Mouse-look already
+    // runs while the mouse is captured (see _Input). The Player is a plain Node3D, so we just drive GlobalPosition directly.
+    public void EditorLookPitch(float pitch) { _pitch = Mathf.Clamp(pitch, -1.4f, 1.4f); if (_cam != null) _cam.Rotation = new Vector3(_pitch, 0, 0); }
+    private void EditorFreeFly(float dt)
+    {
+        if (_cam == null) return;
+        float sp = Input.IsPhysicalKeyPressed(Key.Shift) ? 70f : 26f;
+        Vector3 fwd = -_cam.GlobalTransform.Basis.Z;
+        Vector3 right = _cam.GlobalTransform.Basis.X;
+        Vector3 mv = Vector3.Zero;
+        // physical WASD ONLY (not the move ACTIONS — those also bind the arrow keys, which the editor reserves for transforms)
+        if (Input.IsPhysicalKeyPressed(Key.W)) mv += fwd;
+        if (Input.IsPhysicalKeyPressed(Key.S)) mv -= fwd;
+        if (Input.IsPhysicalKeyPressed(Key.D)) mv += right;
+        if (Input.IsPhysicalKeyPressed(Key.A)) mv -= right;
+        if (Input.IsPhysicalKeyPressed(Key.Space)) mv += Vector3.Up;
+        if (Input.IsPhysicalKeyPressed(Key.Ctrl)) mv -= Vector3.Up;   // fly down (Q/E are collider Y in the editor)
+        if (mv.LengthSquared() > 1e-4f) GlobalPosition += mv.Normalized() * sp * dt;
+    }
+
     private Vector3 ClampPos(Vector3 p)
     {
         // (NEW) structures aren't infinitely tall — once you're flying clear above the local ground (arcing off a gale pad, an ult, etc.)
@@ -1572,17 +1631,35 @@ public partial class Player : Node3D
         foreach (var d in Game.I.Decks)
         {
             if (d.LowPad) continue;   // (NEW) a short dais — step straight up any side, no wall push-out (matches enemies)
-            if (GlobalPosition.Y >= d.TopY - 0.6f) continue;   // standing on/near the top — let us walk to the edge
+            if (GlobalPosition.Y >= d.TopY - 0.6f) continue;   // standing on/near the top — let us walk to the edge (red/blue both let you leave the top)
+            if (d.Boxed && GlobalPosition.Y < d.BotY - 0.6f) continue;   // (AUTHORED) a finite box — below it you pass underneath, no invisible column
             if (d.Floating && GlobalPosition.Y < d.TopY - 4.0f) continue;   // (NEW) sky island: only a thin solid rim below the top — open air below, so you can fly under it to catch a vine (no invisible column)
-            float ex = d.Half.X + 0.9f, ez = d.Half.Y + 0.9f;
-            float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
-            if (Mathf.Abs(dx) < ex && Mathf.Abs(dz) < ez)
+            const float pad = 0.9f;
+            if (d.Cyl)   // (AUTHORED) cylinder footprint → radial push-out, like a Blocker
             {
-                if (ex - Mathf.Abs(dx) < ez - Mathf.Abs(dz)) p.X = d.Center.X + Mathf.Sign(dx) * ex;
-                else p.Z = d.Center.Z + Mathf.Sign(dz) * ez;
+                float rr = d.Half.X + pad;
+                float ox = p.X - d.Center.X, oz = p.Z - d.Center.Z;
+                float dist = Mathf.Sqrt(ox * ox + oz * oz);
+                if (dist < rr) { float k = rr / Mathf.Max(dist, 0.001f); p.X = d.Center.X + ox * k; p.Z = d.Center.Z + oz * k; }
+                continue;
+            }
+            float ex = d.Half.X + pad, ez = d.Half.Y + pad;
+            float dx = p.X - d.Center.X, dz = p.Z - d.Center.Z;
+            float lx = dx, lz = dz;   // (AUTHORED) into the box's local frame (world→local = Godot Y-rot transpose) so a yawed collider pushes out squarely
+            if (d.Yaw != 0f) { float c = Mathf.Cos(d.Yaw), s = Mathf.Sin(d.Yaw); lx = dx * c - dz * s; lz = dx * s + dz * c; }
+            if (Mathf.Abs(lx) < ex && Mathf.Abs(lz) < ez)
+            {
+                if (ex - Mathf.Abs(lx) < ez - Mathf.Abs(lz)) lx = Mathf.Sign(lx) * ex;
+                else lz = Mathf.Sign(lz) * ez;
+                if (d.Yaw != 0f) { float c = Mathf.Cos(d.Yaw), s = Mathf.Sin(d.Yaw); p.X = d.Center.X + lx * c + lz * s; p.Z = d.Center.Z - lx * s + lz * c; }   // local→world (Godot Y-rot)
+                else { p.X = d.Center.X + lx; p.Z = d.Center.Z + lz; }
             }
         }
-        p = Game.I.ClampToWorld(p, 3f);   // (NEW) the overworld cliff-wall boundary — hard stop just inside World.WorldRadius (no-op in maze/expedition/sky)
+        // (FIX) the overworld cliff-wall boundary. NEGATIVE margin pushes the stop OUT past WorldRadius so you can walk right up
+        // to the cliff rock. The mountains are buried 40u and cone-shaped, so their rock face AT GROUND LEVEL sits ~440-465 from
+        // origin (well beyond WorldRadius=425); a WorldRadius-3 clamp stopped you ~20-40u short of the visible wall — the "invisible
+        // wall too far in front of the mountains" bug. WorldRadius+10 puts the stop just inside the nearest ground-level rock face.
+        p = Game.I.ClampToWorld(p, World.PlayerEdgeMargin);   // no-op in maze/expedition/sky
         return p;   // Y preserved — vertical handled by UpdateVertical
     }
 

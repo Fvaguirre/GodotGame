@@ -4,42 +4,33 @@ using Godot;
 // Game.GlowFlowersNear() pulses every bloom in range. Purely cosmetic + local, so it needs no networking. (NEW)
 public partial class Flower : Node3D
 {
-    private MeshInstance3D _bloom;
-    private StandardMaterial3D _mat;
-    private float _baseEnergy = 1.8f;
+    private MeshInstance3D _bloom;   // the whole flower model (stem + bloom baked in)
     private Vector3 _baseScale = Vector3.One;
     private bool _glowing = false;
 
     public void Init(Color bloomCol, float stemH, ulong seed)
     {
-        var stem = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.02f, BottomRadius = 0.03f, Height = stemH } };
-        stem.MaterialOverride = Game.Toon(new Color(0.10f, 0.18f, 0.10f), 0.95f, 0.22f, 0f);
-        stem.Position = new Vector3(0, stemH / 2f, 0);
-        AddChild(stem);
-
-        _mat = Game.ToonEmissive(bloomCol, 0.5f);
-        _baseEnergy = _mat.EmissionEnergyMultiplier;
-        _bloom = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.12f, Height = 0.18f }, MaterialOverride = _mat };
-        _bloom.Position = new Vector3(0, stemH, 0);
+        // (MESHY) real 3D flower model. It carries its own stem, so no separate stem node. A gentle per-flower colour push
+        // toward the requested palette bloom colour (plus seeded jitter) keeps a bed of flowers varied but grove-cohesive.
+        float height = Mathf.Max(0.4f, stemH * 1.9f);
+        _bloom = PropGlb.Instance("flower", height, seed: (int)seed);
+        // signed albedo offset: nudge toward the palette hue (small, so the baked texture still reads), plus the seed jitter
+        var jit = Vis.VaryColorSeeded((int)seed, 0.05f, 0.09f);
+        var push = new Color((bloomCol.R - 0.55f) * 0.28f, (bloomCol.G - 0.55f) * 0.28f, (bloomCol.B - 0.55f) * 0.28f, 0f);
+        _bloom.SetInstanceShaderParameter("node_var", new Vector4(jit.R + push.R, jit.G + push.G, jit.B + push.B, 0f));
         AddChild(_bloom);
     }
 
-    // flare up then settle back; guarded so continuous proximity doesn't restack the tween every frame
+    // react to being brushed past / jumped near / hit: a quick scale pop, then settle back.
+    // guarded so continuous proximity doesn't restack the tween every frame.
     public void Pulse()
     {
-        if (_mat == null || _glowing) return;
+        if (_glowing || !GodotObject.IsInstanceValid(_bloom)) return;
         _glowing = true;
-        float peak = _baseEnergy * 2.6f;
-        var t = CreateTween();
-        t.TweenMethod(Callable.From<float>(v => { if (GodotObject.IsInstanceValid(_mat)) _mat.EmissionEnergyMultiplier = v; }), _baseEnergy, peak, 0.12f);
-        t.TweenMethod(Callable.From<float>(v => { if (GodotObject.IsInstanceValid(_mat)) _mat.EmissionEnergyMultiplier = v; }), peak, _baseEnergy, 0.5f);
-        t.TweenCallback(Callable.From(() => _glowing = false));
-
-        if (GodotObject.IsInstanceValid(_bloom))
-        {
-            var st = _bloom.CreateTween();
-            st.TweenProperty(_bloom, "scale", _baseScale * 1.35f, 0.12f).SetEase(Tween.EaseType.Out);
-            st.TweenProperty(_bloom, "scale", _baseScale, 0.5f);
-        }
+        _baseScale = _bloom.Scale;
+        var st = _bloom.CreateTween();
+        st.TweenProperty(_bloom, "scale", _baseScale * 1.32f, 0.12f).SetEase(Tween.EaseType.Out);
+        st.TweenProperty(_bloom, "scale", _baseScale, 0.5f).SetTrans(Tween.TransitionType.Back).SetEase(Tween.EaseType.Out);
+        st.TweenCallback(Callable.From(() => _glowing = false));
     }
 }

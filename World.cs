@@ -10,6 +10,7 @@ public partial class World : Node3D
 {
     public const float ChunkSize = 50f;
     public const float WorldRadius = 425f;   // (TUNE) the bounded overworld: play area is a disc of this radius around origin, walled by a mountain/cliff ring. Grove + Jungle. (700 → 625 → 575 → 425: −550 diameter total, tightening it up so the map reads full solo)
+    public const float PlayerEdgeMargin = -2f;   // (FIX) player-movement clamp: stop at WorldRadius+2, just inside the cliff rock. The boundary ring now lands its GROUND-LEVEL faces at ~WorldRadius+3..6 consistently (see BuildBoundaryRing), so this puts the wall right at the mountains all the way around. Was -10 (and +3 before) → invisible wall short of the peaks.
     public const int LoadRadius = 2;          // full-detail chunks: 5x5 resident (props, grass, collision, gameplay)
     public static int FarRadius => Game.I != null ? Game.I.FarRing : 3;   // (NEW) lite-LOD ring radius — driven by the Render Distance setting (Low 3 / Med 4 / High 5). Trees are GPU-instanced (TreeField) so this is cheap.
     private const int BuildBudget = 3;        // (NEW) chunks built per frame — spreads the cost so streaming never hitches
@@ -232,16 +233,19 @@ public partial class World : Node3D
     private void BuildBoundaryRing()
     {
         _boundaryRing = new Node3D(); AddChild(_boundaryRing);
-        var cliffMat = Matte(new Color(0.10f, 0.12f, 0.15f), 0.95f, false);   // dark craggy rock; fog/atmosphere lightens it with distance
+        var cliffMat = CliffMat();   // (NEW) real rock_face_03 texture, triplanar so the tall cones don't UV-stretch; dark-toned so fog lightens it with distance
         var rng = new RandomNumberGenerator { Seed = 0xC11FF ^ _worldSeed };
         int n = 120;                                    // enough overlap around the full circle to read as a solid wall
         for (int i = 0; i < n; i++)
         {
             float a = i / (float)n * Mathf.Tau;
-            float hgt = rng.RandfRange(120f, 210f), wid = rng.RandfRange(70f, 120f);
-            // (FIX) push the CENTER out by the base half-width so the mountain's INNER FACE lands at ~WorldRadius instead of
-            // its wide base intruding ~100u into the play disc (which is why you could walk through them / things spawned in them).
-            float r = WorldRadius + wid + rng.RandfRange(3f, 16f);   // inner face = WorldRadius + 3..16 → always just beyond the player's hard clamp (WorldRadius−3)
+            float hgt = rng.RandfRange(150f, 195f), wid = rng.RandfRange(88f, 104f);   // (TUNE) tighter ranges → consistent ground-level face radius so ONE player clamp meets the rock all the way around
+            // (FIX) The cones are BURIED 40u, so at GROUND level the cone has narrowed to ~0.8·wid — its visible rock face there
+            // sits further out than its buried base. Push the centre so that ground-level face lands ~WorldRadius+5 (just beyond
+            // the player clamp), consistently, instead of the old +wid push which put the face 20-40u past the clamp → "invisible
+            // wall way in front of the mountains".
+            float groundFactor = 1f - 40f / (hgt + 40f);                     // cone radius at ground level as a fraction of wid
+            float r = WorldRadius + wid * groundFactor + rng.RandfRange(4f, 8f);   // ground-level inner face ≈ WorldRadius + 4..8
             float gy = Height(Mathf.Cos(a) * r, Mathf.Sin(a) * r);
             var m = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = wid * 0.08f, BottomRadius = wid, Height = hgt + 40f, RadialSegments = 7, Rings = 0 }, MaterialOverride = cliffMat };
             m.Position = new Vector3(Mathf.Cos(a) * r, gy + (hgt + 40f) * 0.5f - 40f, Mathf.Sin(a) * r);   // buried 40u so it never floats on the rim's hills
@@ -256,6 +260,7 @@ public partial class World : Node3D
         Game.I.Blockers.Clear();
         foreach (var kv in _chunkBlockers) Game.I.Blockers.AddRange(kv.Value);
         Game.I.Blockers.AddRange(Game.I.PersistentBlockers);   // structures that survive streaming (the maze well)
+        Game.I.Blockers.AddRange(Game.I.PedestalRimBlockers);  // (NEW) the raised rune-block rims around pedestal daises
         Game.I.Decks.Clear();
         foreach (var kv in _chunkDecks) Game.I.Decks.AddRange(kv.Value);
         Game.I.Decks.AddRange(Game.I.PersistentDecks);   // (NEW) floating sky-island tops survive chunk streaming
@@ -286,6 +291,28 @@ public partial class World : Node3D
     private static Material Matte(Color c, float rough = 0.95f, bool outline = true)
         => Vis.Stone(c);   // (PHASE 2) structures default to painterly STONE (statues/graveyard/shrines/temples/wells/altars/cliffs); wood & thatch bits call Vis.Wood/Vis.Thatch directly
 
+    // (NEW) boundary-mountain rock: rock_face_03 diffuse + normal, TRIPLANAR world-space so the tall thin cones don't smear
+    // their UVs vertically. Darkened + slightly cool so distance fog reads as depth, matching the old flat cliff tone.
+    private static Material _cliffMat;
+    private static Material CliffMat()
+    {
+        if (_cliffMat != null) return _cliffMat;
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.55f, 0.56f, 0.60f),      // knock the bright rock down toward the old dark craggy tone
+            AlbedoTexture = TerrainTex("rock_face_03_diff_4k.jpg"),
+            Roughness = 0.96f,
+            MetallicSpecular = 0.1f,
+            Uv1Triplanar = true,
+            Uv1Scale = new Vector3(0.035f, 0.035f, 0.035f),    // world-space tiling over the ~150-195u cones
+            TextureFilter = BaseMaterial3D.TextureFilterEnum.LinearWithMipmapsAnisotropic,
+        };
+        var nrm = TerrainTex("rock_face_03_nor_4k.png");   // real cracked-rock relief
+        if (nrm != null) { mat.NormalEnabled = true; mat.NormalTexture = nrm; mat.NormalScale = 1.0f; }
+        _cliffMat = mat;
+        return mat;
+    }
+
     // ---- water shader (NEW) -----------------------------------------------
     // A stylized surface: world-space gerstner-ish sine waves displace the mesh (so it visibly rolls and is
     // continuous across chunks), analytic wave normals catch the sun for moving glints, fresnel deepens the
@@ -310,13 +337,69 @@ public partial class World : Node3D
     // One material PER CHUNK now (they share the one Shader resource, and each chunk was already its own draw call, so this
     // costs nothing) — because each chunk carries its own baked PATH MASK texture, and sampler uniforms can't be per-instance.
     private static Shader _terrainShader;
+    private static readonly System.Collections.Generic.Dictionary<string, Texture2D> _terrainTexCache = new();
+    private static readonly System.Collections.Generic.List<ShaderMaterial> _terrainMats = new();   // live chunk terrain materials, so quality changes re-apply
+    // Texture Quality tier: 2 High = full 2k source, 1 Medium = 1k cap, 0 Low = 512 cap. Lower tiers downscale the ground/rock
+    // textures in-engine at load → less VRAM on weak GPUs, no extra files shipped. Set via Game.SetTextureQuality (menus + persisted).
+    public static int TexQuality { get; private set; } = 2;
+
+    // param name -> source file for every texture the terrain material samples (used to (re)apply at the current quality)
+    private static readonly (string param, string file)[] _terrainTexParams =
+    {
+        ("tex_decay",  "dry_decay_leaves_diff_4k.jpg"), ("tex_ground", "forest_ground_06_diff_4k.jpg"),
+        ("tex_leaves", "leaves_forest_ground_diff_4k.jpg"), ("tex_rock", "gray_rocks_diff_4k.jpg"),
+        ("tex_sand",   "coast_sand_rocks_02_diff_4k.jpg"), ("tex_river", "dry_riverbed_rock_diff_4k.jpg"),
+        ("nrm_decay",  "dry_decay_leaves_nor_4k.png"), ("nrm_rock", "gray_rocks_nor_4k.png"),
+        ("nrm_sand",   "coast_sand_rocks_02_nor_4k.png"), ("nrm_river", "dry_riverbed_rock_nor_4k.png"),
+    };
+
+    // load a Poly Haven ground texture, downscaled to the current quality cap. Cached per (file, quality). Null-safe.
+    private static Texture2D TerrainTex(string file)
+    {
+        string key = $"{file}@{TexQuality}";
+        if (_terrainTexCache.TryGetValue(key, out var cached)) return cached;
+        var src = GD.Load<Texture2D>($"res://assets/textures/terrain/{file}");
+        Texture2D outT = src;
+        if (src != null && TexQuality < 2)
+        {
+            int cap = TexQuality == 1 ? 1024 : 512;
+            var img = src.GetImage();
+            if (img != null)
+            {
+                if (img.IsCompressed()) img.Decompress();
+                if (Mathf.Max(img.GetWidth(), img.GetHeight()) > cap) { img.Resize(cap, cap, Image.Interpolation.Lanczos); outT = ImageTexture.CreateFromImage(img); }
+            }
+        }
+        _terrainTexCache[key] = outT;
+        return outT;
+    }
+    private static void ApplyTerrainTextures(ShaderMaterial m)
+    {
+        foreach (var (param, file) in _terrainTexParams) m.SetShaderParameter(param, TerrainTex(file));
+    }
     public static ShaderMaterial TerrainMat(Texture2D pathMask)
     {
         _terrainShader ??= new Shader { Code = TerrainCode };
         var m = new ShaderMaterial { Shader = _terrainShader };
         m.SetShaderParameter("water_level", WaterLevel);
         if (pathMask != null) m.SetShaderParameter("path_mask", pathMask);
+        ApplyTerrainTextures(m);   // (NEW) DECAY forest floor base + soil/leaf/rock/sand/riverbed + normals, at the current texture quality
+        if (_terrainMats.Count > 96) _terrainMats.RemoveAll(mm => !GodotObject.IsInstanceValid(mm));
+        _terrainMats.Add(m);
         return m;
+    }
+
+    // (NEW) apply a Texture Quality tier live: re-scale the ground/rock textures and re-set them on every live terrain material + the cliff.
+    public static void SetTexQuality(int q)
+    {
+        TexQuality = Mathf.Clamp(q, 0, 2);
+        _terrainMats.RemoveAll(mm => !GodotObject.IsInstanceValid(mm));
+        foreach (var mm in _terrainMats) ApplyTerrainTextures(mm);
+        if (_cliffMat is StandardMaterial3D sm)
+        {
+            sm.AlbedoTexture = TerrainTex("rock_face_03_diff_4k.jpg");
+            var n = TerrainTex("rock_face_03_nor_4k.png"); if (n != null) sm.NormalTexture = n;
+        }
     }
     private const string TerrainCode = @"
 shader_type spatial;
@@ -325,6 +408,24 @@ render_mode cull_disabled;
 instance uniform vec3 base_color = vec3(0.06, 0.07, 0.09);
 uniform sampler2D path_mask : hint_default_black, filter_linear;   // R = trodden dirt track, G = laid cobblestone
 uniform float water_level = -1.0;
+
+// (NEW) real PBR ground textures (Poly Haven diffuse), blended by zone. Tiled in world space; anisotropic for grazing angles.
+uniform sampler2D tex_decay  : source_color, filter_linear_mipmap_anisotropic;   // DOMINANT base: dry decaying forest floor
+uniform sampler2D tex_ground : source_color, filter_linear_mipmap_anisotropic;   // secondary soil patches
+uniform sampler2D tex_leaves : source_color, filter_linear_mipmap_anisotropic;   // dry-leaf drift overlay
+uniform sampler2D tex_rock   : source_color, filter_linear_mipmap_anisotropic;   // slopes / rocky ground
+uniform sampler2D tex_sand   : source_color, filter_linear_mipmap_anisotropic;   // shoreline sand
+uniform sampler2D tex_river  : source_color, filter_linear_mipmap_anisotropic;   // dry riverbed near the water
+// matching NORMAL maps (OpenGL convention, linear/non-color) — real surface relief, blended by the same zone weights
+uniform sampler2D nrm_decay  : hint_normal, filter_linear_mipmap_anisotropic;
+uniform sampler2D nrm_rock   : hint_normal, filter_linear_mipmap_anisotropic;
+uniform sampler2D nrm_sand   : hint_normal, filter_linear_mipmap_anisotropic;
+uniform sampler2D nrm_river  : hint_normal, filter_linear_mipmap_anisotropic;
+uniform float tex_scale = 0.10;   // world→UV tiling frequency
+uniform float tex_normal_str = 1.15;   // how hard the texture normals perturb the surface
+
+// decode an OpenGL normal map to a world-XZ slope offset (terrain is ~+Y up, so tangent XY ≈ world XZ for this stylized floor)
+vec2 nrm_slope(sampler2D t, vec2 uv) { vec2 n = texture(t, uv).xy * 2.0 - 1.0; return n; }
 
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
 vec2 hash2(vec2 p) { return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453); }
@@ -398,26 +499,43 @@ void fragment() {
     beach *= 0.55 + 0.45 * fbm(p * 0.7);            // ragged, uneven sand line rather than a contour ring
     float wet  = (1.0 - smoothstep(-0.55, 0.55, above)) * beach;                                // the darker, glossy tide line
 
-    // ---- BASE PALETTE (AUTUMN grove — WORLD-SPACE zones so it's SEAMLESS across chunks) --------------------
-    // The dominant ground colour is a continuous function of world position, NOT the per-chunk base_color uniform —
-    // that per-chunk jump was the grid seam. base_color now only faintly tints per biome, so the floor reads as one
-    // painted autumn carpet with no visible tile grid.
-    float z1 = fbm(p * 0.010);
-    float z2 = fbm(p * 0.022 + 19.0);
-    vec3 duff  = vec3(0.26, 0.15, 0.06);   // golden-brown leaf litter
-    vec3 ochre = vec3(0.36, 0.21, 0.07);   // warm amber-ochre earth
-    vec3 rust  = vec3(0.32, 0.11, 0.05);   // vivid russet-red
-    vec3 olive = vec3(0.17, 0.18, 0.08);   // faded moss patches
-    vec3 zone = mix(duff, ochre, smoothstep(0.40, 0.70, z1));
-    zone = mix(zone, rust, smoothstep(0.60, 0.88, z2) * 0.7);
-    zone = mix(zone, olive, smoothstep(0.58, 0.88, fbm(p * 0.018 + 41.0)) * 0.4);
-    vec3 col = mix(zone, base_color, 0.16);          // per-chunk colour is only a faint tint now (seam gone)
-    col *= 0.74 + 0.5 * n;                           // multi-scale value variation
-    col = mix(col * vec3(0.66, 0.62, 0.66), col, smoothstep(0.30, 0.70, flatness));   // damp shadowed earth on steep faces
+    // ---- REAL PBR GROUND TEXTURES, blended by zone (world-space, seamless). Decay-leaf texture reads across MOST of the
+    //      terrain for its leaf detail + relief, but the palette stays varied (greens/soil) — NOT tinted browner. --------------
+    vec2 tuv = p * tex_scale;
+    // mossy-green hollows (damp, flat) — keep the greens where the old palette had them
+    float mossZone = smoothstep(0.50, 0.82, fbm(p * 0.013 + 7.0)) * smoothstep(0.42, 0.80, flatness);
+    // sample the maps; two scales on the big ones hides obvious tiling
+    vec3 t_decay  = mix(texture(tex_decay, tuv).rgb,       texture(tex_decay, tuv * 0.33 + vec2(2.7)).rgb, 0.4);
+    vec3 t_ground = mix(texture(tex_ground, tuv).rgb,      texture(tex_ground, tuv * 0.35 + vec2(4.1)).rgb, 0.4);
+    vec3 t_leaves = texture(tex_leaves, tuv * 0.75 + vec2(1.7)).rgb;
+    vec3 t_rock   = mix(texture(tex_rock, tuv * 0.55).rgb, texture(tex_rock, tuv * 0.20 + vec2(9.0)).rgb, 0.4);
+    vec3 t_river  = texture(tex_river, tuv * 0.65 + vec2(3.0)).rgb;
+    // BASE = decay-leaf texture blended across MOST of the terrain (its leaf detail + relief reads widely), interwoven with
+    // forest-ground soil so the colour stays varied instead of one flat brown. Decay stays prominent (~55-85% by noise).
+    float decayMask = clamp(0.55 + 0.32 * fbm(p * 0.03 + 5.0), 0.0, 1.0);   // decay dominant, forest-ground soil weaves through
+    vec3 tex = mix(t_ground, t_decay, decayMask);
+    // green forest-leaf drift over the flats + damper hollows — brings the GREENS back so it isn't monochrome brown
+    float leafMix = smoothstep(0.42, 0.85, fbm(p * 0.05 + 12.0)) * smoothstep(0.45, 0.85, flatness);
+    tex = mix(tex, t_leaves, leafMix * 0.55 + mossZone * 0.35);
+    // running weights for the NORMAL blend (start on the decay base)
+    vec2 texSlope = nrm_slope(nrm_decay, tuv);
+    // dry riverbed rock in the low flat band right around the water (above the wet sand)
+    float river = clamp(1.0 - smoothstep(0.2, 2.2, above), 0.0, 1.0) * smoothstep(0.50, 0.85, flatness);
+    tex = mix(tex, t_river, river * 0.7);
+    texSlope = mix(texSlope, nrm_slope(nrm_river, tuv * 0.65 + vec2(3.0)), river * 0.7);
+    // steep faces → rock
+    float rockW = 1.0 - smoothstep(0.52, 0.85, flatness);
+    tex = mix(tex, t_rock, rockW);
+    texSlope = mix(texSlope, nrm_slope(nrm_rock, tuv * 0.55), rockW);
+    // GENTLE tint only — keep the textures' own colour (do NOT push the whole floor browner); greens in the moss hollows
+    tex *= mix(vec3(1.06, 1.02, 0.92), vec3(0.90, 1.06, 0.84), mossZone);
+    vec3 col = mix(tex, base_color, 0.06);            // faint per-chunk biome tint
+    col *= 0.78 + 0.42 * n;                           // macro value drift (painterly)
+    col = mix(col * vec3(0.70, 0.66, 0.68), col, smoothstep(0.30, 0.70, flatness));   // damp shadowed earth on steep faces
     // fallen-leaf drifts — VIVID red/gold flecks pooling on the flat ground
-    float litter = smoothstep(0.68, 0.93, fbm(pd * 6.0)) * smoothstep(0.45, 0.85, flatness);
-    col = mix(col, mix(vec3(0.52, 0.13, 0.05), vec3(0.62, 0.43, 0.09), fbm(pd * 11.0)), litter * 0.6);
-    col += vec3(0.06, 0.04, 0.012) * smoothstep(0.72, 1.0, n);   // warm golden shimmer in the brightest patches
+    float litter = smoothstep(0.70, 0.93, fbm(pd * 6.0)) * smoothstep(0.45, 0.85, flatness);
+    col = mix(col, mix(vec3(0.52, 0.13, 0.05), vec3(0.62, 0.43, 0.09), fbm(pd * 11.0)), litter * 0.45);
+    col += vec3(0.09, 0.075, 0.025) * smoothstep(0.72, 1.0, n);   // warm sunlit highlights
 
     // ---- MICRO-RELIEF -----------------------------------------------------
     float e = 0.30;
@@ -425,6 +543,7 @@ void fragment() {
     float hx = relief(pd + vec2(e, 0.0));
     float hz = relief(pd + vec2(0.0, e));
     vec2 slope = vec2(hx - h0, hz - h0) / e;
+    slope -= texSlope * tex_normal_str;   // (NEW) real material relief from the blended texture normals
     float bumpAmt = 0.55;
     float cavity = clamp(0.55 + 1.4 * (h0 - 0.5), 0.0, 1.0);   // crevices darken, crests catch the moon
     col *= 0.80 + 0.34 * cavity;
@@ -433,10 +552,11 @@ void fragment() {
     float rough = 0.95;
     float spec = 0.2;
 
-    // ---- SAND -------------------------------------------------------------
-    vec3 sand = mix(vec3(0.175, 0.150, 0.108), vec3(0.245, 0.220, 0.168), fbm(pd * 3.5));
+    // ---- SAND (real coastal sand+rocks texture) ---------------------------
+    vec3 sand = texture(tex_sand, tuv * 0.9).rgb * vec3(1.12, 1.04, 0.86);   // warmed a touch toward the grove
     sand *= 0.86 + 0.28 * cavity;
     col = mix(col, sand, beach);
+    slope = mix(slope, slope - nrm_slope(nrm_sand, tuv * 0.9) * tex_normal_str, beach);   // shore-sand relief
     col = mix(col, col * vec3(0.52, 0.56, 0.62), wet);            // wet sand darkens and cools
     col += vec3(0.10, 0.10, 0.13) * step(0.977, vnoise(pd * 90.0)) * beach;   // mica sparkle in the dry sand
     rough = mix(rough, 0.80, beach);
@@ -712,7 +832,7 @@ void fragment() {
     // only a fine ripple, no matter how deep it is. Continuous across chunk seams because both are pure Height() reads.
     private ArrayMesh BuildWaterMesh(Vector2I c)
     {
-        const int res = 24;
+        const int res = 32;   // (TUNE) denser water grid → smoother wave surface + normals (was 24, read a bit blocky/pixelly up close)
         float half = ChunkSize * 0.5f, ox = c.X * ChunkSize, oz = c.Y * ChunkSize;
         var verts = new List<Vector3>(); var norms = new List<Vector3>();
         var uvs = new List<Vector2>(); var cols = new List<Color>(); var idx = new List<int>();
@@ -1030,6 +1150,7 @@ void fragment() {
 
         var decks = new List<Deck>();
         var ramps = new List<Ramp>();
+        _emitDecks = decks; _emitRamps = ramps;   // (AUTHORED) so StructureModel can emit template decks/ramps even when a caller (House/Altar/…) only passes blockers
 
         // --- trees + terrain structures: placed in BOTH full and lite chunks (this is the silhouette that fills the view) ---
         if (jungle)
@@ -1078,10 +1199,11 @@ void fragment() {
         else if (biome != 5 && biome != 6 && biome != 9)   // not on house/altar/hamlet chunks
         {
             if (structRoll < 0.12f) Fort(root, rng, blockers, decks, ramps, c);
-            else if (structRoll < 0.26f) Ruins(root, rng, blockers, decks, c);
+            else if (structRoll < 0.26f) Ruins(root, rng, blockers, decks, ramps, c);
         }
 
         Dbg.Log($"BuildChunk {c} structs done");
+        _scatterBlockers = blockers;   // (NEW) so the ground-detail scatter below avoids the structures just placed
         // --- ground detail: grass, ferns, flowers, wisps, fireflies, pickups. FULL chunks ONLY — this is the bulk of the
         //     per-chunk node cost, and its rng comes LAST so skipping it never shifts the trees/structures above. ---
         if (!lite)
@@ -1099,6 +1221,11 @@ void fragment() {
                 int detail = rng.RandiRange(4, 9);
                 for (int i = 0; i < detail; i++) GrassTuft(root, rng, R(rng), R(rng));
                 if (biome != 3) { int fl = rng.RandiRange(0, 3); for (int i = 0; i < fl; i++) Flowers(root, rng, R(rng), R(rng)); }
+                { int nf = rng.RandiRange(0, 2); for (int i = 0; i < nf; i++) GroveFern(root, rng, R(rng), R(rng)); }   // (MESHY) real fern/bush clusters on the Grove floor
+                // (NEW autumn detail) warm dry grass tufts + fallen-leaf litter, with the occasional raked pile
+                { int fgc = rng.RandiRange(2, 5); for (int i = 0; i < fgc; i++) FallGrassClump(root, rng, R(rng), R(rng)); }
+                { int lsc = rng.RandiRange(3, 6); for (int i = 0; i < lsc; i++) LeafScatter(root, rng, R(rng), R(rng), rng.RandiRange(4, 9)); }
+                if (rng.Randf() < 0.3f) LeafPile(root, rng, R(rng), R(rng));
                 if (biome != 3 && biome != 6 && rng.Randf() < 0.2f) SpawnPumpkin(root, rng, R(rng), R(rng));   // the odd wild pumpkin
                 bool wispy = biome == 1 || biome == 2 || biome == 3 || biome == 8 || biome == 10;   // forest/marsh/mushroom/meadow
                 int wisps = wispy ? rng.RandiRange(1, 2) : (rng.Randf() < 0.15f ? 1 : 0);
@@ -1125,72 +1252,138 @@ void fragment() {
     {
         float ox = c.X * ChunkSize, oz = c.Y * ChunkSize;
         float lx = rng.RandfRange(-8, 8), lz = rng.RandfRange(-8, 8);
+        if (!DryLand(ox + lx, oz + lz, 0.6f)) return;   // (WATER) keeps/forts never in the water
+        if (StructureBlocked(root, lx, lz, bl, 8f)) return;   // don't drop a keep/fort on a tree / structure / map feature
         float baseY = Height(ox + lx, oz + lz);
-        float topY = rng.RandfRange(4.5f, 6.5f);
-        float hx = rng.RandfRange(6f, 8f), hz = rng.RandfRange(6f, 8f);
-        var top = Matte(new Color(0.22f, 0.21f, 0.24f), 0.9f, false);
-        var stone = Matte(new Color(0.15f, 0.14f, 0.17f), 0.9f, false);
-
-        // solid body
-        float found = 3.5f;   // buried foundation skirt: keep the top where it is, extend the base down so the keep never floats on the downhill side of a slope (NEW)
-        var body = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(hx * 2, topY + found, hz * 2) } };
-        body.MaterialOverride = stone; body.Position = new Vector3(lx, baseY + (topY - found) / 2f, lz); root.AddChild(body);
-        var cap = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(hx * 2 + 0.4f, 0.5f, hz * 2 + 0.4f) } };
-        cap.MaterialOverride = top; cap.Position = new Vector3(lx, topY + baseY, lz); root.AddChild(cap);
-        // battlements
-        foreach (var (mx, mz, sx, sz) in new[] { (0f, hz, hx * 2, 0.6f), (0f, -hz, hx * 2, 0.6f), (hx, 0f, 0.6f, hz * 2), (-hx, 0f, 0.6f, hz * 2) })
+        if (rng.Randf() < 0.5f)
         {
-            var w = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(sx, 1.1f, sz) } };
-            w.MaterialOverride = stone; w.Position = new Vector3(lx + mx, topY + 0.55f + baseY, lz + mz); root.AddChild(w);
+            // (MESHY) decorative ruined tower — a tall landmark, coarse blocker, not climbable
+            float fh = rng.RandfRange(11f, 15f);   // (SCALE) bigger — was 6.5-9.5, read too small
+            StructureModel(root, "fort", new Vector3(lx, baseY, lz), fh, rng.Randf() * Mathf.Tau, bl, (int)rng.Randi(), decks, flatTopFrac: 0.82f);   // solid + you can stand on the flat battlement top
         }
-        decks.Add(new Deck { Center = new Vector3(ox + lx, 0, oz + lz), Half = new Vector2(hx, hz), TopY = topY + baseY });
+        else ClimbableKeep(root, rng, bl, decks, ramps, c, lx, lz, rng.RandfRange(16f, 20f));   // (MESHY) the climbable keep variant — walkable roof + stairs (bigger again)
+    }
 
-        // stepped ramp up the +Z side
-        int steps = 8;
-        float runLen = topY * 2.8f, rw = 3.6f;
-        float z0 = lz + hz;
-        for (int i = 0; i < steps; i++)
+    // (DEV) line up every Meshy structure at a world point with its collision REGISTERED, so a scenario can toggle the collision
+    // viz and audit each. Returns each structure's world position (+ .Y=height) for the scenario to frame.
+    public Godot.Collections.Array<Vector3> DebugStructureAudit(Vector3 center)
+    {
+        var outp = new Godot.Collections.Array<Vector3>();
+        var c = new Vector2I(Mathf.RoundToInt(center.X / ChunkSize), Mathf.RoundToInt(center.Z / ChunkSize));
+        if (!_chunks.TryGetValue(c, out var root)) return outp;
+        if (!_chunkDecks.TryGetValue(c, out var decks)) { decks = new List<Deck>(); _chunkDecks[c] = decks; }
+        if (!_chunkRamps.TryGetValue(c, out var ramps)) { ramps = new List<Ramp>(); _chunkRamps[c] = ramps; }
+        if (!_chunkBlockers.TryGetValue(c, out var bl)) { bl = new List<Blocker>(); _chunkBlockers[c] = bl; }
+        _emitDecks = decks; _emitRamps = ramps;   // (AUTHORED) so StructureModel/StairModel use the saved collider templates in the audit too
+        var rng = new RandomNumberGenerator { Seed = 42 };
+        float bz = center.Z - root.Position.Z;
+        var specs = new (string name, float h, bool arch, float flatTop)[]
         {
-            float frac = (i + 0.5f) / steps;
-            float sy = topY * (1f - frac);
-            float sz = z0 + runLen * frac;
-            float vis = Mathf.Max(0.4f, sy), stepH = vis + 2.5f;   // buried skirt under each step so the ramp never floats on a slope (NEW)
-            var st = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(rw, stepH, 1.2f + runLen / steps) } };
-            st.MaterialOverride = top; st.Position = new Vector3(lx, baseY + vis - stepH / 2f, sz); root.AddChild(st);
+            ("cottage_a", 14f, false, 0f), ("cottage_b", 14f, false, 0f), ("fort", 13f, false, 0.82f),
+            ("ruin", 12f, true, 0f), ("staircase", 8f, false, 0.9f), ("altar", 2.6f, false, 0f),
+            ("well", 3f, false, 0f), ("gravestones", 2.2f, false, 0f), ("platform", 2.0f, false, 0.6f),
+        };
+        float sp = 24f, x0 = center.X - root.Position.X - (specs.Length) * sp * 0.5f;
+        for (int i = 0; i < specs.Length; i++)
+        {
+            float lx = x0 + i * sp, gyy = Height(root.Position.X + lx, root.Position.Z + bz);
+            float auditYaw = specs[i].name == "fort" ? 0.7f : 0f;   // (AUTHORED) rotate the templated fort to verify authored colliders track the model's spawn rotation
+            if (specs[i].name == "staircase") StairModel(root, "staircase", new Vector3(lx, gyy, bz), specs[i].h, bl, decks, ramps, i * 13 + 3);
+            else StructureModel(root, specs[i].name, new Vector3(lx, gyy, bz), specs[i].h, auditYaw, bl, i * 13 + 3, decks, specs[i].flatTop, specs[i].arch);
+            outp.Add(new Vector3(root.Position.X + lx, gyy + specs[i].h, root.Position.Z + bz));
         }
-        ramps.Add(new Ramp { Center = new Vector3(ox + lx, 0, oz + (z0 + runLen / 2f)), Half = new Vector2(rw / 2f, runLen / 2f), YLow = topY + baseY, YHigh = baseY, AlongX = false });
-        // notch the battlement where the ramp meets the top so you can step on
-        var gap = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(rw + 0.4f, 1.4f, 1.0f) } };
-        gap.MaterialOverride = top; gap.Position = new Vector3(lx, topY + 0.55f + baseY, lz + hz); root.AddChild(gap);
+        float kx = x0 + specs.Length * sp;   // climbable keep at the end
+        ClimbableKeep(root, rng, bl, decks, ramps, c, kx, bz, 16f);
+        outp.Add(new Vector3(root.Position.X + kx, Height(root.Position.X + kx, root.Position.Z + bz) + 16f, root.Position.Z + bz));
+        MarkBlockersDirty();
+        return outp;
+    }
+
+    // (DEV) place a climbable keep at a world point with its Deck/Ramp REGISTERED into the chunk collision (so a scenario can
+    // actually walk up it). Returns (roofY, stairFarWorldZ) so the caller can position the player at the stair base. Fixed H.
+    public Vector3 DebugSpawnClimbableKeep(Vector3 center)
+    {
+        var c = new Vector2I(Mathf.RoundToInt(center.X / ChunkSize), Mathf.RoundToInt(center.Z / ChunkSize));
+        if (!_chunks.TryGetValue(c, out var root)) return new Vector3(center.Y, center.X, center.Z);
+        if (!_chunkDecks.TryGetValue(c, out var decks)) { decks = new List<Deck>(); _chunkDecks[c] = decks; }
+        if (!_chunkRamps.TryGetValue(c, out var ramps)) { ramps = new List<Ramp>(); _chunkRamps[c] = ramps; }
+        if (!_chunkBlockers.TryGetValue(c, out var bl)) { bl = new List<Blocker>(); _chunkBlockers[c] = bl; }
+        float lx = center.X - root.Position.X, lz = center.Z - root.Position.Z;
+        const float H = 18f;
+        ClimbableKeep(root, new RandomNumberGenerator { Seed = 7 }, bl, decks, ramps, c, lx, lz, H);
+        MarkBlockersDirty();
+        float ground = Height(center.X, center.Z);
+        float placeY = ground - Mathf.Max(0.6f, H * 0.04f);
+        var ext = PropGlb.NormExtents("keep_climb");
+        float halfX = H * ext.X, halfZ = H * ext.Y;
+        float roofY = placeY + H * 0.60f;
+        float rise = roofY - ground;
+        float xStairWorld = center.X - halfX * 0.42f;                    // the +Z-face staircase's X (offset to -X)
+        float stairFarZ = center.Z + halfZ * 0.92f + rise * 1.5f;         // far (ground) end of the +Z staircase
+        return new Vector3(roofY, xStairWorld, stairFarZ);
+    }
+
+    // (MESHY) a CLIMBABLE keep: the keep_climb model (flat battlement roof) as the body, a registered walkable-roof Deck, and a
+    // visible stone staircase up the +Z face (Ramp) so it keeps its verticality. Stairs start at the model edge and run OUTWARD,
+    // so they read as an external stair and never clip the walls. Deck footprint is kept inside the (wider) model so you never
+    // stand on empty air; roof sits just under the battlement crenellations.
+    private void ClimbableKeep(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, List<Deck> decks, List<Ramp> ramps, Vector2I c, float lx, float lz, float H)
+    {
+        float ox = c.X * ChunkSize, oz = c.Y * ChunkSize;
+        float ground = Height(ox + lx, oz + lz);
+        float placeY = ground - Mathf.Max(0.6f, H * 0.04f);   // (FIX) SINK the model base into the terrain so it's embedded, not floating
+        float roofY = placeY + H * 0.60f;     // the model's actual roof FLOOR (~0.6H above the base)
+        var ext = PropGlb.NormExtents("keep_climb");
+        float halfX = H * ext.X, halfZ = H * ext.Y;   // the model's REAL footprint (so the stair starts at the true wall, not inside it)
+        var keep = PropGlb.Instance("keep_climb", H, (int)rng.Randi());
+        keep.Position = new Vector3(lx, placeY, lz);
+        root.AddChild(keep);
+        if (ColliderTemplates.Emit("keep_climb", new Vector3(ox + lx, 0, oz + lz), placeY, H, 0f, bl, decks, ramps)) return;   // (AUTHORED) hand-placed template wins
+        // walkable roof = the model's full top footprint (rail below stops you at the parapet).
+        float deckHX = halfX * 0.92f, deckHZ = halfZ * 0.92f;
+        decks.Add(new Deck { Center = new Vector3(ox + lx, 0, oz + lz), Half = new Vector2(deckHX, deckHZ), TopY = roofY });
+        // Use the model's OWN built-in staircase: it's on the +Z face, offset to the -X side. We place ONLY a matching invisible
+        // Ramp over it (no primitive steps of our own → no double staircase). Ramp runs from the TERRAIN (ground) up to the roof
+        // so you step onto it seamlessly from the ground and aren't floating.
+        float rise = roofY - ground, runLen = rise * 1.5f;
+        float xStair = lx - halfX * 0.42f;      // stair sits on the -X portion of the +Z face
+        float z0 = lz + deckHZ;                 // +Z roof edge, where the stairs meet the roof
+        float rw = halfX * 0.58f;               // stair width (along X)
+        ramps.Add(new Ramp { Center = new Vector3(ox + xStair, 0, oz + (z0 + runLen / 2f)), Half = new Vector2(rw / 2f, runLen / 2f), YLow = roofY, YHigh = ground, AlongX = false });
+        // (RAIL) RECTANGULAR parapet — collidable to just above the roof (no walking off) but jump-overable. Along the 4 real
+        // edges; the +Z-edge blockers over the staircase are skipped so the stairs stay open.
+        float railTop = roofY + 1.15f, rbr = Mathf.Min(halfX, halfZ) * 0.5f;
+        for (int e = 0; e < 4; e++)
+            for (int s = -1; s <= 1; s++)
+            {
+                float ex = e == 1 ? lx - halfX : e == 2 ? lx + halfX : lx + s * halfX;
+                float ez = e == 0 ? lz - halfZ : e == 3 ? lz + halfZ : lz + s * halfZ;
+                if (e == 3 && Mathf.Abs(ex - xStair) < halfX * 0.62f) continue;   // +Z edge over the stair entry → leave open
+                bl.Add(new Blocker { Pos = new Vector3(ox + ex, 0, oz + ez), Radius = rbr, Top = railTop });
+            }
     }
 
     // scattered broken walls plus a solid jump-height platform
-    private void Ruins(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, List<Deck> decks, Vector2I c)
+    private void Ruins(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, List<Deck> decks, List<Ramp> ramps, Vector2I c)
     {
         float ox = c.X * ChunkSize, oz = c.Y * ChunkSize;
         var stone = Matte(new Color(0.17f, 0.16f, 0.19f), 0.9f, false);
-        int n = rng.RandiRange(4, 7);
-        for (int i = 0; i < n; i++)
+
+        // (MESHY) the hero ruin — a real authored broken-temple structure as the centrepiece landmark, replacing the old
+        // scatter of box walls. A coarse central blocker keeps you from walking through its solid mass.
+        float rlx = rng.RandfRange(-14, 14), rlz = rng.RandfRange(-14, 14);
+        if (StructureBlocked(root, rlx, rlz, bl, 8f)) return;   // don't drop the ruin on a tree / structure / map feature
+        float rh = rng.RandfRange(9f, 14f);   // (SCALE) bigger arch
+        StructureModel(root, "ruin", new Vector3(rlx, Height(ox + rlx, oz + rlz), rlz), rh, rng.Randf() * Mathf.Tau, bl, (int)rng.Randi(), arch: true);   // solid pillars + walk UNDER the arch
+
+        // an occasional weathered staircase nearby — another authored landmark (coarse blocker; not yet a walkable ramp)
+        if (rng.Randf() < 0.5f)
         {
-            float lx = rng.RandfRange(-16, 16), lz = rng.RandfRange(-16, 16);
-            float h = rng.RandfRange(1.4f, 3.6f), w = rng.RandfRange(2.5f, 5.5f);
-            float yawDeg = rng.RandfRange(0, 180);
-            var wall = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(w, h, 1.0f) } };
-            wall.MaterialOverride = stone;
-            wall.Position = new Vector3(lx, h / 2f + Height(ox + lx, oz + lz), lz);
-            wall.RotationDegrees = new Vector3(0, yawDeg, rng.RandfRange(-7, 7));
-            root.AddChild(wall);
-            // solid the whole wall: a line of overlapping blockers along its long axis
-            float yr = Mathf.DegToRad(yawDeg);
-            var d = new Vector3(Mathf.Cos(yr), 0, -Mathf.Sin(yr));
-            int segs = Mathf.Max(1, Mathf.CeilToInt(w / 1.3f));
-            for (int s = 0; s < segs; s++)
-            {
-                float tt = segs == 1 ? 0f : (s / (float)(segs - 1) - 0.5f);
-                var bp = new Vector3(lx, 0, lz) + d * (tt * w);
-                bl.Add(new Blocker { Pos = new Vector3(ox + bp.X, 0, oz + bp.Z), Radius = 0.7f, Top = Height(ox + lx, oz + lz) + h });
-            }
+            float slx = rng.RandfRange(-16, 16), slz = rng.RandfRange(-16, 16);
+            StairModel(root, "staircase", new Vector3(slx, Height(ox + slx, oz + slz), slz), rng.RandfRange(6f, 9f), bl, decks, ramps, (int)rng.Randi());   // WALKABLE up (yaw 0)
         }
+
+        // a raised stone slab you can actually climb onto — verticality/perch (kept from the old ruins)
         float plx = rng.RandfRange(-10, 10), plz = rng.RandfRange(-10, 10), pY = rng.RandfRange(1.6f, 2.6f);
         float pBaseY = Height(ox + plx, oz + plz);
         var slab = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(7, pY, 7) } };
@@ -1198,6 +1391,106 @@ void fragment() {
         var cap = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(7.3f, 0.4f, 7.3f) } };
         cap.MaterialOverride = Matte(new Color(0.22f, 0.21f, 0.24f), 0.9f, false); cap.Position = new Vector3(plx, pY + pBaseY, plz); root.AddChild(cap);
         decks.Add(new Deck { Center = new Vector3(ox + plx, 0, oz + plz), Half = new Vector2(3.5f, 3.5f), TopY = pY + pBaseY });
+    }
+
+    // (MESHY) place an authored structure GLB (ruin/staircase) as a landmark: real 3D model at (localPos, yaw) scaled to
+    // `height`, plus a coarse central collision blocker so its solid core is impassable. Skipped in the boundary-cliff band.
+    // Place an authored structure GLB embedded in the terrain, and give it COLLISION derived from the model so what looks solid
+    // IS solid and what looks flat can be stood on:
+    //   • solid=true (default) → a footprint Blocker sized from the model's real extents (can't walk through the walls)
+    //   • arch=true            → two solid PILLARS at the arch legs, leaving the opening walkable-UNDER
+    //   • flatTopFrac>0 + decks → a walkable Deck at that fraction of the height (jump up → stand on the flat top)
+    // (AUTHORED) the current chunk's deck/ramp lists, so StructureModel can emit template decks/ramps even for callers that only pass blockers
+    private List<Deck> _emitDecks; private List<Ramp> _emitRamps;
+
+    private void StructureModel(Node3D root, string name, Vector3 localPos, float height, float yaw, List<Blocker> bl, int seed,
+                                List<Deck> decks = null, float flatTopFrac = 0f, bool arch = false, bool solid = true)
+    {
+        if (InCliffBand(root.Position.X + localPos.X, root.Position.Z + localPos.Z, 14f)) return;
+        var node = PropGlb.Instance(name, height, seed);
+        node.Position = new Vector3(localPos.X, localPos.Y - Mathf.Max(0.4f, height * 0.06f), localPos.Z);   // SINK into the terrain so it's embedded, not floating
+        node.RotationDegrees = new Vector3(0, Mathf.RadToDeg(yaw), 0);
+        root.AddChild(node);
+
+        var ext = PropGlb.NormExtents(name);
+        float hx = height * ext.X, hz = height * ext.Y;   // real footprint half-extents
+        float wx = root.Position.X + localPos.X, wz = root.Position.Z + localPos.Z, gy = localPos.Y;
+        // (AUTHORED) if this model has a hand-placed collider template, use it instead of the heuristic colliders below
+        var eDecks = decks ?? _emitDecks; var eRamps = _emitRamps;
+        if (eDecks != null && eRamps != null && ColliderTemplates.Emit(name, new Vector3(wx, 0, wz), node.Position.Y, height, yaw, bl, eDecks, eRamps)) return;
+        if (arch)
+        {
+            // solid pillars at the two arch legs. AUDIT (colliders viz) showed this model's legs run along its NARROWER footprint
+            // axis (opening is along the wider one), so the pillars go on the narrow axis; the wide axis stays walkable-under.
+            bool spanX = hx >= hz; float span = spanX ? hx : hz;
+            var dir = spanX ? new Vector2(-Mathf.Sin(yaw), Mathf.Cos(yaw)) : new Vector2(Mathf.Cos(yaw), Mathf.Sin(yaw));
+            for (int s = -1; s <= 1; s += 2)
+                bl.Add(new Blocker { Pos = new Vector3(wx + dir.X * span * 0.82f * s, 0, wz + dir.Y * span * 0.82f * s), Radius = span * 0.32f, Top = gy + height });
+        }
+        else if (solid)
+            bl.Add(new Blocker { Pos = new Vector3(wx, 0, wz), Radius = Mathf.Max(hx, hz) * 1.05f, Top = gy + height * 0.9f });
+        if (flatTopFrac > 0f && decks != null)
+            decks.Add(new Deck { Center = new Vector3(wx, 0, wz), Half = new Vector2(hx * 0.78f, hz * 0.78f), TopY = gy + height * flatTopFrac });
+    }
+
+    // (MESHY) a WALKABLE staircase: the model + a Ramp matching its steps + a small top-landing Deck + side blockers for the
+    // flanking columns. Placed axis-aligned (yaw 0 — steps ascend toward -Z) so the Ramp lines up with the visual steps. Sunk
+    // into the terrain like other structures. Top height / width tuned against the `colliders` audit.
+    private void StairModel(Node3D root, string name, Vector3 localPos, float height, List<Blocker> bl, List<Deck> decks, List<Ramp> ramps, int seed)
+    {
+        if (InCliffBand(root.Position.X + localPos.X, root.Position.Z + localPos.Z, 14f)) return;
+        var node = PropGlb.Instance(name, height, seed);
+        node.Position = new Vector3(localPos.X, localPos.Y - Mathf.Max(0.4f, height * 0.06f), localPos.Z);
+        root.AddChild(node);   // yaw 0
+
+        var ext = PropGlb.NormExtents(name);
+        float hx = height * ext.X, hz = height * ext.Y;
+        float wx = root.Position.X + localPos.X, wz = root.Position.Z + localPos.Z, gy = localPos.Y;
+        if (ColliderTemplates.Emit(name, new Vector3(wx, 0, wz), node.Position.Y, height, 0f, bl, decks, ramps)) return;   // (AUTHORED) hand-placed template wins
+        float topY = gy + height * 0.62f;   // top-landing height (TUNE via audit)
+        float rw = hx * 1.1f;
+        // Ramp spans the run (Z). AlongX=false: t=0 at low-Z (= back, top), t=1 at high-Z (= front, ground).
+        ramps.Add(new Ramp { Center = new Vector3(wx, 0, wz), Half = new Vector2(rw * 0.5f, hz * 0.95f), YLow = topY, YHigh = gy, AlongX = false });
+        // top landing Deck — placed BEHIND the ramp's high end (so its side wall never blocks the climb), at topY
+        decks.Add(new Deck { Center = new Vector3(wx, 0, wz - hz * 1.15f), Half = new Vector2(rw * 0.5f, hz * 0.25f), TopY = topY });
+        for (int s = -1; s <= 1; s += 2)   // the two flanking columns are solid
+            bl.Add(new Blocker { Pos = new Vector3(wx + s * hx * 0.85f, 0, wz), Radius = hx * 0.28f, Top = gy + height });
+    }
+
+    // (WATER) true when this world XZ is dry LAND, comfortably above the water table. Only reeds, lilypads and the (already
+    // ruined) ruin/staircase are allowed in/at the water; every other prop & structure gates on this so nothing spawns
+    // silly-looking standing in a pond.
+    public bool DryLand(float wx, float wz, float margin = 0.35f) => Height(wx, wz) > WaterLevel + margin;
+
+    // (NEW) the current chunk's structure blockers, set before the ground-detail scatter so props don't land INSIDE big
+    // structures (houses/forts/wells/altars). Only BIG blockers count — small ones (graves, trees) are fine to scatter around.
+    private List<Blocker> _scatterBlockers;
+    private bool ClearOfStructures(float wx, float wz)
+    {
+        if (_scatterBlockers == null) return true;
+        foreach (var b in _scatterBlockers)
+        {
+            if (b.Radius < 2f) continue;                       // ignore small footprints (gravestones, trees) — props may sit near them
+            float r = b.Radius + 1.2f, dx = wx - b.Pos.X, dz = wz - b.Pos.Z;
+            if (dx * dx + dz * dz < r * r) return false;
+        }
+        return true;
+    }
+    // scatter gate: on dry land AND not inside a big structure's footprint
+    private bool Scatterable(float wx, float wz, float margin = 0.35f) => DryLand(wx, wz, margin) && ClearOfStructures(wx, wz);
+
+    // true if placing something of radius `rad` at (root+lx,lz) would overlap an existing BIG blocker (a tree or an
+    // already-placed structure in this chunk) OR a map-wide feature → used to stop structures/trees stacking on each other.
+    private bool StructureBlocked(Node3D root, float lx, float lz, List<Blocker> bl, float rad)
+    {
+        float wx = root.Position.X + lx, wz = root.Position.Z + lz;
+        foreach (var b in bl)
+        {
+            if (b.Radius < 1.5f) continue;
+            float d = rad + b.Radius, dx = wx - b.Pos.X, dz = wz - b.Pos.Z;
+            if (dx * dx + dz * dz < d * d) return true;
+        }
+        return Game.I != null && Game.I.NearMapFeature(new Vector3(wx, 0, wz), rad + 8f);
     }
 
     // (FIX) true when a world XZ sits in the cliff-wall band (or beyond) — used to keep trees/structures/scenery from
@@ -1221,6 +1514,7 @@ void fragment() {
         float gy = GY(root, lx, lz);
         var sp = dead ? ProcTree.Species.DeadOak : ProcTree.Species.GroveOak;
         int variant = ProcTree.PickVariant(sp, rng, out float br, out float th, out _);
+        if (StructureBlocked(root, lx, lz, bl, br)) return;   // (FIX) no trees stacked on other trees / structures / map features
         var xform = new Transform3D(new Basis(Vector3.Up, rng.Randf() * Mathf.Tau), new Vector3(root.Position.X + lx, gy, root.Position.Z + lz));   // random yaw so the fleet isn't clones
         _treeField.Add(sp, variant, xform, c);   // GPU-instanced — one draw call for all trees of this variant
         bl.Add(new Blocker { Pos = World3(c, lx, lz), Radius = br, Top = gy + th });   // finite height → you fly over it once clear of the canopy
@@ -1236,27 +1530,118 @@ void fragment() {
 
     private void Mushroom(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
-        float h = rng.RandfRange(0.4f, 1.1f);
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) mushrooms only on dry land
+        // (MESHY) real 3D mushroom model, GPU-instanced. Normalised to unit height by PropGlb, so we just scale by a target
+        // height + random yaw + a little squash variety; base sits on the terrain. Per-instance colour jitter is automatic.
+        float h = rng.RandfRange(0.5f, 1.4f);
         float gy = GY(root, lx, lz);
         var c = ChunkOf(root);
         float ox = root.Position.X + lx, oz = root.Position.Z + lz;
-        _propField.Add(PropField.Kind.MushroomStem, new Transform3D(new Basis().Scaled(new Vector3(1f, h, 1f)), new Vector3(ox, h / 2f + gy, oz)), c);
-        float cr = rng.RandfRange(0.25f, 0.5f), chh = rng.RandfRange(0.3f, 0.5f);
-        _propField.Add(PropField.Kind.MushroomCap, new Transform3D(new Basis().Scaled(new Vector3(cr, chh, cr)), new Vector3(ox, h + gy, oz)), c);
+        float squash = rng.RandfRange(0.85f, 1.12f);   // some caps broader/shorter than others
+        var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(h * squash, h, h * squash));
+        _propField.Add(PropField.Kind.GlbMushroom, new Transform3D(basis, new Vector3(ox, gy, oz)), c);
     }
 
+    // (MESHY) a stand of real reed CLUMPS — the GLB reed is already a multi-stalk clump with cattail heads, so a couple per
+    // spot reads as a full reed bed (was: a handful of primitive box stalks). GPU-instanced; base sits on the terrain.
     private void Reed(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
-        int n = rng.RandiRange(3, 6);
         var c = ChunkOf(root);
-        float gy = GY(root, lx, lz);
+        int n = rng.RandiRange(1, 2);
         for (int i = 0; i < n; i++)
         {
-            float h = rng.RandfRange(1.2f, 2.4f);
-            var pos = new Vector3(root.Position.X + lx + rng.RandfRange(-0.5f, 0.5f), h / 2f + gy, root.Position.Z + lz + rng.RandfRange(-0.5f, 0.5f));
-            var basis = Basis.FromEuler(new Vector3(rng.RandfRange(-0.15f, 0.15f), 0, rng.RandfRange(-0.15f, 0.15f))).Scaled(new Vector3(0.06f, h, 0.06f));
-            _propField.Add(PropField.Kind.Reed, new Transform3D(basis, pos), c);
+            float jx = rng.RandfRange(-0.6f, 0.6f), jz = rng.RandfRange(-0.6f, 0.6f);
+            float h = rng.RandfRange(1.9f, 2.9f);
+            float gy = GY(root, lx + jx, lz + jz);
+            var pos = new Vector3(root.Position.X + lx + jx, gy, root.Position.Z + lz + jz);
+            var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(h, h, h));
+            _propField.Add(PropField.Kind.GlbReeds, new Transform3D(basis, pos), c);
         }
+    }
+
+    // (MESHY) a small fern/bush cluster for the Grove floor — a few real fern models, GPU-instanced.
+    private void GroveFern(Node3D root, RandomNumberGenerator rng, float lx, float lz)
+    {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) ferns/bushes only on dry land
+        var c = ChunkOf(root);
+        int n = rng.RandiRange(1, 3);
+        for (int i = 0; i < n; i++)
+        {
+            float jx = rng.RandfRange(-0.9f, 0.9f), jz = rng.RandfRange(-0.9f, 0.9f);
+            float h = rng.RandfRange(0.7f, 1.3f);
+            float gy = GY(root, lx + jx, lz + jz);
+            var pos = new Vector3(root.Position.X + lx + jx, gy, root.Position.Z + lz + jz);
+            var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(h, h, h));
+            _propField.Add(PropField.Kind.GlbFern, new Transform3D(basis, pos), c);
+        }
+    }
+
+    // (NEW autumn detail) a tuft of warm DRY grass that sways — a clump is either mostly-tall or mostly-short. GPU-instanced.
+    private void FallGrassClump(Node3D root, RandomNumberGenerator rng, float lx, float lz)
+    {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) dry grass only on dry land
+        var c = ChunkOf(root);
+        float gy = GY(root, lx, lz);
+        int blades = rng.RandiRange(4, 8);
+        bool tall = rng.Randf() < 0.4f;
+        for (int i = 0; i < blades; i++)
+        {
+            float h = tall ? rng.RandfRange(1.2f, 2.2f) : rng.RandfRange(0.4f, 0.9f);
+            float px = root.Position.X + lx + rng.RandfRange(-0.4f, 0.4f), pz = root.Position.Z + lz + rng.RandfRange(-0.4f, 0.4f);
+            var basis = Basis.FromEuler(new Vector3(rng.RandfRange(-0.22f, 0.22f), rng.Randf() * 6f, rng.RandfRange(-0.22f, 0.22f))).Scaled(new Vector3(0.055f, h, 0.055f));
+            _propField.Add(PropField.Kind.FallGrass, new Transform3D(basis, new Vector3(px, h / 2f + gy, pz)), c);
+        }
+    }
+
+    // (MESHY) real single fallen-leaf models (3 kinds) scattered over the ground around (lx,lz), each with a little wind flutter.
+    private void LeafScatter(Node3D root, RandomNumberGenerator rng, float lx, float lz, int n)
+    {
+        var c = ChunkOf(root);
+        for (int i = 0; i < n; i++)
+        {
+            float jx = rng.RandfRange(-2.4f, 2.4f), jz = rng.RandfRange(-2.4f, 2.4f);
+            if (!Scatterable(root.Position.X + lx + jx, root.Position.Z + lz + jz)) continue;
+            float r = rng.Randf();
+            var kind = r < 0.34f ? PropField.Kind.GlbLeafA : r < 0.67f ? PropField.Kind.GlbLeafB : PropField.Kind.GlbLeafC;
+            float s = rng.RandfRange(0.3f, 0.55f);
+            float gx = root.Position.X + lx + jx, gz = root.Position.Z + lz + jz;
+            var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(s, s, s));
+            _propField.Add(kind, new Transform3D(basis, new Vector3(gx, GY(root, lx + jx, lz + jz) + 0.02f, gz)), c);
+        }
+    }
+
+    // (MESHY) a real raked leaf-PILE model (2 kinds) at a spot.
+    private void LeafPile(Node3D root, RandomNumberGenerator rng, float lx, float lz)
+    {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;
+        var c = ChunkOf(root);
+        var kind = rng.Randf() < 0.5f ? PropField.Kind.GlbLeafPileA : PropField.Kind.GlbLeafPileB;
+        float s = rng.RandfRange(0.9f, 1.5f);
+        var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(s, s * rng.RandfRange(0.7f, 1f), s));
+        _propField.Add(kind, new Transform3D(basis, new Vector3(root.Position.X + lx, GY(root, lx, lz) + 0.02f, root.Position.Z + lz)), c);
+    }
+
+    // (DEV) scatter a representative Grove patch around a world point — exercises the REAL placement helpers (instanced
+    // mushroom/fern/reeds + flower/pumpkin nodes + ruin & staircase structures) so a scenario can validate the shipping path,
+    // not a hand-placed lineup. No-op if the target chunk isn't streamed in yet.
+    public void DebugGrovePatch(Vector3 center)
+    {
+        var c = new Vector2I(Mathf.RoundToInt(center.X / ChunkSize), Mathf.RoundToInt(center.Z / ChunkSize));
+        if (!_chunks.TryGetValue(c, out var root)) return;
+        var rng = new RandomNumberGenerator { Seed = 0xB00B5 };
+        float bx = center.X - root.Position.X, bz = center.Z - root.Position.Z;
+        for (int i = 0; i < 10; i++) Mushroom(root, rng, bx + rng.RandfRange(-6f, 6f), bz + rng.RandfRange(-6f, 6f));
+        for (int i = 0; i < 4; i++)  Flowers(root, rng, bx + rng.RandfRange(-7f, 7f), bz + rng.RandfRange(-7f, 7f));
+        for (int i = 0; i < 5; i++)  GroveFern(root, rng, bx + rng.RandfRange(-7f, 7f), bz + rng.RandfRange(-7f, 7f));
+        for (int i = 0; i < 4; i++)  Reed(root, rng, bx + rng.RandfRange(-8f, 8f), bz + rng.RandfRange(-8f, 8f));
+        for (int i = 0; i < 3; i++)  SpawnPumpkin(root, rng, bx + rng.RandfRange(-6f, 6f), bz + rng.RandfRange(-6f, 6f));
+        for (int i = 0; i < 8; i++)  FallGrassClump(root, rng, bx + rng.RandfRange(-7f, 7f), bz + rng.RandfRange(-7f, 7f));
+        for (int i = 0; i < 6; i++)  LeafScatter(root, rng, bx + rng.RandfRange(-7f, 7f), bz + rng.RandfRange(-7f, 7f), 8);
+        LeafPile(root, rng, bx + 3f, bz - 2f);
+        var bl = new List<Blocker>();
+        StructureModel(root, "ruin", new Vector3(bx - 10f, GY(root, bx - 10f, bz + 3f), bz + 3f), 6.5f, 0.6f, bl, 11, arch: true);
+        StructureModel(root, "staircase", new Vector3(bx + 10f, GY(root, bx + 10f, bz + 3f), bz + 3f), 4.5f, -0.6f, bl, 22);
+        _propField.Flush();
     }
 
     // (NEW) SHORELINE DRESSING — the water table used to just stop against bare ground. Now every chunk that touches it gets
@@ -1289,24 +1674,18 @@ void fragment() {
             }
             else
             {
-                // the shallows and the bank: a stand of reeds, some of them topped with a cattail head
-                int n = rng.RandiRange(4, 8);
+                // the shallows and the bank: a few real reed CLUMPS (GLB already has cattail heads → no separate head prop)
+                int n = rng.RandiRange(1, 3);
                 for (int k = 0; k < n; k++)
                 {
-                    float sh = rng.RandfRange(1.4f, 2.9f);
+                    float sh = rng.RandfRange(1.9f, 3.0f);
                     float jx = rng.RandfRange(-1.4f, 1.4f), jz = rng.RandfRange(-1.4f, 1.4f);
                     float gy = Height(ox + lx + jx, oz + lz + jz);
                     if (gy - WaterLevel > 1.7f) continue;
                     float footY = Mathf.Min(gy, WaterLevel);   // reeds rooted underwater still break the surface
-                    var pos = new Vector3(ox + lx + jx, footY + sh / 2f, oz + lz + jz);
-                    var basis = Basis.FromEuler(new Vector3(rng.RandfRange(-0.18f, 0.18f), rng.Randf() * Mathf.Tau, rng.RandfRange(-0.18f, 0.18f)))
-                                     .Scaled(new Vector3(0.06f, sh, 0.06f));
-                    _propField.Add(PropField.Kind.Reed, new Transform3D(basis, pos), c);
-                    if (rng.Randf() < 0.34f)   // the brown velvet head
-                    {
-                        var hb = Basis.FromEuler(new Vector3(0f, rng.Randf() * Mathf.Tau, 0f)).Scaled(new Vector3(0.075f, 0.09f, 0.075f));
-                        _propField.Add(PropField.Kind.Cattail, new Transform3D(hb, new Vector3(pos.X, footY + sh * 0.92f, pos.Z)), c);
-                    }
+                    var pos = new Vector3(ox + lx + jx, footY, oz + lz + jz);   // GLB base sits at foot
+                    var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(sh, sh, sh));
+                    _propField.Add(PropField.Kind.GlbReeds, new Transform3D(basis, pos), c);
                 }
                 // wet shingle on the sand
                 if (above > 0.1f)
@@ -1534,35 +1913,19 @@ void fragment() {
         if (rng.Randf() < 0.5f) KnottedTree(root, rng, bl, c, R(rng), R(rng), true);   // a lone gnarled tree
     }
 
-    private void House(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c)
+    private void House(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c, Vector2? at = null)
     {
-        float lx = rng.RandfRange(-8f, 8f), lz = rng.RandfRange(-8f, 8f);
+        float lx = at?.X ?? rng.RandfRange(-8f, 8f), lz = at?.Y ?? rng.RandfRange(-8f, 8f);
+        if (!DryLand(root.Position.X + lx, root.Position.Z + lz, 0.6f)) return;   // (WATER) cottages never in the water
+        if (StructureBlocked(root, lx, lz, bl, 7f)) return;                        // don't drop a cottage on a tree / another structure / a map feature
         float baseY = GY(root, lx, lz);
-        float w = rng.RandfRange(6f, 9f), d = rng.RandfRange(6f, 9f), bodyH = rng.RandfRange(4f, 5.5f);
-        var bodyCol = new Color(0.09f, 0.07f, 0.06f).Lerp(new Color(0.06f, 0.06f, 0.08f), rng.Randf());
-        var body = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(w, bodyH, d) } };
-        body.MaterialOverride = Vis.Wood(bodyCol);   // (PHASE 2) timber walls — vertical wood grain
-        body.Position = new Vector3(lx, bodyH / 2f + baseY, lz);
-        body.RotationDegrees = new Vector3(0, rng.RandfRange(0, 90), 0);
-        root.AddChild(body);
-        // sagging roof
-        var roof = new MeshInstance3D { Mesh = new PrismMesh { Size = new Vector3(w * 1.15f, bodyH * 0.7f, d * 1.15f) } };
-        roof.MaterialOverride = Vis.Thatch(new Color(0.09f, 0.06f, 0.04f));   // (PHASE 2) thatched/straw roof — raked fibrous grain
-        roof.Position = new Vector3(lx, bodyH + bodyH * 0.35f + baseY, lz);
-        roof.RotationDegrees = body.RotationDegrees;
-        roof.Rotation += new Vector3(0, 0, rng.RandfRange(-0.06f, 0.06f));   // sag
-        root.AddChild(roof);
-        // a dim window glow (lit or abandoned-dark)
+        // (MESHY) a real cottage model — one of two variants, per-instance tint/scale/yaw so a hamlet isn't clones.
+        float ch = rng.RandfRange(12f, 16f);   // (SCALE) cottages read too small — bumped again
+        string cot = rng.Randf() < 0.5f ? "cottage_a" : "cottage_b";
+        StructureModel(root, cot, new Vector3(lx, baseY, lz), ch, rng.Randf() * Mathf.Tau, bl, (int)rng.Randi());   // solid walls (sloped roof → not standable)
+        // a warm window glow for lit cottages (the model has its own windows; this just casts light into the scene)
         if (rng.Randf() < 0.6f)
-        {
-            var win = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(1.0f, 1.0f, 0.1f) } };
-            win.MaterialOverride = Game.ToonEmissive(new Color(0.95f, 0.65f, 0.25f), 1.2f);
-            win.Position = new Vector3(lx, bodyH * 0.55f + baseY, lz + d / 2f + 0.05f);
-            win.RotationDegrees = body.RotationDegrees;
-            root.AddChild(win);
-            root.AddChild(new OmniLight3D { OmniRange = 9f, LightColor = new Color(0.9f, 0.6f, 0.25f), LightEnergy = 1.3f, Position = new Vector3(lx, bodyH * 0.6f + baseY, lz) });
-        }
-        bl.Add(new Blocker { Pos = World3(c, lx, lz), Radius = Mathf.Max(w, d) * 0.62f, Top = baseY + bodyH * 1.85f });   // roof peak → fly over the house above the ridge
+            root.AddChild(new OmniLight3D { OmniRange = 9f, LightColor = new Color(0.9f, 0.6f, 0.25f), LightEnergy = 1.3f, Position = new Vector3(lx, ch * 0.4f + baseY, lz) });
         // surrounding fence posts + a tree or two
         int posts = rng.RandiRange(4, 8);
         for (int i = 0; i < posts; i++)
@@ -1580,15 +1943,13 @@ void fragment() {
     private void Altar(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c)
     {
         float lx = rng.RandfRange(-6f, 6f), lz = rng.RandfRange(-6f, 6f);
+        if (!DryLand(root.Position.X + lx, root.Position.Z + lz, 0.6f)) return;   // (WATER) altars never in the water
+        if (StructureBlocked(root, lx, lz, bl, 5f)) return;
         float baseY = GY(root, lx, lz);
         var glow = rng.Randf() < 0.5f ? DamageTypes.Col(DamageType.Curse) : DamageTypes.Col(DamageType.Arcane);
-        // broken stone ring
-        var ring = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = 3.0f, OuterRadius = 3.6f } };
-        ring.MaterialOverride = Vis.Stone(new Color(0.12f, 0.12f, 0.14f));   // (PHASE 2) weathered stone ring
-        ring.Position = new Vector3(lx, 0.15f + baseY, lz);
-        ring.RotationDegrees = new Vector3(90, 0, 0);
-        root.AddChild(ring);
-        // faded sigil on the ground
+        // (MESHY) the real altar shrine model as the centrepiece (its own candles/bowl baked in)
+        StructureModel(root, "altar", new Vector3(lx, baseY, lz), rng.RandfRange(2.3f, 2.9f), rng.Randf() * Mathf.Tau, bl, (int)rng.Randi());   // solid
+        // faded sigil glowing on the ground around it
         var sigil = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 2.6f, BottomRadius = 2.6f, Height = 0.04f } };
         var sm = Game.Emissive(glow, 0.5f);
         sm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha;
@@ -1596,47 +1957,43 @@ void fragment() {
         sigil.MaterialOverride = sm;
         sigil.Position = new Vector3(lx, 0.06f + baseY, lz);
         root.AddChild(sigil);
-        // standing stones
-        int stones = rng.RandiRange(3, 6);
-        for (int i = 0; i < stones; i++)
-        {
-            float a = i / (float)stones * Mathf.Tau + rng.RandfRange(-0.2f, 0.2f);
-            float sh = rng.RandfRange(2.2f, 3.8f);
-            var s = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.8f, sh, 0.5f) } };
-            s.MaterialOverride = Matte(new Color(0.11f, 0.11f, 0.13f));
-            float sx = lx + Mathf.Cos(a) * 4.2f, sz = lz + Mathf.Sin(a) * 4.2f;
-            s.Position = new Vector3(sx, sh / 2f + GY(root, sx, sz), sz);
-            s.Rotation = new Vector3(rng.RandfRange(-0.1f, 0.1f), a, rng.RandfRange(-0.12f, 0.12f));
-            root.AddChild(s);
-            bl.Add(new Blocker { Pos = World3(c, sx, sz), Radius = 0.7f, Top = GY(root, sx, sz) + sh });
-        }
-        // candle motes
+        // candle glow motes clustered on the shrine
         int candles = rng.RandiRange(2, 4);
         for (int i = 0; i < candles; i++)
-            root.AddChild(new OmniLight3D { OmniRange = 6f, LightColor = glow, LightEnergy = 1.2f, Position = new Vector3(lx + R(rng) * 0.3f, 1.2f + baseY, lz + R(rng) * 0.3f) });
-        var pillar = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(1.4f, 1.0f, 1.4f) } };
-        pillar.MaterialOverride = Game.ToonEmissive(glow, 0.4f);
-        pillar.Position = new Vector3(lx, 0.5f + baseY, lz);
-        root.AddChild(pillar);
-        bl.Add(new Blocker { Pos = World3(c, lx, lz), Radius = 1.2f, Top = baseY + 1.2f });
+            root.AddChild(new OmniLight3D { OmniRange = 6f, LightColor = glow, LightEnergy = 1.2f, Position = new Vector3(lx + rng.RandfRange(-1.5f, 1.5f), 1.2f + baseY, lz + rng.RandfRange(-1.5f, 1.5f)) });
     }
 
     private void Graveyard(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c)
     {
-        int graves = rng.RandiRange(6, 12);
-        for (int i = 0; i < graves; i++)
-        {
-            float lx = R(rng), lz = R(rng);
-            float gh = rng.RandfRange(0.9f, 1.6f);
-            var g = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(rng.RandfRange(0.6f, 1.0f), gh, 0.2f) } };
-            g.MaterialOverride = Matte(new Color(0.13f, 0.13f, 0.15f));
-            g.Position = new Vector3(lx, gh / 2f + GY(root, lx, lz), lz);
-            g.Rotation = new Vector3(rng.RandfRange(-0.25f, 0.25f), rng.Randf() * 6f, rng.RandfRange(-0.18f, 0.18f));
-            root.AddChild(g);
-        }
+        // (MESHY) a cemetery PLOT — gravestones CLUMPED together in one spot and loosely ROWED (all facing the plot's heading
+        // ± jitter), instead of sprinkled randomly across the whole chunk. Dry land only.
+        float plx = rng.RandfRange(-10f, 10f), plz = rng.RandfRange(-10f, 10f);
+        if (!DryLand(root.Position.X + plx, root.Position.Z + plz, 0.5f)) return;   // (WATER) no graveyards in ponds
+        float plotYaw = rng.Randf() * Mathf.Tau;
+        var fwd = new Vector2(Mathf.Cos(plotYaw), Mathf.Sin(plotYaw));
+        var side = new Vector2(-fwd.Y, fwd.X);
+        float half = 7.5f;                       // ~15u plot
+        // laid out in ROWS (with walkable aisles between them) but deliberately UNtidy — jittered, a few missing, headstones
+        // roughly but not exactly aligned to the plot heading. A cemetery you can wander, not a perfect grid.
+        int rows = rng.RandiRange(3, 4);
+        int perRow = rng.RandiRange(4, 6);
+        float rowGap = (2f * half) / rows;       // aisle spacing between rows
+        float colGap = (2f * half) / perRow;
+        for (int r = 0; r < rows; r++)
+            for (int col = 0; col < perRow; col++)
+            {
+                if (rng.Randf() < 0.14f) continue;   // gaps in the rows → not too clean
+                float rowT = -half + (r + 0.5f) * rowGap + rng.RandfRange(-0.45f, 0.45f);   // along the plot heading (which row)
+                float colT = -half + (col + 0.5f) * colGap + rng.RandfRange(-0.7f, 0.7f);   // across the row (position in it)
+                float lx = plx + fwd.X * rowT + side.X * colT, lz = plz + fwd.Y * rowT + side.Y * colT;
+                if (!DryLand(root.Position.X + lx, root.Position.Z + lz, 0.3f)) continue;
+                StructureModel(root, "gravestones", new Vector3(lx, GY(root, lx, lz), lz), rng.RandfRange(1.5f, 2.2f), plotYaw + rng.RandfRange(-0.22f, 0.22f), bl, (int)rng.Randi());   // solid stones
+            }
         int dead = rng.RandiRange(1, 3);
-        for (int i = 0; i < dead; i++) KnottedTree(root, rng, bl, c, R(rng), R(rng), true);
-        if (rng.Randf() < 0.4f) root.AddChild(new OmniLight3D { OmniRange = 10f, LightColor = new Color(0.4f, 0.8f, 0.6f), LightEnergy = 0.6f, Position = new Vector3(R(rng) * 0.4f, 1.5f, R(rng) * 0.4f) });
+        for (int i = 0; i < dead; i++) KnottedTree(root, rng, bl, c, plx + rng.RandfRange(-half, half), plz + rng.RandfRange(-half, half), true);
+        int pk = rng.RandiRange(2, 5);   // a scatter of pumpkins among the graves — spooky cemetery dressing
+        for (int i = 0; i < pk; i++) SpawnPumpkin(root, rng, plx + rng.RandfRange(-half, half), plz + rng.RandfRange(-half, half));
+        if (rng.Randf() < 0.5f) root.AddChild(new OmniLight3D { OmniRange = 12f, LightColor = new Color(0.4f, 0.8f, 0.6f), LightEnergy = 0.6f, Position = new Vector3(plx, 1.6f + GY(root, plx, plz), plz) });
     }
 
     private void MushroomGrove(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c)
@@ -1650,6 +2007,7 @@ void fragment() {
     // ---- new props & POIs (NEW) -------------------------------------------
     private void SpawnPumpkin(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) pumpkins only on dry land
         float s = rng.RandfRange(0.4f, 1.0f);
         bool lit = rng.Randf() < 0.22f;
         var pk = new Pumpkin();
@@ -1661,6 +2019,7 @@ void fragment() {
 
     private void Flowers(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) flowers only on dry land
         var palette = new[]
         {
             new Color(0.9f, 0.3f, 0.5f), new Color(0.85f, 0.8f, 0.35f), new Color(0.6f, 0.4f, 0.9f),
@@ -1682,6 +2041,7 @@ void fragment() {
 
     private void GrassTuft(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) grass only on dry land
         var c = ChunkOf(root);
         float gy = GY(root, lx, lz);
         int blades = rng.RandiRange(3, 6);
@@ -1706,6 +2066,7 @@ void fragment() {
 
     private void Lantern(Node3D root, RandomNumberGenerator rng, float lx, float lz)
     {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) lanterns only on dry land
         float h = rng.RandfRange(1.8f, 2.6f);
         var post = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.07f, BottomRadius = 0.09f, Height = h } };
         post.MaterialOverride = Matte(new Color(0.07f, 0.06f, 0.05f));
@@ -1722,6 +2083,7 @@ void fragment() {
 
     private void Cart(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c, float lx, float lz)
     {
+        if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;   // (WATER) carts only on dry land
         var wood = Matte(new Color(0.10f, 0.08f, 0.06f));
         float yaw = rng.Randf() * 6f;
         float by = GY(root, lx, lz);
@@ -1741,28 +2103,31 @@ void fragment() {
 
     private void Well(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c, float lx, float lz)
     {
-        var stone = Matte(new Color(0.16f, 0.15f, 0.17f));
+        // (MESHY) the real roofed stone well model (its own bucket/rope baked in) + a coarse blocker for its solid base
+        if (!DryLand(root.Position.X + lx, root.Position.Z + lz, 0.6f)) return;   // (WATER) wells never in the water
+        if (StructureBlocked(root, lx, lz, bl, 3f)) return;
         float by = GY(root, lx, lz);
-        var ring = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 1.1f, BottomRadius = 1.1f, Height = 1.0f } };
-        ring.MaterialOverride = stone; ring.Position = new Vector3(lx, 0.5f + by, lz); root.AddChild(ring);
-        var hole = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.85f, BottomRadius = 0.85f, Height = 1.04f } };
-        hole.MaterialOverride = Matte(new Color(0.02f, 0.02f, 0.03f), 1f, false); hole.Position = new Vector3(lx, 0.52f + by, lz); root.AddChild(hole);
-        for (int sgn = -1; sgn <= 1; sgn += 2)
-        {
-            var post = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.14f, 2.0f, 0.14f) } };
-            post.MaterialOverride = Matte(new Color(0.08f, 0.07f, 0.05f));
-            post.Position = new Vector3(lx + sgn * 0.9f, 1.0f + by, lz); root.AddChild(post);
-        }
-        var roof = new MeshInstance3D { Mesh = new PrismMesh { Size = new Vector3(2.6f, 0.8f, 1.6f) } };
-        roof.MaterialOverride = Matte(new Color(0.05f, 0.04f, 0.05f)); roof.Position = new Vector3(lx, 2.4f + by, lz); root.AddChild(roof);
-        bl.Add(new Blocker { Pos = World3(c, lx, lz), Radius = 1.2f, Top = by + 3f });
+        StructureModel(root, "well", new Vector3(lx, by, lz), rng.RandfRange(2.7f, 3.3f), rng.Randf() * Mathf.Tau, bl, (int)rng.Randi());   // solid
     }
 
     // a little cluster of cottages with lanterns, a well, fences and grass — a lived-in village (NEW)
     private void Hamlet(Node3D root, RandomNumberGenerator rng, List<Blocker> bl, Vector2I c)
     {
         int houses = rng.RandiRange(2, 3);
-        for (int i = 0; i < houses; i++) House(root, rng, bl, c);
+        var placed = new List<Vector2>();
+        for (int i = 0; i < houses; i++)
+        {
+            Vector2 pos = new Vector2(rng.RandfRange(-16f, 16f), rng.RandfRange(-16f, 16f));
+            for (int t = 0; t < 16; t++)   // reject spots too close to an already-placed cottage → no houses inside each other
+            {
+                var cand = new Vector2(rng.RandfRange(-16f, 16f), rng.RandfRange(-16f, 16f));
+                bool ok = true;
+                foreach (var q in placed) if (cand.DistanceTo(q) < 17f) { ok = false; break; }
+                if (ok) { pos = cand; break; }
+            }
+            placed.Add(pos);
+            House(root, rng, bl, c, pos);
+        }
         int lanterns = rng.RandiRange(2, 4);
         for (int i = 0; i < lanterns; i++) Lantern(root, rng, R(rng), R(rng));
         if (rng.Randf() < 0.7f) Well(root, rng, bl, c, R(rng) * 0.5f, R(rng) * 0.5f);

@@ -404,7 +404,7 @@ public static class ModelAssets
     // Freeze the Hips horizontal (X/Z) translation in every clip while keeping vertical (Y = standing height + walk bob), so
     // locomotion plays IN PLACE — no root-motion drift/teleport, and no ground-sink (which full root-motion extraction caused).
     // We drive world position from gameplay, so the clip must not translate the body horizontally.
-    private static void StripHorizontalDrift(AnimationPlayer ap)
+    public static void StripHorizontalDrift(AnimationPlayer ap)
     {
         foreach (StringName lib in ap.GetAnimationLibraryList())
         {

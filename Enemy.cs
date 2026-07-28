@@ -11,8 +11,23 @@ using Godot;
 // locally. To add an enemy type see DEV_GUIDE.md §6.1 (don't forget the EnemyKinds table!).
 public enum EBehav { Melee, Ranged, Charged, Flyer, Healer, Goblin, Boss, Zapper, Bomber, Diver, Hexer, Totem, Sapper, Lobber, Phalanx, Archer }   // Lobber = croc bomb-thrower; Phalanx/Archer = the warded formation (NEW)
 
-public partial class Enemy : Node3D
+public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
 {
+    // --- DEV visual-test harness (res://dev/ai). Read-only + a deterministic slash trigger; no gameplay coupling. ---
+    public bool IsAuthoredGoblin => _creature?.IsAuthoredGoblin ?? false;
+    public void DebugSlash(bool left) => _creature?.DebugSlash(left);
+    public void DebugWalk(float move) => _creature?.DebugWalkSpeed(move);
+    public Godot.Collections.Dictionary GetAiDebugState() => new()
+    {
+        { "type", _type },
+        { "radius", Radius },
+        { "hp", Hp },
+        { "affix", Affix },
+        { "elite", _eliteRing != null },
+        { "authored_goblin", IsAuthoredGoblin },
+        { "name", PingName },
+    };
+
     public float Hp, MaxHp, Speed, Dmg, Radius;
     public int Score;
     public Color Col;
@@ -1315,6 +1330,7 @@ public partial class Enemy : Node3D
 
     public override void _Ready()
     {
+        AddToGroup(Grove.Dev.Ai.AiObservable.Group);   // DEV harness observability (inert unless a scenario is running)
         if (!IsBoss && !IsGoblin && SizeMul != 1f) Radius *= SizeMul;   // (NEW) apply the (synced) power/variety size BEFORE the mesh + hitbox are built off Radius
         CreatureKind kind;
         if (_type == "boss") kind = CreatureKind.HollowBoss;   // THE HOLLOW MOON — bespoke half-orc/half-zombie w/ a hollow midsection

@@ -11,7 +11,7 @@ using System.Collections.Generic;
 // Game.I is the singleton; Game.IsAuthority / WardenCount gate host-only logic. Difficulty tuning
 // (spawn formulas, elite/affix chances, co-op multiplier) lives in the wave block — see DEV_GUIDE.md
 // §7.3. The HUD reads this object every frame; menu states pause the world (WorldRunning).
-public enum GameState { Lobby, CharSelect, Playing, LevelUp, Swap, Stats, Element, Ult, UltMenu, Roulette, Mystic, Scroll, Shop, BindKey, Pause, Attune, Over }
+public enum GameState { Lobby, CharSelect, Playing, LevelUp, Swap, Stats, Element, Ult, UltMenu, Roulette, Mystic, Scroll, Shop, BindKey, Pause, Attune, Over, ColliderEdit }
 // (NEW) named wave mutators — a hot streak can turn the next wave into one of these. Blood Moon = faster foes + more loot;
 // Eclipse = dense fog / short sight; Surge = a dense fast-trash rush. Lasts one wave; synced to clients via the wave state.
 public enum WaveMutator { None, BloodMoon, Eclipse, Surge, Moonfall, Volatile }
@@ -32,10 +32,12 @@ public static class Palette
 public struct Blocker { public Vector3 Pos; public float Radius; public float Top; }   // Top = world-Y of the structure's top (0 = "unknown/infinite"). Lets the player fly OVER a tree/house instead of catching its invisible column.
 public struct FireRing { public Vector3 Pos; public float Radius; public float T; }   // (NEW) Ring of Fire zone: eats enemy projectiles that enter it (host-authoritative)
 public struct VineGrab { public Vector3 Pos; public float TopY; public bool Sky; }   // (NEW) jungle grapple vine: Pos = low handhold you interact with, TopY = height it carries you to. Sky = a floating-island vine (only grabbable while airborne, so you can't grab one from the island it hangs under)
-// Walkable flat surface (raised platform top, or ground patch).
-public struct Deck { public Vector3 Center; public Vector2 Half; public float TopY; public bool Floating; public bool LowPad; }   // Floating = a sky island (thin solid rim). LowPad = a short dais (pedestal) you STEP up from any side — never a solid wall push-out, regardless of absolute Y
-// Sloped walkway connecting two heights along one axis.
-public struct Ramp { public Vector3 Center; public Vector2 Half; public float YLow; public float YHigh; public bool AlongX; }
+// Walkable flat surface (raised platform top, or ground patch). (AUTHORED-COLLIDER extensions: Yaw = Y-rotation of the box
+// footprint so it can sit at any angle; Solid = red collider — you're blocked from the sides but CANNOT stand on top (excluded
+// from the walkable-surface height); Cyl = cylinder footprint instead of a box (Half.X used as the radius).
+public struct Deck { public Vector3 Center; public Vector2 Half; public float TopY; public bool Floating; public bool LowPad; public float Yaw; public bool Solid; public bool Cyl; public bool Boxed; public float BotY; }   // Floating = a sky island (thin solid rim). LowPad = a short dais (pedestal) you STEP up from any side. Boxed = an AUTHORED finite box: BotY..TopY (side-block only within that Y range; below it you pass under). Legacy decks (Boxed=false) block from -inf up to TopY.
+// Sloped walkway connecting two heights along one axis (Yaw = Y-rotation of the slope so a ramp can face any direction).
+public struct Ramp { public Vector3 Center; public Vector2 Half; public float YLow; public float YHigh; public bool AlongX; public float Yaw; }
 
 public partial class Game : Node3D
 {
@@ -104,6 +106,7 @@ public partial class Game : Node3D
     public readonly List<Enemy> Enemies = new();
     public readonly List<Blocker> Blockers = new();
     public readonly List<Blocker> PersistentBlockers = new();   // structures that stay solid regardless of chunk streaming (the maze well)
+    public readonly List<Blocker> PedestalRimBlockers = new();  // (NEW) the raised rune-block rims around pedestal daises — jump-overable; managed with pedestals (separate from the maze well's clear/add)
     public readonly List<Blocker> WallBlockers = new();          // (NEW) frost-wall obstacle circles — enemies steer around these; NOT touched by chunk-stream RebuildBlockers
     public readonly List<Deck> PersistentDecks = new();         // (NEW) floating sky-island tops — walkable, survive chunk streaming (flushed into Decks in RebuildBlockers)
     public readonly List<Ramp> PersistentRamps = new();         // (NEW) pedestal staircases — walkable ramps that survive chunk streaming (so foes climb the STAIRS, not the wall)
@@ -384,15 +387,30 @@ public partial class Game : Node3D
         float best = (_world != null && !InExpedition) ? _world.Height(pos.X, pos.Z) : 0f;   // rolling terrain is the base surface; Expedition stays flat/authored (NEW)
         foreach (var d in Decks)
         {
-            if (Mathf.Abs(pos.X - d.Center.X) <= d.Half.X && Mathf.Abs(pos.Z - d.Center.Z) <= d.Half.Y)
-                if (d.TopY <= feetY + step && d.TopY > best) best = d.TopY;
+            if (d.Solid) continue;   // (AUTHORED) red collider — solid from the sides but NOT a standing surface (can't get on top)
+            bool inside;
+            if (d.Cyl)   // cylinder footprint
+            {
+                float ox = pos.X - d.Center.X, oz = pos.Z - d.Center.Z;
+                inside = ox * ox + oz * oz <= d.Half.X * d.Half.X;
+            }
+            else if (d.Yaw != 0f)   // yawed box → test in the box's local frame (world→local = Godot Y-rot transpose)
+            {
+                float dx = pos.X - d.Center.X, dz = pos.Z - d.Center.Z;
+                float c = Mathf.Cos(d.Yaw), s = Mathf.Sin(d.Yaw);
+                inside = Mathf.Abs(dx * c - dz * s) <= d.Half.X && Mathf.Abs(dx * s + dz * c) <= d.Half.Y;
+            }
+            else inside = Mathf.Abs(pos.X - d.Center.X) <= d.Half.X && Mathf.Abs(pos.Z - d.Center.Z) <= d.Half.Y;
+            if (inside && d.TopY <= feetY + step && d.TopY > best) best = d.TopY;
         }
         foreach (var r in Ramps)
         {
-            if (Mathf.Abs(pos.X - r.Center.X) <= r.Half.X && Mathf.Abs(pos.Z - r.Center.Z) <= r.Half.Y)
+            float lx = pos.X - r.Center.X, lz = pos.Z - r.Center.Z;
+            if (r.Yaw != 0f) { float c = Mathf.Cos(r.Yaw), s = Mathf.Sin(r.Yaw); float nx = lx * c - lz * s, nz = lx * s + lz * c; lx = nx; lz = nz; }   // (AUTHORED) world→local (Godot Y-rot transpose)
+            if (Mathf.Abs(lx) <= r.Half.X && Mathf.Abs(lz) <= r.Half.Y)
             {
-                float t = r.AlongX ? (pos.X - (r.Center.X - r.Half.X)) / (2f * r.Half.X)
-                                   : (pos.Z - (r.Center.Z - r.Half.Y)) / (2f * r.Half.Y);
+                float t = r.AlongX ? (lx + r.Half.X) / (2f * r.Half.X)
+                                   : (lz + r.Half.Y) / (2f * r.Half.Y);
                 float y = Mathf.Lerp(r.YLow, r.YHigh, Mathf.Clamp(t, 0f, 1f));
                 if (y <= feetY + step && y > best) best = y;
             }
@@ -445,6 +463,10 @@ public partial class Game : Node3D
     public int RewardCat => _rewardCat;
     private World _world;
     public long WorldSeed;   // shared map seed; host generates it, clients receive it so everyone gets the same world (NEW)
+    private long? _forcedWorldSeed;   // DEV: fixed seed for AI-scenario runs → deterministic map + spawn framing
+    public CollisionDebug ColDebug;   // (DEV) collision-bounds visualiser (`colliders` command)
+    public ColliderEditor ColEditor;  // (DEV) collider-authoring editor (`cedit` command)
+    public void SetWorldVisible(bool v) { if (_world != null) _world.Visible = v; }   // (DEV) hide the streamed terrain/structures/water for the isolated collider-editor stage
 
     public int Gold = 0;             // persists across runs
     public int Souls = 0;            // (HAUNT ECONOMY) souls come ONLY from kills inside a Haunt (per-player, resets each run) — spent at effigies (+ Sanctuary shrine); rituals are free now
@@ -585,7 +607,14 @@ public partial class Game : Node3D
         GameClock = 0f;
         LoadGold();
         SetupInput();
+        World.SetTexQuality(TextureQuality);   // apply the persisted Texture Quality BEFORE the world builds (chunks load at that tier)
+        var scenSeed = Grove.Dev.Ai.AiTestRunner.ScenarioWorldSeed();   // deterministic world for AI scenarios (stable framing)
+        if (scenSeed.HasValue) _forcedWorldSeed = scenSeed.Value;
         BuildWorld();
+
+        ColDebug = new CollisionDebug { Visible = false }; AddChild(ColDebug);   // (DEV) collision visualiser — toggle with the `colliders` command
+        ColEditor = new ColliderEditor(); AddChild(ColEditor);   // (DEV) collider-authoring editor — enter with the `cedit` command
+        Engine.MaxFps = Mathf.Max(0, MaxFps);   // apply the persisted frame cap (default 60) even on a fresh save
 
         Player = new Player();
         AddChild(Player);
@@ -624,8 +653,17 @@ public partial class Game : Node3D
         AddChild(padLayer);
         padLayer.AddChild(new PadCursor());
 
+        if (Grove.Dev.Ai.AiTestRunner.TryBoot(this)) return;   // DEV: launched with `-- --scenario <name>` → deterministic AI-test boot (inert otherwise)
         if (s_witch >= 0) { LobbyUi.Hide(); StartGame(); }   // restart kept the chosen witch — skip lobby
         else { State = GameState.Lobby; LobbyUi.Show(); Input.MouseMode = Input.MouseModeEnum.Visible; }
+    }
+
+    // DEV visual-test entry: pick a witch and jump straight into a live run (skips lobby/char-select). Used only by AiTestRunner.
+    public void StartScenarioRun(int witchIdx)
+    {
+        s_witch = Mathf.Clamp(witchIdx, 0, 8);
+        if (LobbyUi != null) LobbyUi.Hide();
+        StartGame();
     }
 
     // ---- lobby callbacks ----
@@ -635,6 +673,49 @@ public partial class Game : Node3D
     public PerkScreen PerkScreenUi;
     public void OpenPerks() { if (LobbyUi != null) LobbyUi.Hide(); if (PerkScreenUi != null) PerkScreenUi.Show(s_witch < 0 ? 0 : s_witch); }
     public void ClosePerks() { if (PerkScreenUi != null) PerkScreenUi.Hide(); if (LobbyUi != null) LobbyUi.Show(); }
+
+    // ---- pause-menu run controls (Options overlay / Quit Run / Restart Run) --------------------------------------------
+    public bool InGameOptions = false;   // true while the full main-menu options panel is overlaid on the paused run
+    // only the host (or a solo player) may restart the shared run — a MP client can't yank everyone back to the start
+    public bool CanRestartRun() => NetMgr == null || !NetMgr.Active || NetMgr.IsHost;
+    private void ResumeRun() { SaveGold(); State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
+    // open the SAME options page as the main menu, but overlaid transparently so the paused game shows behind it
+    public void OpenInGameOptions()
+    {
+        InGameOptions = true;
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+        LobbyUi?.ShowOptionsOverlay();
+    }
+    // Back / Esc from the options overlay → return to the pause menu (still paused)
+    public void CloseInGameOptions()
+    {
+        InGameOptions = false;
+        LobbyUi?.HideOptionsOverlay();
+        SelectLock = 0.2f;   // so the same Esc that closed options doesn't also resume the run
+    }
+    // Quit Run → tear down the run and return to the home screen. Works in MP too: host ends the session for everyone; a client just leaves.
+    private void QuitRun()
+    {
+        InGameOptions = false; LobbyUi?.HideOptionsOverlay();
+        if (NetMgr != null && NetMgr.Active)
+        {
+            if (NetMgr.IsHost) { NetMgr.BroadcastGameOverChoice(2); return; }   // 2 = End: disconnects + reloads on every peer (incl. host)
+            NetMgr.Disconnect();                                                // client leaves the host's session
+        }
+        s_witch = -1; GetTree().ReloadCurrentScene();                          // solo / departed client → back to the main menu
+    }
+    // Restart Run → fresh run, same witch. Solo reloads the scene; MP host restarts for everyone; MP clients are blocked.
+    private void RestartRun()
+    {
+        if (NetMgr != null && NetMgr.Active)
+        {
+            if (!NetMgr.IsHost) return;                // clients can't restart
+            InGameOptions = false; LobbyUi?.HideOptionsOverlay();
+            NetMgr.BroadcastGameOverChoice(1);         // 1 = Retry: SoftResetRun + StartGame on every peer
+            return;
+        }
+        GetTree().ReloadCurrentScene();                // solo: full clean restart (s_witch kept ≥ 0 → same witch)
+    }
     public int ReadyCount = 0;   // (NEW) MP char-select: how many wardens have locked in (synced from host)
     public RunStats MyStats = new RunStats();                                                        // (NEW) this player's end-of-run tally
     public readonly System.Collections.Generic.Dictionary<long, RunStats> AllStats = new();          // (NEW) every warden's PERSONAL tally (kills come from the host-authoritative tally below)
@@ -1102,6 +1183,7 @@ public partial class Game : Node3D
     {
         if (_started) return;
         _started = true;
+        InGameOptions = false; LobbyUi?.HideOptionsOverlay();   // (MP) if a client was in the pause options overlay when the host restarted, dismiss it
         s_dynLights = 0;   // reset the transient-light budget for a clean run
         if (CharSelectUi != null) CharSelectUi.Hide();
         ConfigureWitch(s_witch < 0 ? 0 : s_witch);
@@ -1112,8 +1194,9 @@ public partial class Game : Node3D
         AllStats.Clear(); KillTally.Clear(); NightKillTally.Clear(); ClearDiscovered();
         Player.Hp = Player.S.MaxHp; Player.Mana = Player.S.ManaMax; Player.DashStock = Player.S.DashCharges; Player.Downed = false;   // full vitals (also covers an MP retry after a soft-reset)
         // in co-op, host and joiner spawn a few steps apart at the same area so they can see each other
-        if (NetMgr != null && NetMgr.Active)
-            Player.GlobalPosition = NetMgr.IsHost ? new Vector3(-2.5f, 0, 0) : new Vector3(2.5f, 0, 0);
+        Vector3 spawn = (NetMgr != null && NetMgr.Active) ? (NetMgr.IsHost ? new Vector3(-2.5f, 0, 0) : new Vector3(2.5f, 0, 0)) : Vector3.Zero;
+        Player.GlobalPosition = SafeSpawn(spawn);   // (SPAWN SAFETY) never start inside water / a structure / ruins; land on clear ground
+        _spawnSettleT = 2f;                          // structures stream in per-chunk — re-nudge out of any that load ON the spawn
         if (IsAuthority) ResetDifficulty();   // (CONTINUOUS DIRECTOR) start the difficulty clock; the stream spawns continuously
         if (IsAuthority) PopulateMap();        // (MAP FILL) scatter EVERYTHING across the whole bounded disc, once, at load
         State = GameState.Playing;
@@ -3555,7 +3638,8 @@ void sky(){
 
         // Procedural streaming world (chunks load around the player).
         _world = new World();
-        if (IsAuthority) WorldSeed = (long)(((ulong)GD.Randi() << 32) ^ (ulong)GD.Randi() ^ 0x9E3779B97F4A7C15UL);   // host/solo pick the map; clients get it over the net (NEW)
+        if (_forcedWorldSeed.HasValue) { WorldSeed = _forcedWorldSeed.Value; GD.Print($"[SEED] forced WorldSeed={WorldSeed}"); }   // DEV scenario: deterministic map
+        else if (IsAuthority) WorldSeed = (long)(((ulong)GD.Randi() << 32) ^ (ulong)GD.Randi() ^ 0x9E3779B97F4A7C15UL);   // host/solo pick the map; clients get it over the net (NEW)
         _world.SetSeed((ulong)WorldSeed);
         AddChild(_world);
         _world.Update(Vector3.Zero);
@@ -5547,6 +5631,21 @@ void fragment() {
         SpawnPoof(e.GlobalPosition);
     }
 
+    // (DEV harness) spawn one enemy with an optional affix/elite, at an exact spot, returned. Sets the flags BEFORE AddChild so
+    // the affix aura / elite ring build correctly in _Ready — same ordering as the maze spawn.
+    public Enemy SpawnEnemyForTest(string type, Vector3 pos, int affix = 0, bool elite = false)
+    {
+        var e = new Enemy();
+        e.Configure(type, Wave);
+        if (elite) e.MakeElite(); else if (affix > 0) e.MakeAffix(affix);
+        AddChild(e);
+        e.NetId = _netEnemySeq++;
+        e.TypeIdx = EnemyKinds.Index(type);
+        e.GlobalPosition = new Vector3(pos.X, Mathf.Max(pos.Y, e.Radius), pos.Z);
+        Enemies.Add(e);
+        return e;
+    }
+
     // maze spawn: rolls elite/affix BEFORE AddChild so the ring + affix visuals build in _Ready
     private Enemy SpawnMazeEnemy(string type, Vector3 pos)
     {
@@ -5940,6 +6039,94 @@ void fragment() {
         if (moved) { pos = ClampToWorld(pos, 20f); pos.Y = SurfaceHeight(pos, 1e9f); }
         return moved;
     }
+
+    // (SPAWN SAFETY) A safe overworld spawn near `near`: on dry LAND (spiral out of water), shoved clear of any solid structure
+    // (tree/house/keep via NudgeOutOfStructures), and grounded. Note: structures stream in per-chunk, so at the very first frame
+    // the Decks/Blockers near spawn may not exist yet — the `_spawnSettleT` re-check in _Process finishes the job once they load.
+    public Vector3 SafeSpawn(Vector3 near)
+    {
+        float minLand = World.WaterLevel + 0.5f;
+        Vector3 best = new Vector3(near.X, 0f, near.Z);
+        if (_world != null && _world.Height(best.X, best.Z) < minLand)   // in water → spiral out to the nearest dry land
+        {
+            bool found = false;
+            for (float r = 6f; r <= 160f && !found; r += 6f)
+                for (int a = 0; a < 16 && !found; a++)
+                {
+                    float ang = a * Mathf.Tau / 16f;
+                    float cx = near.X + Mathf.Cos(ang) * r, cz = near.Z + Mathf.Sin(ang) * r;
+                    if (_world.Height(cx, cz) >= minLand) { best.X = cx; best.Z = cz; found = true; }
+                }
+        }
+        NudgeOutOfStructures(ref best, 2f);
+        best.Y = SurfaceHeight(best, 1e9f);
+        return best;
+    }
+
+    // Horizontal distance from (x,z) to the nearest SOLID structure (tree/pillar/house Blocker + tall keep Deck), capped at 10.
+    // Bigger = more open. Deterministic given world state → identical on every MP client. Only meaningful once chunks are loaded.
+    private float StructureClearance(float x, float z)
+    {
+        float min = 10f;
+        var nb = QueryBlockers(x, z, 12f);
+        for (int i = 0; i < nb.Count; i++)
+        {
+            var b = Blockers[nb[i]];
+            float d = Mathf.Sqrt((x - b.Pos.X) * (x - b.Pos.X) + (z - b.Pos.Z) * (z - b.Pos.Z)) - b.Radius;
+            if (d < min) min = d;
+        }
+        var nd = QueryDecks(x, z, 14f);
+        for (int i = 0; i < nd.Count; i++)
+        {
+            var d = Decks[nd[i]];
+            if (d.TopY < 1.8f || d.LowPad || d.Floating) continue;
+            float ox = Mathf.Max(0f, Mathf.Abs(x - d.Center.X) - d.Half.X), oz = Mathf.Max(0f, Mathf.Abs(z - d.Center.Z) - d.Half.Y);
+            float dd = Mathf.Sqrt(ox * ox + oz * oz);
+            if (dd < min) min = dd;
+        }
+        return min;
+    }
+
+    // Best OPEN spawn near `near`: dry land, maximally clear of solid structures (not merely shoved against a wall). Prefers spots
+    // close to `near`. Deterministic given world state (MP-safe). Only effective once spawn-chunk structures are loaded.
+    public Vector3 BestOpenSpawn(Vector3 near)
+    {
+        float minLand = World.WaterLevel + 0.5f;
+        Vector3 best = new Vector3(near.X, 0f, near.Z);
+        float bestScore = float.NegativeInfinity; bool any = false;
+        for (float r = 0f; r <= 70f; r += 5f)
+        {
+            int steps = r < 1f ? 1 : Mathf.Max(8, (int)r);
+            for (int a = 0; a < steps; a++)
+            {
+                float ang = a * Mathf.Tau / steps;
+                float cx = near.X + Mathf.Cos(ang) * r, cz = near.Z + Mathf.Sin(ang) * r;
+                if (_world != null && _world.Height(cx, cz) < minLand) continue;   // in water → skip
+                float score = StructureClearance(cx, cz) - r * 0.05f;              // open, but bias toward staying near `near`
+                if (score > bestScore) { bestScore = score; best = new Vector3(cx, 0f, cz); any = true; }
+            }
+            if (bestScore >= 6f) break;   // comfortably open — good enough, stop searching outward
+        }
+        if (!any) best = new Vector3(near.X, 0f, near.Z);
+        best.Y = SurfaceHeight(best, 1e9f);
+        return best;
+    }
+
+    // Re-check the player's spawn for a short window after StartGame, as chunk structures stream in. Runs locally on each MP
+    // client for ITS OWN player (the corrected position then syncs via the normal position broadcast).
+    private float _spawnSettleT = 0f;
+    private void SettleSpawn(float dt)
+    {
+        if (_spawnSettleT <= 0f || Player == null || !InOverworld) { _spawnSettleT = 0f; return; }
+        _spawnSettleT -= dt;
+        if (Decks.Count == 0 && Blockers.Count == 0) return;   // spawn-chunk structures not loaded yet — wait
+        Vector3 p = Player.GlobalPosition;
+        var test = p;
+        bool buried = NudgeOutOfStructures(ref test, 2f);       // would the de-overlap have to move her? → she's in/against a structure
+        if (buried || StructureClearance(p.X, p.Z) < 2f)
+            Player.GlobalPosition = BestOpenSpawn(p);            // relocate to genuinely open ground nearby (not just a wall edge)
+        _spawnSettleT = 0f;   // one clean correction once structures exist
+    }
     // host: sweep the on-load interactables near the player (where structures are actually loaded) and shove any buried inside a
     // structure back out to clear ground. Chests/vendors/rituals/roulettes re-sync via their periodic snapshots; the one-shot sets re-broadcast.
     private float _deOverlapT = 0f;
@@ -6311,13 +6498,13 @@ void fragment() {
     private Vector3 GroundedDrySpawn(Vector3 around, float minD, float maxD)
     {
         Vector3 best = around; float bestY = -9999f;
-        for (int i = 0; i < 14; i++)
+        for (int i = 0; i < 24; i++)   // more tries so gameplay objects reliably find real dry land, not the waterline
         {
             float a = _rng.RandfRange(0, Mathf.Tau), d = _rng.RandfRange(minD, maxD);
             var p = ClampToWorld(new Vector3(around.X + Mathf.Cos(a) * d, 0, around.Z + Mathf.Sin(a) * d), 14f);   // (NEW) keep spawns inside the bounded overworld (well off the cliff wall)
             float gy = SurfaceHeight(p, 1e9f);
-            if (gy >= World.WaterLevel + 0.2f) return new Vector3(p.X, gy, p.Z);   // dry ground — take it
-            if (gy > bestY) { bestY = gy; best = new Vector3(p.X, Mathf.Max(gy, World.WaterLevel + 0.2f), p.Z); }
+            if (gy >= World.WaterLevel + 0.6f) return new Vector3(p.X, gy, p.Z);   // comfortably DRY ground — take it (raised from +0.2 so rituals/pedestals/vendors don't sit at the waterline)
+            if (gy > bestY) { bestY = gy; best = new Vector3(p.X, Mathf.Max(gy, World.WaterLevel + 0.6f), p.Z); }
         }
         return best;   // every try was over water → driest spot found, lifted to the shoreline so it never floats on open water
     }
@@ -6715,6 +6902,15 @@ void fragment() {
     // (MAP FILL) the shared "already-placed" list for a run — every discoverable (rituals, shrines, lair, chests, vendors,
     // effigies, portals) spreads against ALL the others so the whole bounded disc fills evenly with no big empty gaps.
     private readonly List<Vector3> _mapOccupied = new();
+    // true if a map-wide feature (ritual/pedestal/effigy/vendor/chest/lair/gate…) sits within `r` of this XZ — so chunk-streamed
+    // structures/trees can avoid dropping on top of them. (Map features are placed at load; chunks build lazily around them.)
+    public bool NearMapFeature(Vector3 p, float r)
+    {
+        float r2 = r * r;
+        foreach (var q in _mapOccupied)
+            if ((q.X - p.X) * (q.X - p.X) + (q.Z - p.Z) * (q.Z - p.Z) < r2) return true;
+        return false;
+    }
 
     // Host/solo: populate the ENTIRE bounded map, once, at load — a fresh, different-every-run layout decided up front.
     // Called from both map-setup paths (StartGame for the first Grove, ApplyLevelAdvance for every later map).
@@ -6825,9 +7021,10 @@ void fragment() {
         {
             var p = SpreadPointInWorld(_mapOccupied, 95f); _mapOccupied.Add(p);
             var ped = new Pedestal { NetId = NextPickupId() }; AddChild(ped); ped.GlobalPosition = p; Pedestals.Add(ped);
-            PersistentDecks.Add(new Deck { Center = new Vector3(p.X, 0, p.Z), Half = new Vector2(Pedestal.Half, Pedestal.Half), TopY = p.Y + Pedestal.TopH, LowPad = true });   // LowPad → step up from ANY side, no wall push-out (reliable; no stair-pathfinding)
-            PersistentRamps.Add(new Ramp { Center = new Vector3(p.X, 0, p.Z + Pedestal.Half + 1.2f), Half = new Vector2(1.5f, 1.2f), YLow = p.Y + Pedestal.TopH, YHigh = p.Y, AlongX = false });   // the +Z staircase → a smooth walk-up matching the visible steps
-            _pedestalTops.Add(new Vector3(p.X, p.Y + Pedestal.TopH + 0.15f, p.Z));
+            float daisR = Pedestal.DaisR;
+            PersistentDecks.Add(new Deck { Center = new Vector3(p.X, 0, p.Z), Half = new Vector2(daisR, daisR), TopY = p.Y + Pedestal.TopH, LowPad = true });   // (FIX) deck covers the WHOLE dais footprint; LowPad → step up from any side (no ramp needed)
+            _pedestalTops.Add(new Vector3(p.X, p.Y + Pedestal.TopH - 0.15f, p.Z));   // effigy sits ON the dais surface
+            AddPedestalRim(p, daisR);
             ids[i] = ped.NetId; px[i] = p.X; pz[i] = p.Z;
         }
         _world?.MarkBlockersDirty();   // flush the new pedestal decks into Decks so they're solid + walkable right away
@@ -6839,7 +7036,19 @@ void fragment() {
         Pedestals.Clear(); _pedestalTops.Clear();
         PersistentDecks.RemoveAll(d => !d.Floating);   // strip our overworld pedestal decks (sky-island decks are Floating=true → kept)
         PersistentRamps.Clear();                        // only pedestals add persistent ramps → safe to strip all
+        PedestalRimBlockers.Clear();
         _world?.MarkBlockersDirty();
+    }
+    // red blockers on the raised rune-block "pony walls" out on the dais RIM — jump-over height, gaps between them, matching the
+    // model's raised blocks (~6 around the perimeter). Sized/positioned to the real dais radius.
+    private void AddPedestalRim(Vector3 p, float daisR)
+    {
+        int n = 6;
+        for (int k = 0; k < n; k++)
+        {
+            float a = k / (float)n * Mathf.Tau + 0.5f, rr = daisR * 0.85f;
+            PedestalRimBlockers.Add(new Blocker { Pos = new Vector3(p.X + Mathf.Cos(a) * rr, 0, p.Z + Mathf.Sin(a) * rr), Radius = daisR * 0.2f, Top = p.Y + Pedestal.TopH + 1.3f });
+        }
     }
     // client: rebuild pedestals + their walkable decks from the host broadcast
     public void SetRemotePedestals(int[] ids, float[] px, float[] pz)
@@ -6849,8 +7058,9 @@ void fragment() {
         {
             float y = SurfaceHeight(new Vector3(px[i], 0, pz[i]), 1e9f);
             var ped = new Pedestal { NetId = ids[i], Remote = true }; AddChild(ped); ped.GlobalPosition = new Vector3(px[i], y, pz[i]); Pedestals.Add(ped);
-            PersistentDecks.Add(new Deck { Center = new Vector3(px[i], 0, pz[i]), Half = new Vector2(Pedestal.Half, Pedestal.Half), TopY = y + Pedestal.TopH, LowPad = true });
-            PersistentRamps.Add(new Ramp { Center = new Vector3(px[i], 0, pz[i] + Pedestal.Half + 1.2f), Half = new Vector2(1.5f, 1.2f), YLow = y + Pedestal.TopH, YHigh = y, AlongX = false });
+            float daisR = Pedestal.DaisR;
+            PersistentDecks.Add(new Deck { Center = new Vector3(px[i], 0, pz[i]), Half = new Vector2(daisR, daisR), TopY = y + Pedestal.TopH, LowPad = true });
+            AddPedestalRim(new Vector3(px[i], y, pz[i]), daisR);
         }
         _world?.MarkBlockersDirty();
     }
@@ -7027,8 +7237,6 @@ void fragment() {
 
         if (e is InputEventKey f3 && f3.Pressed && !f3.Echo && f3.PhysicalKeycode == Key.F3) { PadDebug = !PadDebug; return; }   // toggle the gamepad debug readout
 
-        if (e is InputEventMouseMotion mm && _dragSlider >= 0 && State == GameState.Pause) { ApplySlider(mm.Position); return; }
-
         if (e is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left)
         {
             if (!mb.Pressed) { _dragSlider = -1; return; }
@@ -7079,15 +7287,12 @@ void fragment() {
                 case GameState.Shop:
                     { int idx = Hud.ShopAt(pos); if (idx == -1) CloseShop(); else if (idx >= 0) ShopBuy(idx); break; }
                 case GameState.Pause:
+                    if (InGameOptions) break;   // the options overlay's Control nodes own input while it's up
                     { int bi = Hud.PauseBindAt(pos); if (bi >= 0) { RebindFinisher(bi); break; } }
-                    if (Hud.RPauseResume.HasPoint(pos)) { SaveGold(); State = GameState.Playing; Input.MouseMode = Input.MouseModeEnum.Captured; }
-                    else if (Hud.RPauseDmg.HasPoint(pos)) { DmgNumbers = !DmgNumbers; SaveGold(); }
-                    else if (Hud.RPauseMusic.HasPoint(pos)) { _dragSlider = 0; ApplySlider(pos); }
-                    else if (Hud.RPauseSens.HasPoint(pos)) { _dragSlider = 1; ApplySlider(pos); }
-                    else if (Hud.RPauseBloom.HasPoint(pos)) { GfxBloom = !GfxBloom; ApplyGraphics(); SaveGold(); }
-                    else if (Hud.RPauseSsao.HasPoint(pos)) { GfxSsao = !GfxSsao; ApplyGraphics(); SaveGold(); }
-                    else if (Hud.RPauseSsil.HasPoint(pos)) { GfxSsil = !GfxSsil; ApplyGraphics(); SaveGold(); }
-                    else { for (int gi = 0; gi < 3; gi++) { if (Hud.RPauseGfx[gi].HasPoint(pos)) { SetGfxQuality(gi); SaveGold(); break; } if (Hud.RPauseShadow[gi].HasPoint(pos)) { SetShadowQuality(gi); SaveGold(); break; } if (Hud.RPauseView[gi].HasPoint(pos)) { SetViewDist(gi); SaveGold(); break; } } }
+                    if (Hud.RPauseResume.HasPoint(pos)) ResumeRun();
+                    else if (Hud.RPauseOptions.HasPoint(pos)) OpenInGameOptions();
+                    else if (Hud.RPauseQuit.HasPoint(pos)) QuitRun();
+                    else if (Hud.RPauseRestart.HasPoint(pos) && CanRestartRun()) RestartRun();
                     break;
                 case GameState.Over:
                     if (NetMgr != null && NetMgr.Active)   // MP: only the host may choose, and it applies to everyone
@@ -7109,11 +7314,6 @@ void fragment() {
         }
     }
 
-    private void ApplySlider(Vector2 pos)
-    {
-        if (_dragSlider == 0) { var r = Hud.RPauseMusic; SetMusicVol((pos.X - r.Position.X) / Mathf.Max(1f, r.Size.X)); }
-        else if (_dragSlider == 1) { var r = Hud.RPauseSens; SetSensitivity((pos.X - r.Position.X) / Mathf.Max(1f, r.Size.X)); }
-    }
 
     // (ULT CARDS) ults are now acquired through the level-up roll itself (Legendary equip cards from level 3, guaranteed by
     // ~level 10 via RollUltCard's pity) — NOT a dedicated pop-up offer. This is a no-op so the old call sites stay harmless.
@@ -7348,6 +7548,7 @@ void fragment() {
     {
         CrashLogger.Beat("Game._Process");   // heartbeat — the watchdog flags a freeze if this stops
         float dt = (float)delta;
+        if (_spawnSettleT > 0f) SettleSpawn(dt);   // (SPAWN SAFETY) nudge the player off any structure that streamed in on spawn
         if (SelectLock > 0f) SelectLock -= dt;
         UpdatePadCursor(dt);
         if (State == GameState.Playing && _pendingLevels == 0) TryOfferUlt();   // (SAFETY NET) never leave an unlock-level+ warden without their ult offer, no matter how the levels were gained
@@ -7564,17 +7765,13 @@ void fragment() {
         }
         if (State == GameState.Pause)
         {
-            if (Sfx != null)
+            if (InGameOptions)   // Esc backs out of the options overlay to the pause menu (rather than resuming)
             {
-                if (Input.IsActionPressed("move_left")) { Sfx.MusicVol = Mathf.Max(0f, Sfx.MusicVol - dt * 0.6f); }
-                if (Input.IsActionPressed("move_right")) { Sfx.MusicVol = Mathf.Min(1f, Sfx.MusicVol + dt * 0.6f); }
+                if (SelectLock <= 0f && Input.IsActionJustPressed("release_mouse")) CloseInGameOptions();
+                return;
             }
             if (SelectLock <= 0f && (Input.IsActionJustPressed("release_mouse") || Input.IsActionJustPressed("pick1")))
-            {
-                SaveGold();   // persist music volume
-                State = GameState.Playing;
-                Input.MouseMode = Input.MouseModeEnum.Captured;
-            }
+                ResumeRun();
             return;
         }
 
@@ -8112,10 +8309,19 @@ void fragment() {
     public int ResIndex = 2;     // index into ResChoices (default 1920×1080)
     public bool VSync = true;
     public int ViewDist = 1;     // (NEW) Render Distance: 0 Low, 1 Med, 2 High → World.FarRadius (LOD-ring reach)
+    public int TextureQuality = 2;   // (NEW) 0 Low (512), 1 Medium (1k), 2 High (full 2k) — caps ground/rock texture resolution (VRAM). Persisted.
+    public void SetTextureQuality(int q) { TextureQuality = Mathf.Clamp(q, 0, 2); World.SetTexQuality(TextureQuality); }
+    public int MaxFps = 60;       // (NEW) explicit frame cap (30/60/90/120/144). Persisted. Independent of V-Sync + the Painterly quality.
+    public static readonly int[] FpsChoices = { 30, 60, 90, 120, 144 };
+    public void SetMaxFps(int fps) { MaxFps = fps; Engine.MaxFps = Mathf.Max(0, fps); }
     public int FarRing => ViewDist <= 0 ? 3 : ViewDist == 1 ? 4 : 5;
     public void SetViewDist(int v) { ViewDist = Mathf.Clamp(v, 0, 2); _world?.RefreshStreaming(); }
+    public void DebugGrovePatch(Vector3 c) => _world?.DebugGrovePatch(c);   // (DEV) in-world prop/structure validation patch (grove_showcase scenario)
+    public Vector3 DebugSpawnClimbableKeep(Vector3 c) => _world != null ? _world.DebugSpawnClimbableKeep(c) : new Vector3(c.Y, c.X, c.Z);   // (DEV) → (roofY, xStairWorld, stairFarZ)
+    public Godot.Collections.Array<Vector3> DebugStructureAudit(Vector3 c) => _world != null ? _world.DebugStructureAudit(c) : new Godot.Collections.Array<Vector3>();
     public void ApplyWindow()
     {
+        Engine.MaxFps = Mathf.Max(0, MaxFps);   // (NEW) explicit frame cap (applies whether V-Sync is on or off)
         DisplayServer.WindowSetVsyncMode(VSync ? DisplayServer.VSyncMode.Enabled : DisplayServer.VSyncMode.Disabled);
         if (WindowMode == 1) { DisplayServer.WindowSetMode(DisplayServer.WindowMode.Fullscreen); return; }
         DisplayServer.WindowSetMode(DisplayServer.WindowMode.Windowed);
@@ -8175,6 +8381,8 @@ void fragment() {
         cfg.SetValue("options", "vsync", VSync);
         cfg.SetValue("options", "viewdist", ViewDist);
         cfg.SetValue("options", "shadowquality", ShadowQuality);
+        cfg.SetValue("options", "maxfps", MaxFps);
+        cfg.SetValue("options", "texquality", TextureQuality);
         Perks.Save(cfg);   // (NEW) persist the coven perk trees (owned + equipped per witch)
         MetaUnlocks.Save(cfg);   // (NEW) persist the general gold meta-tree (+fin / +mod / +mana)
         cfg.Save("user://grove_save.cfg");
@@ -8201,6 +8409,8 @@ void fragment() {
             VSync = cfg.GetValue("options", "vsync", true).AsBool();
             ViewDist = cfg.GetValue("options", "viewdist", 1).AsInt32();
             ShadowQuality = cfg.GetValue("options", "shadowquality", 1).AsInt32();
+            MaxFps = cfg.GetValue("options", "maxfps", 60).AsInt32();          // default 60
+            TextureQuality = cfg.GetValue("options", "texquality", 2).AsInt32();   // default High
             ApplyGraphics();   // no-op if the environment isn't built yet; BuildWorld re-applies
             ApplyWindow();
             Perks.Load(cfg);   // (NEW) restore the coven perk trees

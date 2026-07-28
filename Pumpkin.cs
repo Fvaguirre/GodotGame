@@ -24,16 +24,19 @@ public partial class Pumpkin : Node3D
     {
         _col = new Color(0.85f, 0.35f, 0.05f).Lerp(new Color(0.7f, 0.45f, 0.08f), rng.Randf());
 
-        _body = new MeshInstance3D { Mesh = new SphereMesh { Radius = _size, Height = _size * 1.3f } };
-        _body.MaterialOverride = lit ? Game.ToonEmissive(_col, 0.7f) : Game.Toon(_col, 0.9f, 0.22f, 0.03f);
-        _body.Position = new Vector3(0, _size * 0.55f, 0);
-        _body.Scale = new Vector3(1f, 0.8f, 1f);
+        // (MESHY) real 3D pumpkin model (baked texture + per-node colour jitter). The model already includes its stem, so
+        // _stem stays null; Smash() null-checks it. A jack-o'-lantern glow for the ~22% "lit" ones via an emissive add-light.
+        float th = _size * 2.2f;   // model is normalised to unit height; scale up to a chunky patch pumpkin
+        _body = PropGlb.Instance("pumpkin", th, seed: (int)rng.Randi());
         AddChild(_body);
 
-        _stem = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.08f, Height = 0.3f } };
-        _stem.MaterialOverride = Game.Toon(new Color(0.12f, 0.16f, 0.08f), 0.95f, 0.22f, 0.03f);
-        _stem.Position = new Vector3(0, _size * 1.0f, 0);
-        AddChild(_stem);
+        if (lit)
+        {
+            var glow = new OmniLight3D { LightColor = new Color(1f, 0.55f, 0.18f), LightEnergy = 1.4f, OmniRange = _size * 4f, OmniAttenuation = 1.6f };
+            glow.Position = new Vector3(0, th * 0.5f, 0);
+            glow.ShadowEnabled = false;
+            _body.AddChild(glow);
+        }
     }
 
     public void TakeDamage(float dmg)   // (NEW) world objects break when their hidden HP is depleted by ANY damage source
