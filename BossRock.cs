@@ -21,7 +21,7 @@ public partial class BossRock : Node3D
         float travel = Mathf.Max(0.2f, dist / speed);
         Vel = flat / travel + new Vector3(0f, 22f * travel * 0.5f + (targetPos.Y - from.Y) / travel, 0f);   // ballistic arc that lands on target
 
-        var rock = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.85f, Height = 1.7f, RadialSegments = 6, Rings = 4 }, MaterialOverride = Game.Toon(new Color(0.42f, 0.38f, 0.34f), 0.95f, 0.35f, 0.05f) };
+        var rock = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.85f, Height = 1.7f, RadialSegments = 6, Rings = 4 }, MaterialOverride = Game.RockMat() };
         AddChild(rock);
         AddChild(new OmniLight3D { OmniRange = 4f, LightColor = new Color(1f, 0.55f, 0.3f), LightEnergy = 0.7f });
     }

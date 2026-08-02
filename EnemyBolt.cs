@@ -13,6 +13,11 @@ public partial class EnemyBolt : Node3D
     public float Radius = 0.5f;
     public Color Tint = new Color(1f, 0.5f, 0.3f);
     public bool Remote = false;
+    // (PUPPET) a shot fired by a turned foe. It ignores players entirely and looks for ENEMIES instead — the one piece of
+    // ranged puppetry that isn't free, since this class only ever knew how to find a witch. Host-only, like all its damage.
+    public bool HitsEnemies = false;
+    public long OwnerPeer = 0;    // peer credited with the kill, so a puppet's kill still pays XP/souls/Highlight (NOT `Owner` — that's Node.Owner)
+    public Node3D Shooter;        // never hit whoever fired it
     public static int Live = 0;
     private bool _litReg = false;
     private bool _warned = false;   // (NEW) fired the one-shot "incoming" whistle already
@@ -97,7 +102,7 @@ public partial class EnemyBolt : Node3D
         var p = Game.I.Player;
 
         // (NEW) a spatial "incoming" whistle the moment a shot on a collision course gets close — panned from its direction
-        if (!_warned && p != null && ThreatTo(p.GlobalPosition, out float _tti, out float _miss) && _tti < 0.85f && _tti > 0.04f)
+        if (!_warned && !HitsEnemies && p != null && ThreatTo(p.GlobalPosition, out float _tti, out float _miss) && _tti < 0.85f && _tti > 0.04f)   // (PUPPET) a turned foe's shot can't hurt you — don't cry incoming
         { _warned = true; Game.I.Sfx?.Incoming(GlobalPosition); }
 
         if (Remote)
@@ -108,6 +113,24 @@ public partial class EnemyBolt : Node3D
                 if (new Vector2(GlobalPosition.X - bl.Pos.X, GlobalPosition.Z - bl.Pos.Z).Length() < bl.Radius) { QueueFree(); return; }
             if (HitsDeck()) { QueueFree(); return; }
             if (Life <= 0f) QueueFree();
+            return;
+        }
+
+        // (PUPPET) a turned foe's shot: hunt enemies, never the witches. Runs before every player-facing check below so a
+        // puppet's bolt can't clip a warden on its way across, and skips the wind/fire wards too — those guard the player.
+        if (HitsEnemies)
+        {
+            foreach (var e in Game.I.Enemies.ToArray())
+            {
+                if (e == null || e == Shooter || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+                if (GlobalPosition.DistanceTo(e.GlobalPosition + new Vector3(0, e.Radius * 0.6f, 0)) > Radius + e.Radius) continue;
+                e.PuppetHurt(OwnerPeer, Dmg);
+                QueueFree();
+                return;
+            }
+            foreach (var bl in Game.I.Blockers)
+                if (new Vector2(GlobalPosition.X - bl.Pos.X, GlobalPosition.Z - bl.Pos.Z).Length() < bl.Radius) { QueueFree(); return; }
+            if (HitsDeck() || Life <= 0f) QueueFree();
             return;
         }
 

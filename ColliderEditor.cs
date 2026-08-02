@@ -298,10 +298,14 @@ public partial class ColliderEditor : Node3D
                 ? new CylinderMesh { TopRadius = pl.Size.X, BottomRadius = pl.Size.X, Height = pl.Size.Y * 2f, RadialSegments = 16 }
                 : new BoxMesh { Size = pl.Size * 2f };
             var mi = new MeshInstance3D { Mesh = mesh, MaterialOverride = mat, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off, Position = pl.Pos };
-            // ramp kind: tilt the slab along local +X so its slope direction is visible
+            // ramp kind: draw the ACTUAL thin sloped WALKABLE surface (run=2·X, rise=2·Y, width=2·Z) — NOT a thick block. This
+            // matches exactly what the game builds (World/CollisionDebug), so what you place is what you get. Size.Y = the rise.
             if (pl.Kind == "ramp")
             {
-                float ang = Mathf.Atan2(2f * pl.Size.Y, Mathf.Max(0.05f, 2f * pl.Size.X));
+                float run = 2f * pl.Size.X, rise = 2f * pl.Size.Y;
+                float len = Mathf.Sqrt(run * run + rise * rise);
+                float ang = Mathf.Atan2(rise, Mathf.Max(0.05f, run));
+                mi.Mesh = new BoxMesh { Size = new Vector3(len, 0.16f, 2f * pl.Size.Z) };
                 mi.Basis = new Basis(Quaternion.FromEuler(new Vector3(0, pl.Yaw, 0)) * Quaternion.FromEuler(new Vector3(0, 0, ang)));
             }
             else mi.Basis = new Basis(Quaternion.FromEuler(new Vector3(0, pl.Yaw, 0)));

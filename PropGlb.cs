@@ -25,7 +25,7 @@ public static class PropGlb
 
     private static string PathFor(string name, string subdir) => $"res://assets/models/{subdir}/{name}.glb";
 
-    private static Entry Load(string name, string subdir, float rough, float wind, bool tryNormal, bool byMaxDim = false)
+    private static Entry Load(string name, string subdir, float rough, float wind, bool tryNormal, bool byMaxDim = false, bool layFlat = false)
     {
         string key = subdir + "/" + name;
         if (_cache.TryGetValue(key, out var e)) return e;
@@ -41,16 +41,32 @@ public static class PropGlb
         if (mi == null || mi.Mesh == null) { GD.PushWarning($"PropGlb: no mesh in {name}"); root.QueueFree(); _cache[key] = e; return e; }
 
         var src = mi.Mesh;
-
-        // oriented AABB of the mesh in its authored (post-transform) space → normalise to unit height, base at 0, centred XZ
         var ab = src.GetAabb();
-        Vector3 min = new(float.MaxValue, float.MaxValue, float.MaxValue), max = new(-float.MaxValue, -float.MaxValue, -float.MaxValue);
-        for (int i = 0; i < 8; i++)
+
+        // oriented AABB of the mesh in `acc` space → 8 transformed corners
+        (Vector3 min, Vector3 max) MinMax(Transform3D a)
         {
-            var corner = ab.Position + ab.Size * new Vector3((i & 1), (i >> 1) & 1, (i >> 2) & 1);
-            var w = acc * corner;
-            min = new Vector3(Mathf.Min(min.X, w.X), Mathf.Min(min.Y, w.Y), Mathf.Min(min.Z, w.Z));
-            max = new Vector3(Mathf.Max(max.X, w.X), Mathf.Max(max.Y, w.Y), Mathf.Max(max.Z, w.Z));
+            Vector3 mn = new(float.MaxValue, float.MaxValue, float.MaxValue), mx = new(-float.MaxValue, -float.MaxValue, -float.MaxValue);
+            for (int i = 0; i < 8; i++)
+            {
+                var corner = ab.Position + ab.Size * new Vector3((i & 1), (i >> 1) & 1, (i >> 2) & 1);
+                var w = a * corner;
+                mn = new Vector3(Mathf.Min(mn.X, w.X), Mathf.Min(mn.Y, w.Y), Mathf.Min(mn.Z, w.Z));
+                mx = new Vector3(Mathf.Max(mx.X, w.X), Mathf.Max(mx.Y, w.Y), Mathf.Max(mx.Z, w.Z));
+            }
+            return (mn, mx);
+        }
+        var (min, max) = MinMax(acc);
+
+        // (FLAT PROPS) a single leaf must rest on its biggest face. If its THINNEST AABB axis isn't vertical, the source model
+        // is standing on edge — rotate 90° so the thin axis points up (Y), then re-measure. Piles/foliage skip this (layFlat=false).
+        if (layFlat)
+        {
+            float dx = max.X - min.X, dy = max.Y - min.Y, dz = max.Z - min.Z;
+            Basis flat = Basis.Identity; bool reorient = false;
+            if (dx <= dy && dx <= dz) { flat = new Basis(new Vector3(0, 0, 1), Mathf.Pi / 2f); reorient = true; }        // X thinnest → X→Y
+            else if (dz <= dx && dz <= dy) { flat = new Basis(new Vector3(1, 0, 0), -Mathf.Pi / 2f); reorient = true; }  // Z thinnest → Z→Y
+            if (reorient) { acc = new Transform3D(flat, Vector3.Zero) * acc; (min, max) = MinMax(acc); }
         }
         // normalise by HEIGHT (default — so callers place by a plain desired height) OR by the LARGEST dimension (for FLAT props
         // like leaves/lilypads: normalising a thin-Y leaf by height would blow its width up boat-sized).
@@ -146,8 +162,9 @@ public static class PropGlb
             case "fern":      return Load(name, "props", 0.8f, 0.018f, false);
             case "reeds":     return Load(name, "props", 0.8f, 0.030f, false);
             case "pumpkin":   return Load(name, "props", 0.75f, 0f, false);
-            case "leaf_a": case "leaf_b": case "leaf_c": return Load(name, "props", 0.7f, 0.02f, false, byMaxDim: true);   // single leaves — normalise by MAX dim (flat) so they don't blow up; a little wind flutter
+            case "leaf_a": case "leaf_b": case "leaf_c": return Load(name, "props", 0.7f, 0.02f, false, byMaxDim: true, layFlat: true);   // single leaves — normalise by MAX dim + lay FLAT (thin axis up) so none stand on edge; a little wind flutter
             case "leafpile_a": case "leafpile_b":        return Load(name, "props", 0.8f, 0f, false, byMaxDim: true);
+            case "hat": case "hand": case "robe":        return Load(name, "avatar", 0.9f, 0f, true, byMaxDim: true);   // (FLOATING AVATAR) Meshy hero pieces — normalise by max dim, keep baked normal
             case "ruin":      return Load(name, "structures", 0.95f, 0f, true);
             case "staircase": return Load(name, "structures", 0.95f, 0f, true);
             case "cottage_a": return Load(name, "structures", 0.9f, 0f, true);

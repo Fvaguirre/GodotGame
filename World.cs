@@ -1616,7 +1616,7 @@ void fragment() {
         if (!Scatterable(root.Position.X + lx, root.Position.Z + lz)) return;
         var c = ChunkOf(root);
         var kind = rng.Randf() < 0.5f ? PropField.Kind.GlbLeafPileA : PropField.Kind.GlbLeafPileB;
-        float s = rng.RandfRange(0.9f, 1.5f);
+        float s = rng.RandfRange(1.4f, 2.3f);   // (TUNE) bigger raked piles — the small ones read as scattered litter, not a pile
         var basis = new Basis(Vector3.Up, rng.Randf() * Mathf.Tau).Scaled(new Vector3(s, s * rng.RandfRange(0.7f, 1f), s));
         _propField.Add(kind, new Transform3D(basis, new Vector3(root.Position.X + lx, GY(root, lx, lz) + 0.02f, root.Position.Z + lz)), c);
     }

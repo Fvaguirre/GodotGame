@@ -288,6 +288,38 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     public bool FiresBolts => !FrostWitch && !ForsakenWitch && !EmberWitch && !ArcaneWitch;
     // ---- Forsaken (Curse) witch tuning ----
     public int MaxLinks = 6;              // (NEW) how many foes she can tether across all curse groups at once
+    // (DOOM) Focus — the channel's wind-up. It lives on HER rather than on the beamed foe on purpose: a per-target ramp
+    // would make tunnelling one enemy the correct line in a game where forty are closing, which is exactly what made her
+    // primary feel bad. Sweeping across a pack now keeps the ramp; only letting go of the button drops it.
+    public float DoomFocus = 1f;
+    public const float FocusMax = 2.5f;   // ×1.0 → ×2.5
+    public const float FocusRise = 0.5f;  // …over 3s of continuous fire
+    public const float FocusFall = 1f;    // …decaying over 1.5s once she stops
+    public float DoomRate = 0.2f;         // Doom/sec = Base() × DoomRate × CurseRate × Focus → 5/s cold, 12.5/s wound up at base CurseRate
+    // (EFFIGY mod) the doll she already holds while charging, finally given a mechanic. While it's nailed to a foe, a
+    // share of everything she does to ANYTHING ELSE is banked on it — which is what makes it her single-target and boss
+    // tool, and the best curse card a non-Forsaken witch can hold (their burn/bleed feeds it without a channel).
+    public Enemy EffigyTgt;
+    public float EffigyT = 0f;
+    public float EffigyShare = 0f;
+    public int EffigyBurst = 0;           // Leg Reckoning: detonate what's banked when the effigy's time runs out
+    // (DOOM) how hard everything she applies banks. This is what her A column now feeds: CurseStackCap used to be the
+    // crush's effective-stack ceiling, which strings made meaningless, so those six nodes point here instead and keep
+    // their names, their column and their build identity.
+    public float DoomPower = 1f;
+    // (DOOM) how far a detonation throws. This is what her B column feeds now that the beam no longer chains on its own:
+    // the question the column answers changed from "how many foes auto-link" to "how wide does your blast carry", which
+    // is both more legible and something the player actually triggers.
+    public float DoomSpreadRadius = 5f;
+    // (FRAY) equipping Fray amplifies EVERY Doom detonation's spread rather than competing with the crush's own. Its
+    // active copy is what a non-Forsaken witch uses (their charged release doesn't detonate anything); this passive is
+    // what earns it a slot on her, where the crush already spreads. Read live off the equipped mod so upgrades count.
+    public float DoomSpreadMul()
+    {
+        var f = Mods.Find(m => m.Type == ModType.Fray);
+        if (f == null) return 1f;
+        return 1.5f + 0.12f * f.Stat[1] + (f.Evo[0] > 0 ? 0.15f * f.Evo[0] : 0f);   // +50%, more with Reach/Wildfire
+    }
     public float CurseRate = 2.5f;        // (NEW) curse stacks/sec the suck-beam builds — faster so groups form quickly
     public float CurseShareFrac = 0.5f;   // (NEW) fraction of any damage instance shared to a cursed group-mate
     public float CurseSpreadRange = 18f;  // (NEW) how close a foe must be to a beamed foe to get pulled into its curse group
@@ -331,9 +363,13 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     public int GroveBonusEnts = 0;                               // extra max ents from upgrades
     public int MaxEnts => 4 + GroveBonusEnts;                    // (REWORK) base 4 (was 3); grows via Grove perks/cards
     private float _groveTrickleT = 0f;                           // (REWORK) Living Grove: a slow passive summon even without combo
-    public float MinionDamage() => Base() * 0.6f;
-    public float MinionBurst() => Base() * 3.0f;                   // full-charge detonation — her big burst
-    public float PoisonDps() => Base() * 0.15f;                   // (NERF 0.22→0.15) per application — additive, stacks while you keep hitting; her primary poison was ~2.6× overtuned
+    // (PERKS) her two signature scalars. Before these the Grove tree could only add ent COUNT — nothing made the ents
+    // themselves hit harder or her rot bite deeper, so "+4% damage" nodes did nothing for her actual win condition.
+    public float MinionDmgMul = 1f;                              // scales tree-ent melee AND their detonation burst
+    public float PoisonMul = 1f;                                 // scales every poison application she causes
+    public float MinionDamage() => Base() * 0.6f * MinionDmgMul;
+    public float MinionBurst() => Base() * 3.0f * MinionDmgMul;    // full-charge detonation — her big burst
+    public float PoisonDps() => Base() * 0.15f * PoisonMul;       // (NERF 0.22→0.15) per application — additive, stacks while you keep hitting; her primary poison was ~2.6× overtuned
     // her tree-ents are part of her kit: their direct hits inherit her crit + lifesteal (but NOT her full
     // HP or flat damage, which stay fractional). Rolls a crit, heals her for the leech, returns final damage.
     public float MinionStrike(float baseDmg, out bool crit)
@@ -357,7 +393,8 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         {
             case DamageType.Ember: e.AddBurn(1.5f, Base() * 0.08f, Base() * 3f, 0f, Game.I.LocalPeer); break;
             case DamageType.Frost: e.AddFreeze(1.5f, FreezeThreshMul, FrostDurBonus); break;
-            case DamageType.Curse: e.Mark(3f, S.MarkAmp, 0); break;
+            case DamageType.Curse: e.AddDoom(Base() * 1.2f * DoomPower); break;   // (DOOM REWORK) a Curse-attuned ent banks Doom, like every other Curse source now — it used to apply a Mark, which belongs to Blood
+
             case DamageType.Lunar: e.Slow(1.4f, 0.65f); break;
             case DamageType.Wind:  e.Knockback(center, 7f); break;
             case DamageType.Holy:  Heal(S.MaxHp * 0.01f); break;
@@ -498,7 +535,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     // dodge, not on top of the field damage. Blessed purges it outright — a Divine ally can cleanse the whole party.
     public float VenomT = 0f, VenomDps = 0f, VenomHold = 0f;
     private float _venomTick = 0f;
-    public bool Sanctuary = false;      // (NERFER) Sanctuary shrine armed → soft aura + angelic hum + 2 HP/s regen during the boss fight
+    public bool Sanctuary = false;      // (NERFER) Sanctuary shrine armed → soft aura + angelic hum + 1%-of-max-HP/s regen during the boss fight
     public bool Divinity = false;       // Divinity ult active (ascended, invulnerable)
     private float _divT = 0f, _divBaseY = 0f, _noFall = 0f;
     private bool _divFalling = false;   // stays invulnerable through the descent until her feet touch ground
@@ -647,6 +684,13 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     public bool Channeling => _beamT > 0;
 
     private Node3D _armL, _armR;
+    private float _fpReleaseT; private bool _fpChgPrev;   // FP glove release-flourish timer (palms rotate forward + extend on right-click release)
+    // --- DEV in-engine FP hand poser (dev cmd `fppose`) ---
+    private bool _fpPoseMode; private int _fpPoseSel;
+    private Vector3 _fpPoseRotL = new Vector3(180, 90, 0), _fpPoseRotR = new Vector3(180, -90, 0);
+    private bool _fpPoseMirrorL = false, _fpPoseMirrorR = true;   // POSED: RIGHT hand mirrored (negative Scale.X) so the pair is anatomically correct
+    private const float _fpHandScale = 0.34f;
+    private readonly System.Collections.Generic.Dictionary<Key, bool> _fpPosePrev = new();
     private MeshInstance3D _chargeOrb;
     private Node3D _thornCharge;   // Verdant charge-up spike
     private Vector3 _baseLPos, _baseRPos, _baseLRot, _baseRRot;
@@ -658,7 +702,42 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     private static float Now => Game.GameClock;
     private static int Tier(Rarity r) => (int)r;
     private float FrenzyMul() => SanguineFrenzy ? (1f + 0.25f * (1f - Mathf.Clamp(Hp / Mathf.Max(1f, S.MaxHp), 0f, 1f))) : 1f;   // up to +25% near death
-    private float Base() => 10f * S.Atk * UltDmgMul * DamageMul * FrenzyMul() * JetstreamMul() * HolyEmpowerMul();   // JetstreamMul = Gale airborne bonus (NEW); HolyEmpowerMul = Divine Hallowed buff (OVERHAUL)
+
+    // ---- (CARDS) SITUATIONAL power — the roll-3 cards' currency -------------------------------------------------
+    // Division of labour: the PERK TREE owns flat, always-on scaling (it's what you plan a build around); a CARD owns
+    // power that only exists when you fight a particular way, so picking one is a decision about play rather than
+    // another +% on a number the tree already feeds. Before this, witch cards and witch perks pushed the very same
+    // fields and simply stacked.
+    // Every condition below is SELF-state — no target context — which is what keeps this MP-safe: it scales the
+    // caster's own Base(), and never reaches into another peer's damage.
+    public float SitNight, SitAirborne, SitLowHp, SitHighHp, SitComboCap, SitPostDash, SitGrove, SitStill, SitFullMana;
+    private float _postDashT = 0f, _stillT = 0f;
+    private const float PostDashWindow = 4f, PlantedAfter = 1.2f;
+    public bool SitPostDashOn => _postDashT > 0f;      // HUD/debug
+    public bool SitPlanted => _stillT >= PlantedAfter;
+    public float DebugBase => Base();                  // dev/ai: the card_conditions scenario reads the damage spine directly
+    public void DebugSetPostDash(float t) => _postDashT = t;
+    public void DebugSetStill(float t) => _stillT = t;
+    private float SitMul()
+    {
+        float m = 1f;
+        if (SitNight > 0f && Game.I != null && Game.I.IsNight) m += SitNight;
+        if (SitAirborne > 0f && Airborne) m += SitAirborne;
+        if (SitLowHp > 0f && Hp <= S.MaxHp * 0.40f) m += SitLowHp;
+        if (SitHighHp > 0f && Hp >= S.MaxHp * 0.85f) m += SitHighHp;
+        if (SitComboCap > 0f && ComboLive && Combo - 1 >= S.ComboCap) m += SitComboCap;
+        if (SitPostDash > 0f && _postDashT > 0f) m += SitPostDash;
+        if (SitGrove > 0f && Ents.Count >= 3) m += SitGrove;
+        if (SitStill > 0f && _stillT >= PlantedAfter) m += SitStill;
+        if (SitFullMana > 0f && Mana >= S.ManaMax - 0.01f) m += SitFullMana;
+        return m;
+    }
+    // on-hit BEHAVIOURS the tree can't express (it only ever adds to a field at purchase time)
+    public bool KillRefreshCombo = false;   // a kill re-opens the combo window
+    public float KillHeal = 0f;             // fraction of max HP mended per kill
+    public float CritMana = 0f;             // mana restored per critical hit
+
+    private float Base() => 10f * S.Atk * UltDmgMul * DamageMul * FrenzyMul() * JetstreamMul() * HolyEmpowerMul() * SitMul();   // JetstreamMul = Gale airborne bonus (NEW); HolyEmpowerMul = Divine Hallowed buff (OVERHAUL); SitMul = the situational card bonuses
     public float ShatterBurstDmg() => Base() * 7.0f * ComboMul();   // (NEW) player-scaled flat shatter burst — her signature single-target snipe, tuned to edge out the Forsaken's crush (~68 → shatter ~73+ at full HP)
     public float DamageMul = 1f;   // per-witch base-damage scalar (Divine trades damage for sustain)
     public float HolyEmpowerT = 0f, HolyEmpowerAmt = 0f;   // (OVERHAUL) Consecrated Ground Hallowed: a timed Holy damage buff
@@ -692,6 +771,8 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     // (DEV) playable THIRD-PERSON prototype: authored witch shown full-body, follow-cam behind, she faces your aim + strafes.
     private bool _tp3;
     private WitchModel _tp3Puppet;
+    private FloatingAvatar _favatar;                 // (NEW) disembodied floating witch avatar (prototype) — replaces the tp3 full-body puppet
+    public static bool UseFloatingAvatar = true;     // tp3 spawns the floating avatar instead of the WitchModel puppet
     private float _tp3H = 4.0f, _tp3D = 2.8f, _tp3Lat = 1.2f;   // OVER-THE-SHOULDER cam: height, distance behind, lateral offset
     public bool ThirdPersonPlay => _tp3;
     private float _leftFire;    // 0→1 left-arm thrust blend (ramps up while LMB held, down on release)
@@ -824,23 +905,39 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (_tp3 && !hasArgs)
         {
             if (_tp3Puppet != null && GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.QueueFree();
-            _tp3Puppet = null; _tp3 = false;
+            if (_favatar != null && GodotObject.IsInstanceValid(_favatar)) _favatar.QueueFree();
+            _tp3Puppet = null; _favatar = null; _tp3 = false;
             SetPrimitiveFpVisible(true);
             return "third-person PLAY off — first-person restored.";
         }
         if (!_tp3)
         {
-            var p = new WitchModel();
-            p.Build(WitchIndex, false);
-            if (!p.IsAuthored) { p.QueueFree(); return "no authored mesh for this witch (drop witch_<key>.fbx first)."; }
-            _tp3Puppet = p;
-            AddChild(_tp3Puppet);
-            _tp3Puppet.Position = Vector3.Zero;
-            _tp3Puppet.Rotation = new Vector3(0f, Mathf.Pi, 0f);   // mesh faces +Z → +Pi so she faces your aim (-Z), back to the cam
-            // Ground AFTER the AnimationTree ticks (the idle clip repositions her hips vs rest) — a few frames later, then plant.
-            GetTree().CreateTimer(0.15).Timeout += () => { if (GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.GroundAuthored(); };
-            SetPrimitiveFpVisible(false);
-            _tp3 = true;
+            if (UseFloatingAvatar)   // (NEW) the floating disembodied witch avatar — no rig, faces aim (+Z front → +Pi), back to the over-shoulder cam
+            {
+                _favatar = new FloatingAvatar();
+                AddChild(_favatar);
+                _favatar.Build(WitchIndex);
+                _favatar.Position = Vector3.Zero;
+                _favatar.Rotation = new Vector3(0f, Mathf.Pi, 0f);
+                _favatar.Scale = Vector3.One * 2.15f;   // owner: she was TOWERING at 2.7 — bring her down to a normal witch height
+                _tp3D = 5.2f; _tp3H = 4.3f; _tp3Lat = 0.8f;   // over-shoulder cam pulled in to match the smaller avatar
+                SetPrimitiveFpVisible(false);
+                _tp3 = true;
+            }
+            else
+            {
+                var p = new WitchModel();
+                p.Build(WitchIndex, false);
+                if (!p.IsAuthored) { p.QueueFree(); return "no authored mesh for this witch (drop witch_<key>.fbx first)."; }
+                _tp3Puppet = p;
+                AddChild(_tp3Puppet);
+                _tp3Puppet.Position = Vector3.Zero;
+                _tp3Puppet.Rotation = new Vector3(0f, Mathf.Pi, 0f);   // mesh faces +Z → +Pi so she faces your aim (-Z), back to the cam
+                // Ground AFTER the AnimationTree ticks (the idle clip repositions her hips vs rest) — a few frames later, then plant.
+                GetTree().CreateTimer(0.15).Timeout += () => { if (GodotObject.IsInstanceValid(_tp3Puppet)) _tp3Puppet.GroundAuthored(); };
+                SetPrimitiveFpVisible(false);
+                _tp3 = true;
+            }
         }
         if (dist > 0f) _tp3D = dist;
         if (height > 0f) _tp3H = height;
@@ -868,9 +965,34 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         return _cam.GlobalPosition + camFwd * 1.2f;   // FP: usual camera muzzle
     }
 
+    // Where a held BEAM is drawn from. Aim and hit detection still come from the camera — only the visual origin moves.
+    // This existed per-beam and was wrong in third person: it reached for `_handMeshL`, which is the FIRST-PERSON
+    // viewmodel hand. In tp3 that mesh is hidden but still sitting at the camera, so the beam started ON the lens and its
+    // near segments engulfed the whole screen. Resolve the puppet's actual left hand there instead.
+    private Vector3 BeamOrigin()
+    {
+        Vector3 dir = AimDir().Normalized();
+        var b = _cam.GlobalTransform.Basis;
+        if (_tp3)
+        {
+            // Third person NEVER falls back to a camera-relative point. `_handMeshL` is the FIRST-PERSON viewmodel hand
+            // and is parented to the camera itself, so using it here put the beam's near segments ON the lens — you were
+            // looking down the inside of the cylinder, which is what filled the screen with a magenta octagon. And the
+            // puppet can legitimately be null (an unauthored witch, or a rig that failed to build), which is exactly the
+            // case that used to slip through to that fallback.
+            if (TryHands(out var lh, out _)) return lh + dir * 0.4f;                     // her actual left-hand bone
+            return GlobalPosition + Vector3.Up * 1.5f - b.X * 0.35f + dir * 0.6f;        // else off her BODY
+        }
+        // First person: the viewmodel hand, but only when it's genuinely on screen — Visible is local and stays true
+        // even while a hidden parent makes it invisible, which is how the tp3 case leaked through in the first place.
+        if (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL) && _handMeshL.IsVisibleInTree()) return _handMeshL.GlobalPosition;
+        return EyePos - b.X * 0.3f - b.Y * 0.42f - b.Z * 0.5f;   // FP fallback: a left-hand-ish offset off the eye
+    }
+
     private bool TryHands(out Vector3 left, out Vector3 right)
     {
         left = default; right = default; bool gotL = false, gotR = false;
+        if (_tp3Puppet == null || !GodotObject.IsInstanceValid(_tp3Puppet)) return false;   // no puppet → no hands (was a NullReference inside FindSkeleton)
         var skel = ModelAssets.FindSkeleton(_tp3Puppet);
         if (skel == null) return false;
         for (int i = 0; i < skel.GetBoneCount(); i++)
@@ -943,6 +1065,81 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (_armR != null) _armR.Visible = v;
     }
 
+    // DEV/AI harness only — hide the FP primitive arms so an isolated avatar showcase isn't cluttered by the viewmodel.
+    public void DevSetFpArmsVisible(bool v) => SetPrimitiveFpVisible(v);
+
+    // DEV: interactively rotate the two FP glove hands (X/Y/Z) to find the pose, then read the printed values.
+    public string ToggleFpHandPose()
+    {
+        _fpPoseMode = !_fpPoseMode;
+        if (!_fpPoseMode) return "FP hand pose OFF";
+        _fpPoseRotL = _fpRestL; _fpPoseRotR = _fpRestR;   // start from the current (saved) pose
+        return "FP HAND POSE ON — [Tab] switch hand · I/K pitch±X · J/L yaw±Y · U/O roll±Z · M = MIRROR hand · Shift = 1° fine · [Enter] = SAVE · P print · R reset.  Selected: LEFT";
+    }
+
+    private bool PoseKeyEdge(Key k)
+    {
+        bool now = Input.IsPhysicalKeyPressed(k);
+        _fpPosePrev.TryGetValue(k, out bool prev);
+        _fpPosePrev[k] = now;
+        return now && !prev;
+    }
+
+    private void UpdateFpHandPose()
+    {
+        if (!_fpPoseMode || _handMeshL == null || !GodotObject.IsInstanceValid(_handMeshL)) return;
+        float step = Input.IsPhysicalKeyPressed(Key.Shift) ? 1f : 5f;
+        bool ch = false;
+        if (PoseKeyEdge(Key.Tab)) { _fpPoseSel = 1 - _fpPoseSel; ch = true; }
+        Vector3 r = _fpPoseSel == 0 ? _fpPoseRotL : _fpPoseRotR;
+        if (PoseKeyEdge(Key.I)) { r.X += step; ch = true; }
+        if (PoseKeyEdge(Key.K)) { r.X -= step; ch = true; }
+        if (PoseKeyEdge(Key.J)) { r.Y += step; ch = true; }
+        if (PoseKeyEdge(Key.L)) { r.Y -= step; ch = true; }
+        if (PoseKeyEdge(Key.U)) { r.Z += step; ch = true; }
+        if (PoseKeyEdge(Key.O)) { r.Z -= step; ch = true; }
+        if (PoseKeyEdge(Key.R)) { r = _fpPoseSel == 0 ? new Vector3(180, 90, 0) : new Vector3(180, -90, 0); ch = true; }
+        if (PoseKeyEdge(Key.M)) { if (_fpPoseSel == 0) _fpPoseMirrorL = !_fpPoseMirrorL; else _fpPoseMirrorR = !_fpPoseMirrorR; ch = true; }   // MIRROR the selected hand (flip chirality)
+        if (PoseKeyEdge(Key.Enter) || PoseKeyEdge(Key.KpEnter)) { SaveFpHandPose(); }   // SAVE the pose to disk (used at every spawn)
+        if (_fpPoseSel == 0) _fpPoseRotL = r; else _fpPoseRotR = r;
+        _handMeshL.RotationDegrees = _fpPoseRotL;
+        _handMeshR.RotationDegrees = _fpPoseRotR;
+        _handMeshL.Scale = new Vector3(_fpHandScale * (_fpPoseMirrorL ? -1f : 1f), _fpHandScale, _fpHandScale);
+        _handMeshR.Scale = new Vector3(_fpHandScale * (_fpPoseMirrorR ? -1f : 1f), _fpHandScale, _fpHandScale);
+        if (ch || PoseKeyEdge(Key.P))
+            GD.Print($"[fppose] LEFT rot=({_fpPoseRotL.X:0},{_fpPoseRotL.Y:0},{_fpPoseRotL.Z:0}) mirror={_fpPoseMirrorL}  |  RIGHT rot=({_fpPoseRotR.X:0},{_fpPoseRotR.Y:0},{_fpPoseRotR.Z:0}) mirror={_fpPoseMirrorR}  [editing {(_fpPoseSel == 0 ? "LEFT" : "RIGHT")}]");
+    }
+
+    private const string _fpPosePath = "res://data/fp_hand_pose.json";
+
+    private void SaveFpHandPose()
+    {
+        _fpRestL = _fpPoseRotL; _fpRestR = _fpPoseRotR;   // apply live
+        var d = new Godot.Collections.Dictionary
+        {
+            { "lx", _fpPoseRotL.X }, { "ly", _fpPoseRotL.Y }, { "lz", _fpPoseRotL.Z }, { "lmirror", _fpPoseMirrorL },
+            { "rx", _fpPoseRotR.X }, { "ry", _fpPoseRotR.Y }, { "rz", _fpPoseRotR.Z }, { "rmirror", _fpPoseMirrorR },
+        };
+        using var f = Godot.FileAccess.Open(_fpPosePath, Godot.FileAccess.ModeFlags.Write);
+        if (f != null) { f.StoreString(Json.Stringify(d)); GD.Print($"[fppose] SAVED → {_fpPosePath}"); }
+        else GD.Print("[fppose] SAVE FAILED (couldn't open file)");
+    }
+
+    // load the saved FP hand pose (rotations + mirror flags) into the fields BuildArm reads
+    private void LoadFpHandPose()
+    {
+        if (!Godot.FileAccess.FileExists(_fpPosePath)) return;
+        using var f = Godot.FileAccess.Open(_fpPosePath, Godot.FileAccess.ModeFlags.Read);
+        if (f == null) return;
+        var v = Json.ParseString(f.GetAsText());
+        if (v.VariantType != Variant.Type.Dictionary) return;
+        var d = v.AsGodotDictionary();
+        _fpRestL = new Vector3(d["lx"].AsSingle(), d["ly"].AsSingle(), d["lz"].AsSingle());
+        _fpRestR = new Vector3(d["rx"].AsSingle(), d["ry"].AsSingle(), d["rz"].AsSingle());
+        _fpPoseMirrorL = d["lmirror"].AsBool();
+        _fpPoseMirrorR = d["rmirror"].AsBool();
+    }
+
     private void UpdateTpCam()
     {
         if (_tpCam == null || !GodotObject.IsInstanceValid(_tpCam)) return;
@@ -980,11 +1177,12 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
 
     private void BuildHands()
     {
-        _armL = BuildArm(Palette.Verdant, out _handMeshL);
-        _baseLPos = new Vector3(-0.40f, -0.32f, -0.25f); _baseLRot = new Vector3(-0.10f, 0.25f, 0);
+        LoadFpHandPose();   // apply a saved `fppose` pose if present (else the hardcoded defaults)
+        _armL = BuildArm(-1f, out _handMeshL);
+        _baseLPos = new Vector3(-0.26f, -0.30f, -0.30f); _baseLRot = Vector3.Zero;   // container has NO tilt → palm-facing is controlled cleanly by the glove yaw
         _armL.Position = _baseLPos; _armL.Rotation = _baseLRot; _cam.AddChild(_armL);
-        _armR = BuildArm(Palette.Lunar, out _handMeshR);
-        _baseRPos = new Vector3(0.40f, -0.32f, -0.25f); _baseRRot = new Vector3(-0.10f, -0.25f, 0);
+        _armR = BuildArm(1f, out _handMeshR);
+        _baseRPos = new Vector3(0.26f, -0.30f, -0.30f); _baseRRot = Vector3.Zero;
         _armR.Position = _baseRPos; _armR.Rotation = _baseRRot; _cam.AddChild(_armR);
         _chargeOrb = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.18f, Height = 0.36f } };
         _chargeOrb.Position = new Vector3(0, -0.18f, -1.0f);
@@ -1042,8 +1240,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     {
         var pc = DamageTypes.Col(PrimaryType);
         var sc = DamageTypes.Col(SecondaryType);
-        if (_handMeshL != null) _handMeshL.MaterialOverride = Game.ToonEmissive(pc, 0.8f, 0.02f);
-        if (_handMeshR != null) _handMeshR.MaterialOverride = Game.ToonEmissive(sc, 0.8f, 0.02f);
+        // FP hands stay the NEUTRAL baked glove (same as the tp3 avatar) — do NOT re-tint them per element, so both views match.
         if (_bodyModel != null) BuildBodyModel();   // recolor the body to the witch's damage type
         if (_chargeOrb != null) _chargeOrb.MaterialOverride = Game.ToonEmissive(sc, 2.0f, 0f);
         // personal fill-glow matches the witch's element (Divine → warm gold, not the old hardcoded Lunar violet). Softer for
@@ -1057,21 +1254,24 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     }
     private OmniLight3D _witchLight;
 
-    private Node3D BuildArm(Color skin, out MeshInstance3D handMesh)
+    private Node3D BuildArm(float side, out MeshInstance3D handMesh)
     {
         var n = new Node3D();
-        var fore = new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 0.07f, BottomRadius = 0.10f, Height = 0.6f } };
-        fore.RotationDegrees = new Vector3(90, 0, 0);
-        fore.Position = new Vector3(0, 0, -0.30f);
-        fore.MaterialOverride = Game.Toon(new Color(0.12f, 0.10f, 0.16f), 0.85f, 0.2f, 0.02f);
-        n.AddChild(fore);
-        var hand = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.13f, Height = 0.26f } };
-        hand.Position = new Vector3(0, 0, -0.62f);
-        hand.MaterialOverride = Game.ToonEmissive(skin, 0.3f, 0.02f);   // (PAINTERLY) calmer hand glow — stop the pure-white bloom crescents
+        // UNIFIED FP/TP: the first-person hand is the SAME authored floating GLOVE as the tp3 avatar (PropGlb "hand" + its baked
+        // material) — no primitive forearm, so FP reads as disembodied floating hands (Far Far West), matching the third-person look.
+        var hand = new MeshInstance3D { Mesh = PropGlb.GetMesh("hand"), MaterialOverride = PropGlb.Mat("hand") };
+        // POSED (via `fppose`): per-hand rest rotation + mirror flag (palms to the orb, thumbs on the near side).
+        bool mir = side < 0f ? _fpPoseMirrorL : _fpPoseMirrorR;
+        hand.Scale = new Vector3(_fpHandScale * (mir ? -1f : 1f), _fpHandScale, _fpHandScale);
+        hand.RotationDegrees = side < 0f ? _fpRestL : _fpRestR;
+        hand.Position = new Vector3(0, 0.02f, -0.34f);
         n.AddChild(hand);
         handMesh = hand;
         return n;
     }
+    // POSED rest orientations — loaded from res://data/fp_hand_pose.json (saved by the `fppose` tool), else these defaults
+    private Vector3 _fpRestL = new Vector3(260f, -50f, 0f);
+    private Vector3 _fpRestR = new Vector3(260f, 55f, 0f);
 
     // middle-click ping: name whatever the crosshair is on (enemy / chest / vendor / pumpkin), else ping the spot
     private void DoPing()
@@ -1230,6 +1430,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (Input.IsActionJustPressed("release_mouse")) Input.MouseMode = Input.MouseModeEnum.Visible;
 
         AnimateHands(dt);
+        UpdateFpHandPose();   // DEV: `fppose` interactive hand-rotation tool (overrides the glove rotation while active)
         if (_tp3 || _fpAuthored || _animView) HideFpChargeVisuals();   // FP charge orb/doll/nock are screen-anchored — hide them in 3rd-person
         if (Game.I != null && Game.I.CanControlLocal()) DrawCurseTethers();   // (NEW) tethers persist + show on every machine (synced group)
         if (_bodyModel != null)
@@ -1287,6 +1488,12 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                         _chargeOrb.Scale = Vector3.One * scale;
                     }
                 }
+            }
+            // (NEW) floating avatar: drive its procedural life from the same speed + fire/charge the puppet uses (airborne → idle stride)
+            if (_tp3 && _favatar != null && GodotObject.IsInstanceValid(_favatar))
+            {
+                _favatar.Animate(dt, _grounded ? sp : 0f);
+                _favatar.SetCast(_leftFire, Charging ? ChargeAmt : 0f);
             }
             // two-button caster: drive the authored puppet's charge gather-pose + fire the release on let-go
             var authored = _tp3 ? _tp3Puppet : (_fpAuthored ? _fpPuppet : null);
@@ -1495,6 +1702,8 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
 
         if (_flareCd > 0f) _flareCd -= dt;
         if (_killProcCd > 0f) _killProcCd -= dt;   // (NEW) age the on-kill legendary throttle
+        if (_postDashT > 0f) _postDashT -= dt;     // (CARDS) the post-dash damage window
+        _stillT = InputDir().LengthSquared() > 0.01f ? 0f : _stillT + dt;   // (CARDS) "planted" — how long since you last asked to move
         if (GaleWitch && Airborne && Game.I.State == GameState.Playing) Game.I.MyStats.Highlight += dt;   // (NEW) Gale highlight = seconds aloft
         if (!Downed && Game.I.CanControlLocal() && Input.IsPhysicalKeyPressed(Key.T) && _flareCd <= 0f) { FireFlare(); Game.I.RecallUnicorn(Game.I.LocalPeer); _flareCd = 2f; }   // (NEW) hold T → firework flare AND recall the arcane unicorn to you
 
@@ -1581,13 +1790,13 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             Vector3 dest = ClampPos(GlobalPosition + dir * blink);
             var from = GlobalPosition;
             GlobalPosition = new Vector3(dest.X, GlobalPosition.Y, dest.Z);
-            DashStock--; DashT = 1f; if (DashCdT <= 0) DashCdT = S.DashCd; _iframe = Mathf.Max(_iframe, 0.3f);
+            DashStock--; DashT = 1f; _postDashT = PostDashWindow; if (DashCdT <= 0) DashCdT = S.DashCd; _iframe = Mathf.Max(_iframe, 0.3f);
             EclipseBlinkVfx(from); EclipseBlinkVfx(GlobalPosition);
             Game.I.Sfx?.Cast(DamageType.Lunar);
             return;
         }
         _dashDir = dir; _dashT = DashDur; DashStock--;
-        DashT = 1f;
+        DashT = 1f; _postDashT = PostDashWindow;   // (CARDS) opens the post-dash damage window
         if (_launchVel.LengthSquared() > 0.01f) _launchVel = dir * _launchVel.Length();   // (GALE) dashing mid-launch pivots the arc hard toward the dash direction
         if (DashCdT <= 0) DashCdT = S.DashCd;
         _iframe = Mathf.Max(_iframe, 0.26f);
@@ -1597,6 +1806,23 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     // (DEV) free-fly camera for the collider editor: WASD relative to look, Space/Ctrl up/down, Shift = fast. Mouse-look already
     // runs while the mouse is captured (see _Input). The Player is a plain Node3D, so we just drive GlobalPosition directly.
     public void EditorLookPitch(float pitch) { _pitch = Mathf.Clamp(pitch, -1.4f, 1.4f); if (_cam != null) _cam.Rotation = new Vector3(_pitch, 0, 0); }
+
+    // (AI HARNESS) aim her at a world point — body yaw + camera pitch — so a scenario can point the beam or a cone the
+    // way a player would with the mouse. Test-only, same spirit as EditorLookPitch above.
+    public void LookAtForTest(Vector3 target)
+    {
+        Vector3 to = target - EyePos;
+        Vector3 flat = new Vector3(to.X, 0f, to.Z);
+        if (flat.LengthSquared() > 0.0001f)
+        {
+            var f = flat.Normalized();
+            float yaw = Mathf.Atan2(-f.X, -f.Z);   // Node3D forward is -Z: solve -sin(y)=f.X, -cos(y)=f.Z
+            Rotation = new Vector3(Rotation.X, yaw, Rotation.Z);
+            _tpYaw = yaw;
+        }
+        _pitch = Mathf.Clamp(Mathf.Atan2(to.Y, Mathf.Max(0.01f, flat.Length())), -1.4f, 1.4f);
+        if (_cam != null) _cam.Rotation = new Vector3(_pitch, 0, 0);
+    }
     private void EditorFreeFly(float dt)
     {
         if (_cam == null) return;
@@ -1707,6 +1933,25 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         GlobalPosition = ClampPos(GlobalPosition + _knockVel * dt);   // ClampPos → the shove still respects trees/walls
         _knockVel = _knockVel.MoveToward(Vector3.Zero, 30f * dt);
     }
+    // (HOLLOW MOON PHASE 2) The vortex drag. Applied per-frame by the local BossVortex copy — NOT a decaying impulse
+    // like Knockback, because it must be something you fight against with your own movement for ten seconds. The pull
+    // is a straight positional drag toward the eye that ramps hard as you close, so walking loses ground while a dash
+    // or any speed-up (Wind Rush, Stormform, Specter…) breaks you out. Full immunity ignores it entirely.
+    public const float VortexPullOuter = 4.5f;    // u/s of drag at the very edge of the funnel
+    public const float VortexPullInner = 17f;     // …and at the throat
+    public void VortexPull(Vector3 eye, float range, float dt)
+    {
+        if (Downed || MenuShielded || FullyImmune) return;
+        Vector3 d = eye - GlobalPosition; d.Y = 0f;
+        float dist = d.Length();
+        if (dist < 0.6f || dist > range) return;
+        float close = 1f - Mathf.Clamp(dist / range, 0f, 1f);          // 0 at the rim → 1 at the eye
+        float speed = Mathf.Lerp(VortexPullOuter, VortexPullInner, close * close);   // squared: the last few metres are the trap
+        var step = d / dist * speed * dt;
+        if (step.Length() > dist) step = d;                            // never overshoot through him
+        GlobalPosition = ClampPos(GlobalPosition + step);
+    }
+
     private float _slowT = 0f, _slowMul = 1f;
     private float SlowMul => _slowT > 0f ? _slowMul : 1f;
     public void SlowMe(float dur, float mul) { if (!Downed && !MenuShielded && !FullyImmune) { _slowMul = mul; _slowT = Mathf.Max(_slowT, dur); } }   // swarmer hits (NEW)
@@ -1898,8 +2143,8 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         }
         else if (ForsakenWitch)   // (NEW) primary = a lock-on curse-suck beam (hold left-click)
         {
-            if (!_charging && Input.IsActionPressed("cast") && !(UltActive && Ult == UltKind.Crescent)) UpdateCurseBeam(dt);
-            else EndCurseBeam();
+            if (!_charging && Input.IsActionPressed("cast") && !(UltActive && Ult == UltKind.Crescent)) { UpdateCurseBeam(dt); DoomFocus = Mathf.Min(FocusMax, DoomFocus + FocusRise * dt); }
+            else { EndCurseBeam(); DoomFocus = Mathf.Max(1f, DoomFocus - FocusFall * dt); }   // (DOOM) Focus rides on HER, not the target — sweeping the beam across a pack keeps the wind-up, only letting go drops it
         }
         else if (EmberWitch)   // (NEW) primary = a channeled flame cone (hold left-click) — ticks faster with cast speed
         {
@@ -2423,11 +2668,11 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     // held primary: a flame cone that TICKS at the cast-speed rate (so FireCd cards speed it up) and coats foes in burn.
     private void UpdateFlameCone(float dt)
     {
-        var basis = _cam.GlobalTransform.Basis;
-        Vector3 o = (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))   // (NEW) flame pours from the LEFT HAND, not the eye
-            ? _handMeshL.GlobalPosition
-            : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;
+        Vector3 o = BeamOrigin();   // flame pours from the LEFT HAND in both views (was the FP viewmodel hand, which sits on the camera in tp3)
         Vector3 dir = AimDir().Normalized();
+        // her hands WORK while the cone pours — re-arm the pose as it runs down so it holds for as long as the button is
+        // held, instead of playing once and dropping back to idle mid-flamethrower.
+        if (_animKind != "flame" || _animT >= _animDur * 0.75f) SetArm("flame", 0.5f);
         float reach = 12f * S.SpellArea * FlameReachMul * (PhoenixActive ? 1.7f : 1f);   // (NEW) reaches further; Phoenix Ascendant makes it huge; Cinderreach blessing extends it
         Game.I.SpawnFlameCone(o, dir, reach, DamageTypes.Col(DamageType.Ember));   // continuous flame VFX (local)
         _flameSndT -= dt; if (_flameSndT <= 0f) { _flameSndT = 0.25f; Game.I.Sfx?.Cast(DamageType.Ember); }
@@ -2985,8 +3230,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     private void PlaceFrostBeam(Vector3 eye, Vector3 dir, float len, float dt)
     {
         if (_frostSeg == null) return;
-        var b = _cam.GlobalTransform.Basis;
-        Vector3 origin = eye + b.X * 0.32f - b.Y * 0.42f + dir * 0.5f;
+        Vector3 origin = BeamOrigin();   // left hand, not the eye (the aim/target below is still camera-driven)
         Vector3 target = eye + dir * len;
         float pulse = 1f + 0.15f * Mathf.Sin(Now * 30f);
         _frostSeg.Place(origin, target, dt, 8f, 24f, pulse);
@@ -3036,6 +3280,19 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         foreach (var e in Game.I.Enemies.ToArray())
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || e.CurseGroup != 0) continue;   // only uncursed, ungrouped foes
+            float d = (e.GlobalPosition - at).LengthSquared();
+            if (d < bd) { bd = d; best = e; }
+        }
+        return best;
+    }
+    // (DOOM) how many foes are currently carrying a bank — MaxLinks caps this, so her B column still decides reach.
+    public int CountDoomed() { int n = 0; foreach (var e in Game.I.Enemies) if (e != null && !e.Dead && e.Doomed) n++; return n; }
+    private Enemy NearestDoomSpreadTarget(Vector3 at, float r)
+    {
+        Enemy best = null; float bd = r * r;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || !GodotObject.IsInstanceValid(e) || e.Doomed) continue;   // only foes not already carrying a bank
             float d = (e.GlobalPosition - at).LengthSquared();
             if (d < bd) { bd = d; best = e; }
         }
@@ -3096,31 +3353,16 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (tgt != null)
         {
             beamEnd = tgt.GlobalPosition + Vector3.Up * tgt.Radius * 0.5f;
-            bool _wasCursed = tgt.CurseStacks > 0.01f;
-            tgt.AddCurse(dt * CurseRate, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // build stacks on the beamed foe
-            if (!_wasCursed && tgt.CurseStacks > 0.01f) Game.I.MyStats.Highlight++;   // (NEW) Forsaken highlight = foes newly cursed
+            bool wasDoomed = tgt.Doomed;
+            float doomPerSec = Base() * DoomRate * CurseRate * DoomFocus * DoomPower;   // (DOOM) the channel banks; perks that raised CurseRate still raise it
+            tgt.AddDoom(doomPerSec * dt);
+            if (!wasDoomed && tgt.Doomed) Game.I.MyStats.Highlight++;   // (NEW) Forsaken highlight = foes newly doomed
             float beamDmg = Base() * CurseBeamDmg * dt * ComboMul();
-            tgt.Hurt(beamDmg, DamageType.Curse, true);   // primary DoT — the beam isn't her damage, the group is
+            tgt.Hurt(beamDmg, DamageType.Curse, true);   // a light direct tick so the channel isn't weightless — the BANK is her damage
             if (CurseBeamLifesteal > 0f && Hp < S.MaxHp) Heal(beamDmg * CurseBeamLifesteal);   // (NEW) small sustain: siphon while beaming a live foe
-            int anchorCap = Mathf.FloorToInt(tgt.CurseStacks);   // 2 stacks → group of up to 2; 1 stack does nothing (no tether)
-            if (anchorCap >= 2)
-            {
-                if (tgt.CurseGroup == 0 && TotalTethered() < MaxLinks) tgt.CurseGroup = ++_curseGroupSeq;   // anchor a group
-                if (tgt.CurseGroup != 0)
-                {
-                    _curseSpreadT -= dt;
-                    if (_curseSpreadT <= 0f)
-                    {
-                        _curseSpreadT = 0.5f;
-                        if (GroupSize(tgt.CurseGroup) < anchorCap && TotalTethered() < MaxLinks)
-                        {
-                            var near = NearestSpreadTarget(tgt.GlobalPosition, tgt.CurseGroup, CurseSpreadRange);
-                            if (near != null) { near.AddCurse(1f, tgt.CurseGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2); Game.I.Sfx?.Poof(near.GlobalPosition); }
-                        }
-                    }
-                    RefreshGroup(tgt.CurseGroup, Mathf.Max(2f, anchorCap));   // keep the WHOLE group linked for the group duration (refreshed while beaming any member)
-                }
-            }
+            // (REWORK) the channel NO LONGER auto-chains. It used to creep Doom to a fresh foe every 0.5s out to 18u,
+            // which loaded six enemies you never aimed at — with nothing on screen to explain it, so it read as Doom
+            // multiplying at random. Spreading is now the CHARGED RELEASE's job, where it's deliberate and visible.
             _curseTickT -= dt;
             if (_curseTickT <= 0f) { _curseTickT = Mathf.Max(0.12f, S.FireCd); OnHitDirectNormal(tgt, tgt.Dead, Base() * CurseBeamDmg * _curseTickT, DamageType.Curse); }
             _curseMarkT -= dt;
@@ -3223,10 +3465,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     private void PlaceCurseBeam(Vector3 target, float dt)
     {
         if (_curseSeg == null) return;
-        var basis = _cam.GlobalTransform.Basis;
-        Vector3 origin = (_handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))
-            ? _handMeshL.GlobalPosition
-            : EyePos - basis.X * 0.3f - basis.Y * 0.42f - basis.Z * 0.5f;   // fallback: a left-hand-ish offset from the eye
+        Vector3 origin = BeamOrigin();   // her LEFT HAND in both views — see BeamOrigin for why this used to sit on the camera
         float pulse = 1f + 0.18f * Mathf.Sin(Now * 22f) + (GD.Randf() - 0.5f) * 0.08f;   // living, flowing wobble
         _curseSeg.Place(origin, target, dt, 8f, 24f, pulse);
         if (_curseLight != null) _curseLight.GlobalPosition = _curseSeg.End;   // omni light rides the impact end
@@ -3427,11 +3666,15 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         var tgt = CurseAimTarget();
         var col = DamageTypes.Col(DamageType.Curse);
         if (tgt == null) { _chargedRefund = false; Game.I.Sfx?.Fizzle(); return; }   // nothing under the reticle → the 0.5 mana is spent, no refund
-        float perStack = Base() * 1.4f * ComboMul();   // detonation damage per stack crushed (~90 at 5 stacks after the 1.5x cursed amp)
-        if (tgt.Cursed && tgt.CurseStacks > 0f)
-            tgt.ConsumeCurse(c < 0.12f ? 0.001f : c, perStack, CurseStackCap);   // consume + detonate stacks (damage tapers to CurseStackCap effective stacks; shared to the group before it breaks)
-        else
-            tgt.Hurt(Base() * 1.4f * ComboMul(), DamageType.Curse, true);   // no stacks → still a solid base curse hit
+        // (DOOM) the crush no longer deals damage of its own — it SETS OFF the bank she built. Charge depth picks how much
+        // goes: a tap pops 10%, a full hold pops all of it, and whatever she leaves behind stays banked on a fresh fuse.
+        // Detonating pays a premium over the raw bank (the splash, and the whole lump crits as one), which is what makes
+        // banking a decision rather than bookkeeping. A target carrying nothing still eats a flat hit, so it's never dead.
+        // charge picks BOTH how much of the bank goes off and how widely it carries — a tap is a contained pop, a full
+        // release is a detonation that seeds everything around the target. This is what gives her right-click a job
+        // beyond "spend the bank", and it's why the beam no longer needs to chain on its own.
+        if (tgt.Doomed) tgt.DetonateDoom(0.1f + 0.9f * c, RollCrit(), (0.6f + 1.4f * c) * S.SpellArea);
+        else tgt.Hurt(Base() * 1.4f * ComboMul(), DamageType.Curse, true);   // no bank → still a solid base curse hit
         if (_chargedRefund) { if (c >= 0.95f) AddMana(1f); _chargedRefund = false; }   // consume the flag FIRST so OnHitDirect's generic any-charge refund is a no-op — hers is full-charge-only (net +0.5); a tap/partial just spends the 0.5
         OnHitDirect(tgt, tgt.Dead, Base() * 1.4f * ComboMul(), DamageType.Curse);   // (NEW) register the crush as a charged hit: builds spell-combo count + charges spell-combo finishers (+ ult charge), like every other right-click
         if (c >= 0.95f) ApplyChargedMods(tgt.GlobalPosition);                        // (NEW) full charge fires her equipped right-click modifiers on the struck foe (was only wired through the projectile path)
@@ -4004,8 +4247,10 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     private void SpawnFrostWallMod(Vector3 pos, Modifier m)
     {
         int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
-        int limit = 1 + s2 / 2;                                      // Stat③ Permafrost: +live-wall count (0→1, 2→2, 4→3)
+        int limit = 1 + s2;                                          // Stat③ Permafrost: +1 live wall PER STACK (1→5)
         float dur = 5f + s2;                                        // …and +duration
+        // (FIX) this was `1 + s2 / 2` — integer division made stacks 1 and 3 change nothing, so the card's advertised
+        // "+live-wall count" silently did nothing half the time you took it. Every stack now moves the count.
         // drop any freed refs, then evict the oldest if we're already at the limit (its shatter damages nearby foes)
         _frostWalls.RemoveAll(w => w == null || !GodotObject.IsInstanceValid(w));
         while (_frostWalls.Count >= limit && _frostWalls.Count > 0)
@@ -4077,7 +4322,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             float af = Mathf.Abs(rel.Dot(fwd)), ar = Mathf.Abs(rel.Dot(right));
             if (af < half + e.Radius && ar < half + e.Radius)
             {
-                if (e1 > 0) e.AddFreeze(e.FreezeThreshold * (0.6f + 0.15f * e1), FreezeThreshMul, FrostDurBonus);   // Evo B Absolute Vise: freeze trapped foes
+                if (e1 > 0) e.AddFreeze(e.FreezeThreshold * (1.05f + 0.15f * e1), FreezeThreshMul, FrostDurBonus);   // Evo B Absolute Vise: FREEZE trapped foes — ≥1.0× threshold guarantees the freeze the desc promises (was 0.75×, often didn't land)
                 e.Hurt(e.MaxHp * pct + Base() * 0.5f + clapBonus, DamageType.Frost, true);   // % max HP + flat floor (+ clap bonus)
                 e.Slow(2f, slowF);
                 ComboFromSource();
@@ -4166,7 +4411,10 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         Vector3 fwd = (-_cam.GlobalTransform.Basis.Z).Normalized();
         float reach = 12f * S.SpellArea, cosArc = Mathf.Max(0.35f, 0.6f - 0.04f * s1);   // Stat② Wide Maw
         int jumps = s2 + (e0 > 0 ? e0 : 0);                            // Stat③ Contagion (+ Epic Plague spread range)
-        float markAmp = S.MarkAmp * (e0 > 0 ? 1f + 0.15f * e0 : 1f);   // Epic Plague: hex potency
+        // (DOOM REWORK) its OWN amp, not the global S.MarkAmp. Hex Mark used to overwrite that global, so retiring Hex
+        // Mark would have silently pinned Blood Curse at the 1.3 default forever — and two unrelated abilities sharing
+        // one global stat was a latent bug either way. Mark now belongs to Blood alone; Curse owns Doom.
+        float markAmp = 1.45f * (e0 > 0 ? 1f + 0.15f * e0 : 1f);   // Epic Plague: hex potency
         float cdmg = Base() * 0.8f * (1f + 0.18f * s0);                // Stat① Miasma
         int hexed = 0;
         bool curseKill = false;
@@ -4233,6 +4481,10 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     }
 
     public float StunT = 0f;
+    // Is she inside the post-hit / post-dash invulnerability window? Hurt() already honours it, but Stun() deliberately
+    // does not — so anything that pairs damage WITH a stun has to check this itself or it will lock down a warden who
+    // correctly dodged and took nothing (see Net.HauntBoltPlayersIn).
+    public bool IFraming => _iframe > 0f;
     public int GrabbedBy = 0;   // (NEW) Taker NetId holding this player (0 = free); locks input + snaps to the grasp
     public void Stun(float dur, Vector3? src = null)
     {
@@ -4300,7 +4552,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             float k = Mathf.Min(0.022f, dmg * 0.0004f);   // capped per hit — no longer runs away with damage scaling
             if (dt == DamageType.Lunar && Game.I.IsNight && NightAffinity) k *= 1.6f;   // her lunar ult also charges faster at night
             if (killed) k += 0.012f;                       // kills feed the meter so melee/AoE isn't starved vs ranged
-            UltCharge = Mathf.Min(1f, UltCharge + k * UltChargeMul);
+            UltCharge = Mathf.Min(1f, UltCharge + k * UltChargeMul * Game.I.UltGainMul);   // (ULT COST RAMP) the ult's cost climbs with difficulty — same meter, more work to fill it
         }
         if (Ult == UltKind.Eclipse && UltActive && ModEclipse)
         {
@@ -4334,6 +4586,14 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                 Game.I.Sfx?.Release(DamageType.Blood);
             }
         }
+        // (CARDS) on-hit behaviours — things the perk tree structurally cannot do, since a node only ever adds to a
+        // field once at purchase. Kept next to the existing on-kill legendary procs above and throttled the same way.
+        if (killed)
+        {
+            if (KillRefreshCombo) ComboT = Now;                 // the kill itself re-opens the combo window
+            if (KillHeal > 0f) Heal(S.MaxHp * KillHeal);
+        }
+        if (crit && CritMana > 0f) AddMana(CritMana);
         if (normal) AddMana(S.ManaGain);
         if (killed && charged) AddMana(0.5f);
         if (_chargedRefund && charged) { AddMana(0.5f); _chargedRefund = false; }   // (EXPERIMENT) right-click returns 0.5 on connect (net −0.5 vs the 1 it cost)
@@ -4685,11 +4945,14 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                     float nr = (6f + 0.8f * s1) * S.SpellArea;                     // Stat② Whiteout
                     float ndmg = Base() * (0.6f * (1f + 0.18f * s0));             // Stat① Coldsnap
                     float freeze = e1 > 0 ? 100f : (1f + 0.6f * s2);             // Stat③ Deep Freeze; Evo B Flash Freeze → instant freeze
+                    // (FIX) Flash Freeze's 100f buildup used to make every point of Deep Freeze a total no-op. Deep Freeze
+                    // now ALSO lengthens the freeze, which stays meaningful once the buildup is already guaranteed.
+                    float freezeDur = FrostDurBonus + 0.25f * s2;
                     void Nova(Vector3 p, float scl)
                     {
                         foreach (var e in Game.I.Enemies.ToArray())
                             if (!e.Dead && GodotObject.IsInstanceValid(e) && Flat(e, p) < nr && !Game.I.SightBlocked(p, e.GlobalPosition))
-                            { e.Hurt(ndmg * scl, DamageType.Frost, false); e.AddFreeze(freeze, FreezeThreshMul, FrostDurBonus); e.Slow(2.5f, 0.5f); }
+                            { e.Hurt(ndmg * scl, DamageType.Frost, false); e.AddFreeze(freeze, FreezeThreshMul, freezeDur); e.Slow(2.5f, 0.5f); }
                         Game.I.DamageWorld(p, nr, ndmg * scl);
                         Ring(p, DamageTypes.Col(DamageType.Frost), nr, 0.45f);
                     }
@@ -4700,6 +4963,68 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                         tw.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(this) && Game.I != null) Nova(pos, 0.6f); }));
                     }
                     Game.I.Sfx?.Cast(DamageType.Frost);
+                    break;
+                }
+                // ---- the DOOM kit. All three BANK Doom; nothing but the charged release itself sets any of it off. ----
+                case ModType.Turncoat:   // one clean betrayal: the struck foe attacks its nearest ally, once
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float doom = Base() * 1.5f * (1f + 0.18f * s0) * ComboMul() * DoomPower;   // Stat① Barbs
+                    float leash = 1.2f + 0.35f * s2 + (e0 > 0 ? 0.4f * e0 : 0f);   // Stat③ Deep Pin (+ Epic Crossed Pins)
+                    var hit = NearestEnemy(6f + 1.2f * s1, pos);                   // Stat② Wide Pin: how far the mod reaches for its victim
+                    if (hit != null)
+                    {
+                        hit.AddDoom(doom);
+                        var victim = NearestFoeTo(hit, 14f + 2f * s1);
+                        if (victim != null)
+                        {
+                            hit.Puppet(victim, leash);
+                            victim.AddDoom(doom * 0.5f);
+                            if (e1 > 0) victim.Puppet(NearestFoeTo(victim, 14f), leash * 0.6f);   // Leg Pincushion: the victim turns too — the betrayal keeps going
+                        }
+                    }
+                    break;
+                }
+                case ModType.Fray:   // the threads snap outward — COPIES the bank onto a crowd (it loads, it never detonates)
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    float fr = (6f + 0.9f * s1) * S.SpellArea;            // Stat② Reach
+                    float frac = 0.5f + 0.08f * s0;                       // Stat① Copy: share of the source bank passed on
+                    int cap = 6 + s2 + (e0 > 0 ? e0 : 0);                 // Stat③ Spread (+ Epic Wildfire) — capped so it can't sweep a whole horde
+                    var src = NearestEnemy(fr, pos);
+                    if (src != null)
+                    {
+                        float bank = src.DoomBank;
+                        if (bank <= 0.01f) { src.AddDoom(Base() * 1.2f * DoomPower); bank = src.DoomBank; }   // nothing to copy → seed it first, so it's never a dead cast
+                        int n = 0;
+                        foreach (var e in Game.I.Enemies.ToArray())
+                        {
+                            if (n >= cap) break;
+                            if (e == null || e == src || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+                            if (Flat(e, src.GlobalPosition) > fr + e.Radius) continue;
+                            // COPY, not transfer — and tagged at the deepest generation so a Fray can never be re-copied
+                            // into a chain by a second Fray or by a detonation splash.
+                            e.AddDoom(bank * frac, 0, Enemy.DoomMaxGen);
+                            if (e1 > 0) e.Root(0.4f * e1);   // Leg Snarl: the threads catch them for a moment as they snap
+                            n++;
+                        }
+                        Ring(src.GlobalPosition, DamageTypes.Col(DamageType.Curse), fr, 0.35f);
+                    }
+                    break;
+                }
+                case ModType.Effigy:   // nail the doll: your damage to ANYTHING ELSE banks Doom on one chosen foe
+                {
+                    int s0 = m.Stat[0], s1 = m.Stat[1], s2 = m.Stat[2], e0 = m.Evo[0], e1 = m.Evo[1];
+                    var tgt2 = NearestEnemy(7f, pos);
+                    if (tgt2 != null)
+                    {
+                        EffigyTgt = tgt2;
+                        EffigyT = 8f + 1.2f * s2;                                  // Stat③ Binding
+                        EffigyShare = 0.25f + 0.04f * s0 + (e0 > 0 ? 0.08f * e0 : 0f);   // Stat① Sympathy (+ Epic Bloodline)
+                        tgt2.AddDoom(Base() * (1.2f + 0.3f * s1) * ComboMul() * DoomPower);     // Stat② Nail: the opening slug
+                        if (e1 > 0) EffigyBurst = e1;                              // Leg Reckoning: when the effigy ends, what's banked goes off
+                        Game.I.SpawnGroundSigil(tgt2.GlobalPosition, 2.2f, DamageTypes.Col(DamageType.Curse));
+                    }
                     break;
                 }
                 case ModType.Spore:   // (OVERHAUL) stack-driven poison cloud + field: Toxin/Billow/Lingering + Bursting Spores/Fungal Bloom
@@ -4806,7 +5131,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                         var hitPt = cur.GlobalPosition + Vector3.Up * cur.Radius * 0.5f;
                         bool crit = RollCrit(); float d2 = stormDmg; if (crit) d2 *= CritMult();
                         cur.Hurt(d2, DamageType.Arcane, true, crit); OnHitDirect(cur, cur.Dead, d2, DamageType.Arcane, crit);
-                        if (e1 > 0) cur.Mark(3f, 1.2f + 0.1f * e1, 0);   // Leg Chain Reaction: struck foes marked for extra chains
+                        if (e1 > 0) { cur.Mark(3f, 1.2f + 0.1f * e1, 0); cur.MarkConduit(3f); }   // Leg Chain Reaction: struck foes take amplified damage AND become conduits (a 2nd cross-witch conduit producer for Cataclysm-style chains)
                         Game.I.SpawnArcaneLightning(new System.Collections.Generic.List<Vector3> { from, hitPt }, 0.8f);
                         Game.I.NetMgr?.BroadcastVfx(78, from, (hitPt - from).Normalized(), (hitPt - from).Length(), 0f, acol);
                         from = hitPt;
@@ -4851,7 +5176,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         ComboT = Now;
         _lastAct = act;                                              // (NEW) so the NEXT hit can see this source
         if (Combo > BestCombo) BestCombo = Combo;
-        if (Ult != UltKind.None && !UltActive && UltLingerT <= 0f && _rushDashLingerT <= 0f) UltCharge = Mathf.Min(1f, UltCharge + 0.004f * UltChargeMul);   // combo also charges the ult (not while a lingering ult effect / rush-dash field is up)
+        if (Ult != UltKind.None && !UltActive && UltLingerT <= 0f && _rushDashLingerT <= 0f) UltCharge = Mathf.Min(1f, UltCharge + 0.004f * UltChargeMul * (Game.I?.UltGainMul ?? 1f));   // combo also charges the ult (not while a lingering ult effect / rush-dash field is up)
         Game.I?.AccrueCombo(gain);
         if (fresh) { FreshHit = true; FreshT = 0.5f; Game.I.Sfx?.Chord(Combo); Game.I.Hud?.ComboFlourish(act); }
     }
@@ -4896,6 +5221,19 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         {
             if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
             float d = (e.GlobalPosition - GlobalPosition).LengthSquared();
+            if (d < bd) { bd = d; best = e; }
+        }
+        return best;
+    }
+    // (DOOM kit) the charged mods resolve around the IMPACT point, not around her — ApplyChargedMods is handed where the
+    // charge landed, which for the Forsaken is the crushed foe and for everyone else is their projectile's hit.
+    private Enemy NearestEnemy(float maxR, Vector3 at)
+    {
+        Enemy best = null; float bd = maxR * maxR;
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+            float d = (e.GlobalPosition - at).LengthSquared();
             if (d < bd) { bd = d; best = e; }
         }
         return best;
@@ -4958,7 +5296,11 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             case MinorType.Sporeling: MinorAoE(DamageType.Nature, 0.35f, 4f, stacks); break;
             case MinorType.FrostNip: { var e = NearestEnemy(22f); if (e != null) { e.Slow(2f, 0.55f); e.Hurt(Base() * 0.3f, DamageType.Frost, true); } break; }
             case MinorType.IcePrick: MinorAoE(DamageType.Frost, 0.3f, 4f, stacks); break;
-            case MinorType.HexWisp: { var e = NearestEnemy(22f); if (e != null) e.Mark(3f, S.MarkAmp, 0); break; }
+            // (DOOM REWORK) Hex Wisp was the odd one out — every other minor DOES something, while this one applied a Mark
+            // that was inert unless something else amplified it (and with Hex Mark retired, nothing raises S.MarkAmp at all).
+            // Banking Doom makes it the cheapest on-ramp to the mechanic in the game: it detonates on its own fuse, so even
+            // a witch with no curse abilities sees bombs go off.
+            case MinorType.HexWisp: { var e = NearestEnemy(22f); if (e != null) e.AddDoom(Base() * (0.7f + 0.25f * (stacks - 1)) * DoomPower); break; }
             case MinorType.RotTick: MinorAoE(DamageType.Curse, 0.35f, 4f, stacks); break;
             case MinorType.Glimmer: Heal(S.MaxHp * (0.015f + 0.004f * (stacks - 1))); Ring(GlobalPosition, DamageTypes.Col(DamageType.Holy), 2.5f, 0.3f); break;
             case MinorType.RadiantMote: MinorBolt(DamageType.Holy, 0.4f, stacks); break;
@@ -4969,6 +5311,17 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             case MinorType.Gust: { MinorBolt(DamageType.Wind, 0.4f, stacks); var e = NearestEnemy(20f); if (e != null) e.Knockback(GlobalPosition, 1.2f + 0.2f * stacks); break; }   // (NEW)
             case MinorType.Zephyr: MinorAoE(DamageType.Wind, 0.35f, 4f, stacks); break;   // (NEW)
         }
+    }
+
+    // (AI HARNESS) arm and fire a slot directly. Finishers are bound to raw Key codes rather than InputMap actions, so
+    // the scenario runner can't press them the way it presses move/cast. Test-only entry point, same spirit as
+    // Game.SpawnEnemyForTest — it changes nothing about normal play.
+    public void TestFireFinisher(int idx)
+    {
+        if (idx < 0 || idx >= Fin.Count) return;
+        Fin[idx].Armed = true; Fin[idx].Charge = Fin[idx].Every;
+        Mana = Mathf.Max(Mana, 2f);
+        FireFinisher(idx);
     }
 
     private void FireFinisher(int idx)
@@ -5023,6 +5376,9 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             case FinType.IceSpike: FinIceSpike(pow, t, col); SetArm("thrust", 0.4f); break;        // (NEW)
             case FinType.FrostVault: FinFrostVault(pow, t, col); SetArm("slam", 0.4f); break;      // (NEW)
             case FinType.FrostWalls: FinFrostWalls(pow, t, col); SetArm("together", 0.4f); break;  // (NEW)
+            case FinType.DanseMacabre: FinDanseMacabre(pow, t, col); SetArm("together", 0.45f); break;   // (DOOM kit)
+            case FinType.Rout: FinRout(pow, t, col); SetArm("raise", 0.45f); break;                      // (DOOM kit)
+            case FinType.CurtainCall: FinCurtainCall(pow, t, col); SetArm("palmsup", 0.5f); break;        // (DOOM kit)
             case FinType.SoulReap: FinSoulReap(pow, t, col); SetArm("draw", 0.5f); break;           // (NEW Curse)
             case FinType.HexChains: FinHexChains(pow, t, col); SetArm("together", 0.45f); break;    // (NEW Curse)
             case FinType.DoomSigil: FinDoomSigil(pow, t, col); SetArm("palmsup", 0.5f); break;      // (NEW Curse)
@@ -5087,7 +5443,7 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             bool crit = RollCrit() || (critBonus > 0f && GD.Randf() < critBonus); float d = dmg; if (crit) d *= CritMult() * critMulBonus;
             e.Hurt(d, DamageType.Arcane, true, crit); OnHitDirect(e, e.Dead, d, DamageType.Arcane, crit);
             e.Knockback(GlobalPosition, push);
-            if (e1 > 0 && e.MarkT > 0f)   // Leg Cataclysm: chains through conduit-marked foes
+            if (e1 > 0 && e.ArcaneMarked)   // Leg Cataclysm: chains through CONDUIT-marked foes (was wrongly checking the hex MarkT — an Arcane ability should read the arcane conduit)
             {
                 int chained = 0;
                 foreach (var o in Game.I.Enemies.ToArray())
@@ -5156,6 +5512,121 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
 
     // ===== Curse finishers (NEW) — witch-agnostic, but they lean into the curse fantasy =====
     // Soul Reap: a cursed reaping nova that bites harder the more wounded each foe is, and siphons souls to mend you.
+    // ---- the DOOM kit ---------------------------------------------------------------------------------------------
+    // Where a finisher lands when it's AIMED: the foe under the reticle if there is one, otherwise the ground point the
+    // crosshair is on. No hold, no second input — a finisher fires the instant its key goes down (DefaultFinKeys), so
+    // anything that needed steering (marching foes to a spot) was cut rather than bolted onto the input system.
+    private Vector3 ReticlePoint(float maxRange)
+    {
+        var foe = CurseAimTarget();
+        if (foe != null && GodotObject.IsInstanceValid(foe)) return foe.GlobalPosition;
+        Vector3 dir = AimDir();
+        if (BeamSurfaceHit(EyePos, dir, maxRange, out var hit, out _)) return hit;
+        Vector3 flat = new Vector3(dir.X, 0f, dir.Z);
+        flat = flat.LengthSquared() > 0.001f ? flat.Normalized() : Vector3.Forward;
+        var at = GlobalPosition + flat * (maxRange * 0.5f);
+        return new Vector3(at.X, Game.I.SurfaceHeight(at, 1e9f) + 0.05f, at.Z);
+    }
+
+    // Turn a doomed foe on its nearest neighbour. Shared by Danse Macabre and Turncoat so "who does it hit" is decided
+    // in exactly one place. Skips bosses (never turned) and anything already dancing to someone else's tune.
+    private Enemy NearestFoeTo(Enemy e, float within)
+    {
+        Enemy best = null; float bd = within * within;
+        foreach (var o in Game.I.Enemies.ToArray())
+        {
+            if (o == null || o == e || o.Dead || o.Remote || !GodotObject.IsInstanceValid(o)) continue;
+            float d = (o.GlobalPosition - e.GlobalPosition).LengthSquared();
+            if (d < bd) { bd = d; best = o; }
+        }
+        return best;
+    }
+
+    // DANSE MACABRE — aimed. Dooms the area, then every doomed foe in it turns on whoever is nearest and fights with its
+    // own attacks. The blows they land bank Doom on their victims, which is what makes a big dance snowball — and why
+    // that Doom is applied at DoomMaxGen: infighting must never SEED a fresh detonation chain on top of the splash one.
+    private void FinDanseMacabre(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (9f + 1f * s1) * S.SpellArea;                 // Stat② Ballroom
+        // (RETUNE) a FRACTION of each foe's max HP, not a flat number. Flat Doom exceeded a shade's entire health, so a
+        // trash crowd executed itself instantly and chain-splashed the rest — the dance could literally never happen on
+        // the common case. A percentage always leaves them standing (unless they were already this wounded, which makes
+        // it a clean finisher), and the CAP keeps it honest against big health bars: a boss can't be handed a percentage
+        // of four thousand HP.
+        float doomPct = 0.35f + 0.05f * s0;                                       // Stat① Fervor: 35% → 55%
+        float doomCap = Base() * (3f + 0.6f * s0) * ComboMul() * DoomPower;       // …and the ceiling minibosses/bosses hit
+        float dur = 3f + 1f * s2 + (e0 > 0 ? 0.5f * e0 : 0f);        // Stat③ Tempo (+ Epic Encore lengthens it too)
+        Vector3 at = ReticlePoint(38f * S.SpellRange);
+        int dancers = 0, cap = Mathf.Max(4, MaxLinks + 2);            // capped per cast — this is the fan-out shape that froze MP once
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (dancers >= cap) break;
+            if (e == null || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+            if (new Vector2(e.GlobalPosition.X - at.X, e.GlobalPosition.Z - at.Z).Length() > radius + e.Radius) continue;
+            e.AddDoom(Mathf.Min(e.MaxHp * doomPct, doomCap));
+            var victim = NearestFoeTo(e, radius + 6f);
+            // feed = what each landed blow banks on its victim; finale = Leg Grand Finale, which sets every surviving
+            // dancer's own bank off the moment its leash ends.
+            if (victim != null) { e.Puppet(victim, dur, 0, Base() * 0.5f * (1f + 0.18f * s0) * DoomPower, e1 > 0); dancers++; }
+            ComboFromSource();
+        }
+        Game.I.SpawnGroundSigil(at, radius, col);
+        Ring(at, col, radius, 0.5f);
+        Game.I.NetMgr?.BroadcastVfx(64, at, Vector3.Zero, radius, 0f, col);
+        Game.I.Sfx?.CurseCrush(at);
+    }
+
+    // ROUT — self-centred, defensive. Dooms the ring and scatters it. Deliberately low damage: the space is the payoff,
+    // and a fleeing foe carries its bomb back into its own pack, so scattering them is also delivery.
+    private void FinRout(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        float radius = (11f + 1.2f * s1) * S.SpellArea;               // Stat② Stampede
+        float doom = Base() * 1.2f * (1f + 0.15f * s2) * ComboMul() * DoomPower;  // Stat③ Trample
+        float dur = 2.5f + 0.5f * s0 + (e0 > 0 ? 0.4f * e0 : 0f);     // Stat① Terror (+ Epic Contagious Panic)
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+            if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
+            e.AddDoom(doom);
+            e.Flee(GlobalPosition, dur, e1 > 0);   // Leg Scattered: they drop aggro entirely for the duration
+            ComboFromSource();
+        }
+        Game.I.SpawnGroundSigil(GlobalPosition, radius, col);
+        Ring(GlobalPosition, col, radius, 0.5f);
+        Game.I.NetMgr?.BroadcastVfx(64, GlobalPosition, Vector3.Zero, radius, 0f, col);
+        Game.I.Sfx?.CurseCrush(GlobalPosition);
+    }
+
+    // CURTAIN CALL — an aimed cone on the Ice Spike template. The heaviest Doom load in the kit, so it's the fast route
+    // to an execute, and the kneel is the window to detonate into.
+    private void FinCurtainCall(float pow, int t, Color col)
+    {
+        int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
+        Vector3 o = GlobalPosition, fwd = AimDir(); fwd.Y = 0;
+        fwd = fwd.LengthSquared() > 0.001f ? fwd.Normalized() : Vector3.Forward;
+        float reach = (12f + 1.5f * s1) * S.SpellArea, cosArc = Mathf.Max(0.35f, 0.5f - 0.035f * s1);   // Stat② Stage
+        float doom = Base() * 3.0f * (1f + 0.18f * s0) * ComboMul() * DoomPower;   // Stat① Obeisance
+        float kneel = 1.2f + 0.3f * s2;                                // Stat③ Held
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e.Dead || e.Remote || !GodotObject.IsInstanceValid(e)) continue;
+            var to = e.GlobalPosition - o; float d = to.Length(); to.Y = 0f;
+            if (d > reach + e.Radius || to.LengthSquared() < 0.001f) continue;
+            if (fwd.Dot(to.Normalized()) < cosArc) continue;
+            if (e1 > 0 && e.Doomed) e.DetonateDoom(1f, true);   // Leg Last Rites: the cone sets off every bank it touches instead of feeding them
+            else e.AddDoom(doom);
+            if (e.Doomed || e1 > 0) { e.Root(kneel); e.Mark(kneel, 1.2f, 0); }   // kneeling foes take amplified damage — the window
+            if (e0 > 0) e.Hurt(doom * 0.25f * e0, DamageType.Curse, true, true);  // Epic Exposed: kneeling foes eat an automatic crit
+            ComboFromSource();
+        }
+        Game.I.SpawnGroundSigil(o + fwd * (reach * 0.5f), reach * 0.5f, col);
+        Game.I.NetMgr?.BroadcastVfx(54, o, fwd, reach, 0f, col);
+        CamKick(0.5f);
+        Game.I.Sfx?.CurseCrush(o);
+    }
+
     private void FinSoulReap(float pow, int t, Color col)
     {
         int s0 = _curFin.Stat[0], s1 = _curFin.Stat[1], s2 = _curFin.Stat[2], e0 = _curFin.Evo[0], e1 = _curFin.Evo[1];
@@ -5570,11 +6041,11 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                 if (new Vector2(e.GlobalPosition.X - px, e.GlobalPosition.Z - pz).Length() < _beamWidth + e.Radius) e.Hurt(_beamPow * dt, DamageType.Arcane, true);
             }
             var ps = _prismSegs[pi];
-            if (ps != null) { Vector3 o = eye + new Vector3(0, -0.25f, 0), tg = eye + pdir * _beamLen + new Vector3(0, -0.25f, 0); ps.Place(o, tg, dt, 8f, 24f, 1f); }
+            if (ps != null) { Vector3 o = BeamOrigin(), tg = eye + pdir * _beamLen + new Vector3(0, -0.25f, 0); ps.Place(o, tg, dt, 8f, 24f, 1f); }
         }
         if (_beamSeg != null)
         {
-            Vector3 origin = eye + new Vector3(0, -0.25f, 0);
+            Vector3 origin = BeamOrigin();   // left hand, not the eye
             Vector3 target = eye + dir * _beamLen + new Vector3(0, -0.25f, 0);
             float pl = 1f + 0.18f * Mathf.Sin(Now * 40f) + (GD.Randf() - 0.5f) * 0.12f;   // pulse + plasma flicker
             _beamSeg.Place(origin, target, dt, 8f, 24f, pl);
@@ -5804,7 +6275,9 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         _thornBurstRad = 5f + 0.8f * s1;                        // Stat② Bramble: burst radius
         _thornRoot = e0 > 0 ? 0.8f + 0.4f * e0 : 0f;            // Epic Snare Bark: the burst roots
         if (e1 > 0) { _thornResistT = 6f; _thornResistAmt = 0.08f * e1; }   // Leg Ironbark: briefly gain damage resist
-        int barkGrants = 1 + s2 / 2;                            // Stat③ Bark: bank 1 → 3 thorn charges per cast (still capped by the shared MaxArmor)
+        int barkGrants = 1 + s2;                                // Stat③ Bark: +1 banked thorn charge PER STACK (1→5), still capped by the shared MaxArmor
+        // (FIX) was `1 + s2 / 2` — same integer-division dead-stack bug as Frost Wall's Permafrost. The shared armor
+        // pool (MaxArmor, base 3 / ceil 5) is the real ceiling, so this self-caps rather than running away.
         float barbsDmg = Base() * 1.6f * (1f + 0.18f * s0);     // Stat① Barbs: burst damage
         for (int i = 0; i < barkGrants; i++) AddArmor(true, barbsDmg);   // AddArmor no-ops once the shared pool is full
         Ring(GlobalPosition, DamageTypes.Col(DamageType.Nature), 2.8f, 0.4f);
@@ -5815,6 +6288,12 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         CrashLogger.Mark("Player.AnimateHands");
         if (_armL == null) return;
         _ht += dt;
+        // FP glove choreography applies to the GENERIC witches (Frost/Forsaken/Arcane keep their bespoke charge poses)
+        bool fpGeneric = !FrostWitch && !ForsakenWitch && !ArcaneWitch;
+        if (_fpChgPrev && !Charging && fpGeneric) _fpReleaseT = 0.28f;   // right-click released → start the forward flourish
+        _fpChgPrev = Charging;
+        _fpReleaseT = Mathf.Max(0f, _fpReleaseT - dt);
+        float fpRel = _fpReleaseT / 0.28f;   // 1 → 0
         _kickL = Mathf.Max(0, _kickL - dt * 6f);
         _kickR = Mathf.Max(0, _kickR - dt * 6f);
         if (ArcaneWitch) { UpdateArcaneHandFx(dt); UpdateArcaneMarks(dt); } else if (_arcaneHandFx.Count > 0) ClearArcaneHandFx();   // raw plasma crackling on her hands + mark-timer decay
@@ -5851,12 +6330,19 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                 lp.X = Mathf.Lerp(_baseLPos.X, -0.05f, cc); lp.Z -= cc * 0.30f; lp.Y = Mathf.Lerp(_baseLPos.Y, _baseLPos.Y - 0.05f, cc); lr.X += cc * 1.5f;
                 rp.X = Mathf.Lerp(_baseRPos.X, 0.05f, cc); rp.Z -= cc * 0.30f; rp.Y = Mathf.Lerp(_baseRPos.Y, _baseRPos.Y + 0.24f, cc); rr.X -= cc * 1.5f;
             }
-            else
+            else   // GENERIC (owner FP choreography): palms cup the growing orb → SPREAD APART as it charges → SHAKE at full charge
             {
-                lp.X = Mathf.Lerp(_baseLPos.X, -0.16f, cc); rp.X = Mathf.Lerp(_baseRPos.X, 0.16f, cc);
-                lp.Z -= cc * 0.12f; rp.Z -= cc * 0.12f; lp.Y += cc * 0.05f; rp.Y += cc * 0.05f;
+                lp.X -= cc * 0.16f; rp.X += cc * 0.16f;         // hands move APART as the orb grows between them
+                lp.Z -= cc * 0.04f; rp.Z -= cc * 0.04f; lp.Y += cc * 0.04f; rp.Y += cc * 0.04f;
+                if (cc > 0.85f)                                  // full charge: a little shake to show the power
+                {
+                    float s = (cc - 0.85f) / 0.15f * 0.014f, t = _ht * 42f;
+                    lp.X += Mathf.Sin(t) * s; rp.X += Mathf.Sin(t + 1.7f) * s;
+                    lp.Y += Mathf.Sin(t * 1.3f) * s; rp.Y += Mathf.Sin(t * 1.3f + 0.9f) * s;
+                }
             }
         }
+        if (fpRel > 0f) { lp.Z -= fpRel * 0.2f; rp.Z -= fpRel * 0.2f; }   // release: hands EXTEND forward
 
         if (_animDur > 0)
         {
@@ -5870,6 +6356,14 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
                 case "slam": lp.Y -= 0.18f * e; rp.Y -= 0.18f * e; lp.Z -= 0.28f * e; rp.Z -= 0.28f * e; lr.X += 0.5f * e; rr.X += 0.5f * e; break;
                 case "barrage": { float f2 = Mathf.Abs(Mathf.Sin(k * Mathf.Pi * 3f)); rp.Z -= 0.5f * f2; lp.Z -= 0.5f * (1f - f2); rr.X -= 0.7f * f2; lr.X -= 0.7f * (1f - f2); break; }   // Gale primary: rapid alternating jabs (NEW)
                 case "flick": { float f3 = Mathf.Sin(k * Mathf.Pi); lp.Z -= 0.34f * f3; lp.X -= 0.07f * f3; lp.Y += 0.06f * f3; lr.X -= 1.0f * f3; lr.Y += 0.5f * f3; break; }   // Arcane: LEFT hand snaps forward + outward, flicking the burst out (NEW)
+                case "flame": {   // Ember: both palms shoved forward, alternating on the flame's own flicker so the hands look like they're WORKING
+                    float push = Mathf.Sin(Mathf.Clamp(k, 0f, 1f) * Mathf.Pi) * 0.6f + 0.4f;   // never fully drops back — the cone is continuous
+                    float alt = Mathf.Sin(Now * 17f);
+                    lp.X = Mathf.Lerp(_baseLPos.X, -0.10f, push); rp.X = Mathf.Lerp(_baseRPos.X, 0.10f, push);
+                    lp.Z -= (0.44f + 0.09f * alt) * push; rp.Z -= (0.44f - 0.09f * alt) * push;
+                    lp.Y += (0.06f + 0.05f * alt) * push; rp.Y += (0.06f - 0.05f * alt) * push;
+                    lr.X -= (0.85f + 0.18f * alt) * push; rr.X -= (0.85f - 0.18f * alt) * push;
+                    break; }
                 case "channel": { float fc = Mathf.Sin(k * Mathf.Pi); lp.X = Mathf.Lerp(_baseLPos.X, -0.07f, fc); rp.X = Mathf.Lerp(_baseRPos.X, 0.07f, fc); lp.Z -= 0.5f * fc; rp.Z -= 0.5f * fc; lp.Y += 0.05f * fc; rp.Y += 0.05f * fc; lr.X -= 0.7f * fc; rr.X -= 0.7f * fc; break; }   // Arcane: both palms drive a torrent forward (NEW)
                 case "conjure": { float cu = Mathf.Sin(k * Mathf.Pi); lp.Y += 0.44f * cu; rp.Y += 0.44f * cu; lp.X -= 0.10f * cu; rp.X += 0.10f * cu; lp.Z -= 0.12f * cu; rp.Z -= 0.12f * cu; lr.X += 0.9f * cu; rr.X += 0.9f * cu; break; }   // Arcane: arms flung up, conjuring raw power (NEW)
                 case "grdpunch":   // Gale charged: wind up, then drive a fist down into the ground (NEW)
@@ -5904,6 +6398,16 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (_beamT > 0) { lp.Z -= 0.32f; rp.Z -= 0.32f; lp.X *= 0.5f; rp.X *= 0.5f; lp.Y += 0.04f; rp.Y += 0.04f; }
 
         _armL.Position = lp; _armR.Position = rp; _armL.Rotation = lr; _armR.Rotation = rr;
+
+        // FP gloves: posed REST orientation (palms to the orb). On release, ease the palm-yaw a bit toward forward (the hands also
+        // EXTEND forward — handled above). Skipped while the `fppose` dev tool is active (it drives the rotation itself).
+        if (fpGeneric && !_fpPoseMode && _handMeshL != null && GodotObject.IsInstanceValid(_handMeshL))
+        {
+            Vector3 grL = _fpRestL, grR = _fpRestR;
+            grL.Y *= (1f - 0.5f * fpRel); grR.Y *= (1f - 0.5f * fpRel);   // palms turn a bit forward on release
+            _handMeshL.RotationDegrees = grL;
+            _handMeshR.RotationDegrees = grR;
+        }
 
         _chargeOrb.Visible = Charging && !VerdantWitch && !FrostWitch && !ForsakenWitch;
         if (FrostWitch && _armR != null)   // (NEW) nocked ice arrow: sits in front of the right palm, drawn forward + grows as she charges
@@ -6854,7 +7358,8 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
     }
     private void ClearDrainLinks() { foreach (var l in _drainLinks) if (l != null && GodotObject.IsInstanceValid(l)) l.QueueFree(); _drainLinks.Clear(); }
 
-    // Hex Circle tick: keep the field beneath her, and every 0.25s curse everyone inside into the one mega-group (+stacks).
+    // Hex Circle tick: keep the field beneath her, and every 0.25s flood everyone inside with Doom — and set them on each
+    // other. (DOOM REWORK) it's the ult-scale Danse Macabre: stand in the ring and the pack loads up and eats itself.
     private void UpdateHexCircle(float dt)
     {
         UltActiveT -= dt;
@@ -6870,9 +7375,12 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
             {
                 if (e == null || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
                 if (Flat(e, GlobalPosition) > radius + e.Radius) continue;
-                e.AddCurse(0.6f, _hexGroup, CurseBonusType, CurseBonusMul, CurseShareFrac, CurseBonusType2);   // ~2.4 stacks/s and fold into the mega-group so shared damage cascades
+                e.AddDoom(Base() * (0.5f + t * 0.12f) * DoomPower);   // (DOOM) the ring loads every bank inside it, fast
                 e.Hurt(Base() * (0.22f + t * 0.06f), DamageType.Curse, true);                 // (REWORK) the ring itself gnaws — more base dps, scales with tiers
                 if (ModPlague) e.Hurt(Base() * (0.32f + t * 0.08f), DamageType.Curse, true);  // Plaguebearer: the ring also festers harder
+                // …and turns them on each other for as long as they stand in it. Re-issued on the same 0.25s tick, so a
+                // foe that wanders out simply stops being refreshed and comes back to its senses.
+                if (!e.Puppeted) { var v = NearestFoeTo(e, radius); if (v != null) e.Puppet(v, 1.2f, 0, Base() * 0.3f * DoomPower); }
             }
         }
         _hexNetT -= dt;
@@ -7075,6 +7583,49 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         return outl;
     }
     public void ResetPerks() { _perkLit.Clear(); _routesDone.Clear(); AttunePoints = 1; _attuneEarned = 1; }   // start with 1 point
+
+    // Every witch-specific scalar back to its DECLARED default. Perk nodes, hidden routes and affinity cards all apply
+    // their effect imperatively (`Apply(p)` just mutates a field), so clearing the bookkeeping in ResetPerks does NOT
+    // undo them — before this existed, `Stats` was rebuilt on a restart but these ~50 fields were not, and every
+    // +ent-damage / +burn / +gust / +tether you ever took compounded into the next run forever.
+    // MUST run BEFORE ConfigureWitch, which lays the witch's innate passives (Lunar's LunarBonus, Ember's EmberBurnMul,
+    // Crimson's lifesteal…) on top of these defaults.
+    public void ResetWitchScalars()
+    {
+        // Lunar
+        CrescentPierceBonus = 0; CrescentSizeMul = 1f; LunarBonus = 0f; UltChargeMul = 1f; GravityWell = false;
+        // Divine
+        BlessBonus = 0f; MoteFork = 0; Interventions = 0; MartyrGrace = false; RadiantMote = false; GuardianAegis = false;
+        // Crimson
+        AuraBonusR = 0f; AuraHealMul = 1f; FinHpCost = 0.18f; MaxArmor = 3;
+        SanguineFrenzy = false; Hemoclast = false; Bloodbath = false; CrimsonFrenzy = false;
+        // Verdant
+        GroveEvery = 14; GroveBonusEnts = 0; MinionDmgMul = 1f; PoisonMul = 1f;
+        MinionChain = false; AncientGrove = false; VerdantVitality = false;
+        EntElement = DamageType.Nature; EntElementChosen = false;
+        ModPoisonField = false; ModSeedMine = false; ModThornSkin = false;
+        // Gale
+        GustPower = 1f; TempestHeart = false; Cloudfeather = false; Downburst = false; Jetstream = false;
+        // Frost
+        FreezeRate = 2.0f; FrostDurBonus = 0f; FreezeThreshMul = 1f; ShatterPowerMul = 1f; ShatterFreezeStacks = 1f;
+        ShatterCascade = false; DeepWinter = false; GlacialImpaler = false;
+        // Forsaken
+        MaxLinks = 6; CurseRate = 2.5f; CurseShareFrac = 0.5f; CurseSpreadRange = 18f;
+        CurseBonusMul = 1.5f; CurseStackCap = 5f; CurseBeamLifesteal = 0.13f;
+        CurseBonusType = DamageType.Curse; CurseBonusType2 = -1; SoulTether = false; WitheringPresence = false;
+        DoomPower = 1f; DoomFocus = 1f; DoomRate = 0.2f; DoomSpreadRadius = 5f;                          // (DOOM) …or a witch swap carries her wind-up and perk scaling over
+        EffigyTgt = null; EffigyT = 0f; EffigyShare = 0f; EffigyBurst = 0;        // and the doll never survives the swap either
+        // Ember
+        EmberBurnMul = 1f; FlameReachMul = 1f; LivingBombMul = 1f;
+        EmberInferno = false; FervorWildfire = 0; FervorPhoenix = 0;
+        // Arcane
+        ArcanePowerMul = 1f; ArcaneCritHealBonus = 0f; ArcaneMarkDur = 3f;
+        ArcaneChainReaction = false; ArcanePersistMarks = false; ArcaneLiving = false;
+        // (CARDS) situational bonuses + on-hit behaviours are run-scoped too — miss these and the leak comes straight back
+        SitNight = SitAirborne = SitLowHp = SitHighHp = SitComboCap = SitPostDash = SitGrove = SitStill = SitFullMana = 0f;
+        KillRefreshCombo = false; KillHeal = 0f; CritMana = 0f;
+        _postDashT = 0f; _stillT = 0f;
+    }
     public void GrantAttune() { if (Level % 4 != 0 || _attuneEarned >= Perks.AttuneCap) return; _attuneEarned++; AttunePoints++; }   // +1 every 4 levels, capped
     public bool PurchasePerk(int id)
     {
@@ -7282,6 +7833,16 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (_rushDashLingerT > 0f) _rushDashLingerT -= dt;   // (REWORK) HUD: time left on the LAST dash's lingering field (flame trail / wind area)
         if (UltActive && Ult == UltKind.HexCircle) UpdateHexCircle(dt);   // (NEW) Forsaken curse field
         if (_specter) UpdateSpecter(dt);                                   // (REWORK) LifeCurse immaterial projection drift
+        if (EffigyT > 0f)   // (EFFIGY) the doll's leash. It drops early if its host dies — the bank goes with it.
+        {
+            EffigyT -= dt;
+            bool gone = EffigyTgt == null || EffigyTgt.Dead || !GodotObject.IsInstanceValid(EffigyTgt);
+            if (EffigyT <= 0f || gone)
+            {
+                if (!gone && EffigyBurst > 0) EffigyTgt.DetonateDoom(1f, RollCrit());   // Leg Reckoning: time's up, so is it
+                EffigyT = 0f; EffigyTgt = null; EffigyShare = 0f; EffigyBurst = 0;
+            }
+        }
         if (UltActive && Ult == UltKind.Crescent)
         {
             UpdateCrescentControl(dt);
@@ -7584,9 +8145,12 @@ public partial class Player : Node3D, Grove.Dev.Ai.IAiObservable
         if (VenomT <= 0f) VenomDps = 0f;
     }
 
-    public void Hurt(float dmg, Vector3? src = null)
+    // `ignoreIFrame`: for a signature, fully-telegraphed hit that must NOT be silently eaten by the 0.7s i-frame a
+    // preceding tick left behind (the Hollow Moon's vortex finisher — its own grind damage would otherwise cancel it).
+    // Everything else — resistance, Tailwind, armor charges, shields — still applies exactly as normal.
+    public void Hurt(float dmg, Vector3? src = null, bool ignoreIFrame = false)
     {
-        if (_iframe > 0 || _divFalling || Divinity || BarkActive || _specter || Downed || Game.I == null || !Game.I.WorldRunning) return;   // _specter: immaterial Specter is untouchable
+        if ((!ignoreIFrame && _iframe > 0) || _divFalling || Divinity || BarkActive || _specter || Downed || Game.I == null || !Game.I.WorldRunning) return;   // _specter: immaterial Specter is untouchable
         if (Game.I.MenuImmune || InsideFaithShield) return;   // (MP) untouchable inside her elemental bubble; and ALL damage is nullified inside a Faith Shield dome
         _combatT = 0f;   // taking fire = in combat; gates fast out-of-combat shield regen (NEW)
         if (Armor.Count > 0)   // one shared armor charge eats this whole hit, then pops (thorn charges also burst)

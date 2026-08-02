@@ -9,7 +9,17 @@ using System.Linq;
 //   node has a directed edge to it. (Not just the last-bought node.)
 // • HIDDEN ROUTES (3 per witch): a RequiredNodeSet; when all its nodes are owned, a free bonus keystone unlocks
 //   (0 points), stronger the more nodes it needs. First discovery is catalogued permanently (shown on the coven page +
-//   level-up view thereafter).
+//   level-up view thereafter). Dev: the `routes` console command toggles the whole catalogue on/off.
+//
+// NODE-DESIGN RULES (the trees were audited once already for being flat "+4% damage" sludge — keep them honest):
+//  1. A node's EFFECT must be what its NAME promises. "Blink Step" lengthens the blink; it does not grant walk speed.
+//  2. Each witch's four columns are four distinct BUILDS, not four colours of the same stat. Column A = her signature
+//     offence, B = her second school, C = her tempo/mobility/utility, D = her guard. Read the per-witch header.
+//  3. Prefer the knob the witch actually wins with (ent damage, shatter power, gust force, mark duration, dash
+//     distance) over raw Atk/HP. Generic stats are the seasoning, not the meal.
+//  4. Nothing here may grant a legendary-card gate (GravityWell, Bloodbath, MinionChain, ...) — those stay card-only,
+//     or a 550-gold keystone would quietly delete a whole legendary from the pool.
+//  5. S.Pierce is a NO-OP for Frost/Forsaken/Ember/Arcane (beam/cone/homing kits) — never put it in their trees.
 public class PerkNode { public int Id; public string Name, Desc; public float Col, Row; public bool Keystone; public System.Action<Player> Apply; }
 public class HiddenRoute { public string Name, Desc; public int[] Req; public System.Action<Player> Apply; }
 
@@ -89,6 +99,24 @@ public static class Perks
     static Perks() { for (int w = 0; w < WitchCount; w++) _owned[w] = new HashSet<int>(); }
     public static bool RouteDiscovered(int w, int ri) => (_discovered[w] & (1 << ri)) != 0;
     public static void MarkDiscovered(int w, int ri) { _discovered[w] |= (1 << ri); Game.I?.SavePerks(); }
+    // ---- dev: catalogue every hidden route at once (or wipe the catalogue). This is the DISCOVERY log — the routes
+    //      themselves still fire in a run when you actually own their node-set; this just reveals name + path + the
+    //      required nodes on the Coven page so they can be read without hunting for them. ----
+    public static int DiscoveredCount { get { int n = 0; for (int w = 0; w < WitchCount; w++) for (int r = 0; r < 3; r++) if (RouteDiscovered(w, r)) n++; return n; } }
+    public static int RouteTotal => WitchCount * 3;
+    public static void SetAllDiscovered(bool on)
+    {
+        for (int w = 0; w < WitchCount; w++) _discovered[w] = on ? (1 << Routes(w).Length) - 1 : 0;
+        Game.I?.SavePerks();
+    }
+    // snapshot/restore so a dev test can flip the catalogue without eating the player's real discovery log
+    public static int[] DiscoveredSnapshot() { var a = new int[WitchCount]; System.Array.Copy(_discovered, a, WitchCount); return a; }
+    public static void DiscoveredRestore(int[] a)
+    {
+        if (a == null) return;
+        for (int w = 0; w < WitchCount && w < a.Length; w++) _discovered[w] = a[w];
+        Game.I?.SavePerks();
+    }
     public static void Save(ConfigFile cfg)
     {
         for (int w = 0; w < WitchCount; w++)
@@ -129,6 +157,8 @@ public static class Perks
         for (int w = 0; w < WitchCount; w++)
         {
             var defs = w switch { 0 => LunarDefs(), 1 => DivineDefs(), 2 => CrimsonDefs(), 3 => VerdantDefs(), 4 => GaleDefs(), 5 => FrostDefs(), 6 => ForsakenDefs(), 7 => EmberDefs(), 8 => ArcaneDefs(), _ => GenericDefs(w) };
+            // a SHORT table throws below; a LONG one would silently drop its tail, so say so out loud
+            if (defs.Length != NodeCount) GD.PushError($"[perks] witch {w} declares {defs.Length} node defs, expected {NodeCount}");
             var arr = new PerkNode[NodeCount];
             for (int i = 0; i < NodeCount; i++)
                 arr[i] = new PerkNode { Id = i, Name = defs[i].n, Desc = defs[i].d, Col = POS[i].c, Row = POS[i].r, Keystone = i >= 32, Apply = defs[i].a };
@@ -137,7 +167,9 @@ public static class Perks
         }
     }
 
-    // shorthands
+    // ---- shorthands ----------------------------------------------------------------------------------
+    // These are the vocabulary the trees are written in. The rule for a node: its EFFECT must be the thing its
+    // NAME promises. A perk called "Blink Step" moves you further per dash; it does not quietly grant walk speed.
     private static void A(Player p, float d) => p.S.Atk += d;
     private static void Crit(Player p, float c) => p.S.CritChance = Mathf.Min(1f, p.S.CritChance + c);
     private static void CritD(Player p, float c) => p.S.CritDamage += c;
@@ -145,195 +177,333 @@ public static class Perks
     private static void Res(Player p, float r) => p.S.DmgResist = Mathf.Min(0.8f, p.S.DmgResist + r);
     private static void Area(Player p, float a) => p.S.SpellArea += a;
     private static void Ult(Player p, float u) => p.UltChargeMul = Mathf.Min(2.5f, p.UltChargeMul + u);
+    // mobility
+    private static void Dash(Player p, float d) => p.S.DashDist += d;             // ALSO lengthens Arcane's blink (max(9, DashDist*2.2))
+    private static void DashCut(Player p, float f) => p.S.DashCd = Mathf.Max(0.9f, p.S.DashCd * f);
+    private static void Jmp(Player p, float j) => p.S.JumpMul += j;
+    // casting / projectiles
+    private static void Cast(Player p, float f) => p.S.FireCd = Mathf.Max(0.08f, p.S.FireCd * f);
+    private static void Chg(Player p, float c) => p.S.ChargeSpeed = Mathf.Min(2.5f, p.S.ChargeSpeed + c);   // fill RATE (the engine caps reads at 2.5)
+    private static void Pow(Player p, float c) => p.S.MaxCharge = Mathf.Min(6f, p.S.MaxCharge + c);          // full-charge damage ceiling
+    private static void Rng(Player p, float r) => p.S.SpellRange += r;
+    private static void Prj(Player p, float s) => p.S.ProjSpeed = Mathf.Min(2.4f, p.S.ProjSpeed + s);
+    private static void Prc(Player p, int n) => p.S.Pierce += n;                  // BOLT witches only (Lunar/Divine/Crimson/Verdant/Gale) — a no-op for beam/cone/missile kits
+    // resources / economy
+    private static void Mana(Player p, float m) => p.S.ManaMax += m;
+    private static void Regen(Player p, float g) => p.S.ManaGain += g;
+    private static void Cmb(Player p, float pow) => p.S.ComboPow += pow;
+    private static void CmbCap(Player p, int n) => p.S.ComboCap += n;
+    private static void CmbWin(Player p, float s) => p.S.ComboWindow += s;
+    private static void Life(Player p, float l) => p.S.Lifesteal += l;
+    // shields
+    private static void Shd(Player p, float pct) => p.S.ShieldPct += pct;
+    private static void ShdReg(Player p, float r) => p.S.ShieldRegen += r;
+    private static void ShdFast(Player p, float f) => p.S.ShieldDelay = Mathf.Max(1.2f, p.S.ShieldDelay * f);
+    // per-witch scalars that need a floor/ceiling
+    private static void Thaw(Player p, float f) => p.FreezeThreshMul = Mathf.Max(0.35f, p.FreezeThreshMul * f);
+    private static void Gust(Player p, float g) => p.GustPower = Mathf.Min(2.5f, p.GustPower + g);
+    // (FIX) Soul Tether (the Forsaken legendary card) sets MaxLinks = 99 to mean "no limit". Any perk node that added
+    // links afterwards used to re-clamp to 12, silently DOWNGRADING her from 99 — order-dependent and invisible.
+    // The bool now guards it, which also gives SoulTether its only real read.
+    private static void Links(Player p, int n) { if (p.SoulTether) return; p.MaxLinks = Mathf.Min(12, p.MaxLinks + n); }
+    private static void Share(Player p, float f) => p.CurseShareFrac = Mathf.Min(1f, p.CurseShareFrac + f);
+    private static void Beam(Player p, float f) => p.CurseBeamLifesteal = Mathf.Min(1f, p.CurseBeamLifesteal + f);
+    private static void Ents(Player p, int n) => p.GroveBonusEnts = Mathf.Min(8, p.GroveBonusEnts + n);
+    private static void Grow(Player p, int n) => p.GroveEvery = Mathf.Max(6, p.GroveEvery - n);
+    private static void FinCost(Player p, float f) => p.FinHpCost = Mathf.Max(0.06f, p.FinHpCost * f);
 
-    // ===== LUNAR (template) =====
+    private static void Sp(Player p, float s) => p.S.Speed = Mathf.Min(18f, p.S.Speed + s);
+    private static void Crescent(Player p, float s) => p.CrescentSizeMul = Mathf.Min(2.9f, p.CrescentSizeMul + s);
+
+    // ---- hidden-route node-sets: ONE PER ROUTE PER WITCH, never shared ------------------------------------------
+    // Every witch used to point at the same three sets (R5/R9/R13), so "discovering" a route on the Frost tree taught
+    // you every other witch's routes too and the paths had nothing to do with what the route granted. Each set below
+    // now traces the columns its OWN payoff comes from — Arcane's Phase Walker walks the blink column and ends on
+    // Blinkmaster★; Gale's Skydancer walks the flight column; Verdant's Grovekeeper walks the grove column.
+    //
+    // A set must be REACHABILITY-CLOSED: every non-root node needs at least one of its EDGES[] predecessors in the
+    // same set, or the route can never be completed in a run. Sizes stay under AttuneCap (14 points). The perk_audit
+    // scenario enforces closure, the cap, and cross-witch uniqueness — don't hand-edit these without re-running it.
+    // Columns: A = 0,4,8,9,16,20,24,25,32 · B = 1,5,10,11,17,21,26,27,33 · C = 2,6,12,13,18,22,28,29,34 · D = 3,7,14,15,19,23,30,31,35
+    //                                                                    A-spine            into C
+    private static readonly int[] LunA  = { 0, 4, 8, 9, 16 };
+    private static readonly int[] LunCD = { 2, 3, 6, 7, 13, 14, 18, 19, 22 };
+    private static readonly int[] LunAC = { 0, 4, 8, 9, 16, 20, 24, 25, 32, 2, 6, 13, 18 };
+    private static readonly int[] DivA  = { 0, 4, 9, 16, 20 };
+    private static readonly int[] DivC  = { 2, 6, 12, 13, 18, 22, 28, 29, 34 };            // the whole aegis column
+    private static readonly int[] DivAD = { 0, 4, 8, 9, 16, 20, 24, 25, 32, 3, 7, 15, 19 };
+    private static readonly int[] CrimA = { 0, 4, 8, 16, 20 };
+    private static readonly int[] CrimCD= { 2, 3, 6, 7, 12, 14, 18, 19, 23 };
+    private static readonly int[] CrimBA= { 0, 1, 4, 5, 8, 10, 11, 16, 17, 21, 26, 27, 33 };
+    private static readonly int[] VerA  = { 0, 4, 8, 9, 16, 20 };                          // the whole grove line
+    private static readonly int[] VerCD = { 2, 3, 6, 7, 13, 15, 18, 19, 22, 23 };
+    private static readonly int[] VerAB = { 0, 4, 5, 8, 9, 10, 11, 16, 17, 20, 24, 25, 32 };
+    private static readonly int[] GalA  = { 0, 4, 8, 16, 20, 24 };
+    private static readonly int[] GalC  = { 2, 6, 12, 13, 18, 22, 28, 29 };                // the whole flight column
+    private static readonly int[] GalBC = { 1, 2, 5, 6, 10, 11, 12, 13, 17, 21, 26, 27, 33 };
+    private static readonly int[] FroA  = { 0, 4, 8, 9, 16, 20, 24 };
+    private static readonly int[] FroCD = { 2, 3, 6, 7, 12, 13, 14, 15, 18, 19 };
+    private static readonly int[] FroBC = { 1, 5, 6, 10, 11, 12, 13, 17, 18, 21, 26, 27, 33 };
+    private static readonly int[] ForA  = { 0, 4, 9, 16, 20, 24 };
+    private static readonly int[] ForCD = { 2, 3, 6, 7, 12, 14, 18, 19, 22, 28 };
+    private static readonly int[] ForBA = { 1, 4, 5, 8, 9, 10, 11, 16, 17, 21, 26, 27, 33 };
+    private static readonly int[] EmbA  = { 0, 4, 8, 9, 16, 20, 25 };
+    private static readonly int[] EmbC  = { 2, 6, 12, 13, 18, 22, 29, 34 };
+    private static readonly int[] EmbAB = { 0, 4, 5, 8, 9, 11, 16, 17, 20, 21, 24, 25, 32 };
+    private static readonly int[] ArcA  = { 0, 4, 8, 16, 20, 25 };
+    private static readonly int[] ArcC  = { 2, 6, 12, 13, 18, 22, 28, 34 };                // the whole blink column
+    private static readonly int[] ArcAB = { 0, 4, 5, 8, 9, 10, 16, 17, 20, 21, 24, 25, 32 };
+
+    // ===== LUNAR (0) — A crescents · B moonlight · C eclipse & tempo · D nightward =====
     private static (string n, string d, System.Action<Player> a)[] LunarDefs() => new (string, string, System.Action<Player>)[]{
         ("Keen Edge","+3% crit chance", p=>Crit(p,0.03f)), ("Moonbrand","+4% Lunar damage", p=>p.LunarBonus+=0.04f),
-        ("Duskbound","+4% Lunar damage (2× night)", p=>p.LunarBonus+=0.04f), ("Nightward","+4% resistance", p=>Res(p,0.04f)),
-        ("Silver Point","+12% crit damage", p=>CritD(p,0.12f)), ("Pale Light","+4% Lunar damage", p=>p.LunarBonus+=0.04f),
-        ("Gloaming","+3% damage", p=>A(p,0.03f)), ("Shadowmantle","+4% resistance", p=>Res(p,0.04f)),
-        ("Waxing Blade","+1 crescent pierce", p=>p.CrescentPierceBonus++), ("Sharp Sickle","+18% crescent size", p=>p.CrescentSizeMul=Mathf.Min(2.8f,p.CrescentSizeMul+0.18f)),
-        ("Glimmer","+4% spell area", p=>Area(p,0.04f)), ("Moonveil","+4% spell area", p=>Area(p,0.04f)),
-        ("Eventide","+8% ult charge", p=>Ult(p,0.08f)), ("Starfall","+8% ult charge", p=>Ult(p,0.08f)),
-        ("Gloomskin","+4% resistance", p=>Res(p,0.04f)), ("Moonstone","+25 max health", p=>HP(p,25f)),
-        ("Twin Crescent","+1 pierce, +3% crit", p=>{p.CrescentPierceBonus++; Crit(p,0.03f);}), ("Deep Brand","+5% Lunar damage", p=>p.LunarBonus+=0.05f),
-        ("Twilight","+4% damage", p=>A(p,0.04f)), ("Duskguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Bright Point","+14% crit damage", p=>CritD(p,0.14f)), ("Nightbloom","+5% Lunar dmg, +6% ult", p=>{p.LunarBonus+=0.05f; Ult(p,0.06f);}),
-        ("Moonlit Ward","+4% resist, +6% ult", p=>{Res(p,0.04f); Ult(p,0.06f);}), ("Heartmoon","+30 max health", p=>HP(p,30f)),
-        ("Reaper's Arc","+1 crescent pierce", p=>p.CrescentPierceBonus++), ("Moonfire","+5% Lunar damage", p=>p.LunarBonus+=0.05f),
-        ("Nightsong","+8% ult charge", p=>Ult(p,0.08f)), ("Umbral","+4% resistance", p=>Res(p,0.04f)),
-        ("Starlight","+4% damage", p=>A(p,0.04f)), ("Moonshield","+25 max health", p=>HP(p,25f)),
-        ("Duskblade","+12% crit damage", p=>CritD(p,0.12f)), ("Nightguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Full Moon ★","+2 pierce, +30% size, +8% crit", p=>{p.CrescentPierceBonus+=2; p.CrescentSizeMul=Mathf.Min(2.9f,p.CrescentSizeMul+0.3f); Crit(p,0.08f);}),   // K1
-        ("Moonwell ★","+12% Lunar damage, +8% area", p=>{p.LunarBonus+=0.12f; Area(p,0.08f);}),                     // K2
-        ("Eventide ★","+30% ult charge, +6% damage", p=>{Ult(p,0.3f); A(p,0.06f);}),                                 // K3
-        ("Nightbulwark ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),                            // K4
+        ("Duskbound","+8% ult charge", p=>Ult(p,0.08f)), ("Nightward","+4% resistance", p=>Res(p,0.04f)),
+        ("Silver Point","+12% crit damage", p=>CritD(p,0.12f)), ("Pale Light","+5% spell area", p=>Area(p,0.05f)),
+        ("Gloaming","+0.3s combo window", p=>CmbWin(p,0.3f)), ("Shadowmantle","+25 max health", p=>HP(p,25f)),
+        ("Waxing Blade","+1 crescent pierce", p=>p.CrescentPierceBonus++), ("Sharp Sickle","+18% crescent size", p=>Crescent(p,0.18f)),
+        ("Glimmer","+8% spell range", p=>Rng(p,0.08f)), ("Moonveil","+5% Lunar damage", p=>p.LunarBonus+=0.05f),
+        ("Eventide","+10% ult charge", p=>Ult(p,0.1f)), ("Starfall","+0.2 charge speed", p=>Chg(p,0.2f)),
+        ("Gloomskin","+4% resistance", p=>Res(p,0.04f)), ("Moonstone","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Twin Crescent","+1 crescent pierce, +4% crit", p=>{p.CrescentPierceBonus++; Crit(p,0.04f);}), ("Deep Brand","+6% Lunar dmg, +5% area", p=>{p.LunarBonus+=0.06f; Area(p,0.05f);}),
+        ("Twilight","+0.03 combo power", p=>Cmb(p,0.03f)), ("Duskguard","+30 HP, shield recovers sooner", p=>{HP(p,30f); ShdFast(p,0.88f);}),
+        ("Bright Point","+16% crit damage", p=>CritD(p,0.16f)), ("Nightbloom","+6% Lunar dmg, +8% ult", p=>{p.LunarBonus+=0.06f; Ult(p,0.08f);}),
+        ("Moonlit Ward","+2 combo cap", p=>CmbCap(p,2)), ("Heartmoon","+35 max health", p=>HP(p,35f)),
+        ("Reaper's Arc","+1 crescent pierce", p=>p.CrescentPierceBonus++), ("Moonfire","+22% crescent size", p=>Crescent(p,0.22f)),
+        ("Nightsong","+7% Lunar damage", p=>p.LunarBonus+=0.07f), ("Starlight","+8% range, +6% area", p=>{Rng(p,0.08f); Area(p,0.06f);}),
+        ("Umbral Tide","+12% ult charge", p=>Ult(p,0.12f)), ("Silver Step","+1.2 dash distance", p=>Dash(p,1.2f)),
+        ("Moonshield","+0.5 shield regen", p=>ShdReg(p,0.5f)), ("Nightguard","+5% resistance", p=>Res(p,0.05f)),
+        ("Full Moon ★","+2 crescent pierce, +30% size, +8% crit", p=>{p.CrescentPierceBonus+=2; Crescent(p,0.3f); Crit(p,0.08f);}),   // K1
+        ("Moonwell ★","+14% Lunar damage, +10% area", p=>{p.LunarBonus+=0.14f; Area(p,0.1f);}),                                       // K2
+        ("Eclipse Sovereign ★","+30% ult charge, +0.05 combo power, +3 cap", p=>{Ult(p,0.3f); Cmb(p,0.05f); CmbCap(p,3);}),           // K3
+        ("Nightbulwark ★","+12% resist, +60 HP, +50% shield", p=>{Res(p,0.12f); HP(p,60f); Shd(p,0.1f);}),                            // K4
     };
     private static HiddenRoute[] LunarRoutes() => new[]{
-        new HiddenRoute { Name="Silver Reaper", Desc="hidden — a lean crescent-crit killer: +10% crit, +2 crescent pierce, +25% crit damage",
-            Req=new[]{0,4,8,9,16}, Apply=p=>{Crit(p,0.1f); p.CrescentPierceBonus+=2; CritD(p,0.25f);} },
-        new HiddenRoute { Name="Eclipse Warden", Desc="hidden — a night-shrouded bulwark: +12% resist, +50 health, +20% ult charge, +8% Lunar damage",
-            Req=new[]{2,3,6,7,13,14,18,19,22}, Apply=p=>{Res(p,0.12f); HP(p,50f); Ult(p,0.2f); p.LunarBonus+=0.08f;} },
-        new HiddenRoute { Name="Lunar Colossus", Desc="hidden — ascend into the moon itself: +15% damage, +15% Lunar dmg, +30% ult charge, +50 health, +8% crit",
-            Req=new[]{0,4,8,9,16,20,24,25,32,5,10,17,21}, Apply=p=>{A(p,0.15f); p.LunarBonus+=0.15f; Ult(p,0.3f); HP(p,50f); Crit(p,0.08f);} },
+        new HiddenRoute { Name="Silver Reaper", Desc="+10% crit, +2 crescent pierce, +25% crit dmg",
+            Req=LunA, Apply=p=>{Crit(p,0.1f); p.CrescentPierceBonus+=2; Crescent(p,0.3f); CritD(p,0.25f);} },
+        new HiddenRoute { Name="Eclipse Warden", Desc="+12% resist, +50 HP, +20% ult, +combo power",
+            Req=LunCD, Apply=p=>{Res(p,0.12f); HP(p,50f); Ult(p,0.2f); Cmb(p,0.04f);} },
+        new HiddenRoute { Name="Lunar Colossus", Desc="+15% Lunar dmg, +30% ult, +3 pierce, +50 HP",
+            Req=LunAC, Apply=p=>{p.LunarBonus+=0.15f; Ult(p,0.3f); p.CrescentPierceBonus+=3; HP(p,50f); Crit(p,0.08f);} },
     };
 
-    // shared hidden-route node-sets (graph-connected: 5 / 9 / 13 nodes → weak / medium / strong)
-    private static readonly int[] R5 = { 0, 4, 8, 9, 16 };
-    private static readonly int[] R9 = { 2, 3, 6, 7, 13, 14, 18, 19, 22 };
-    private static readonly int[] R13 = { 0, 4, 8, 9, 16, 20, 24, 25, 32, 5, 10, 17, 21 };
-    private static void Sp(Player p, float s) => p.S.Speed = Mathf.Min(18f, p.S.Speed + s);
-
-    // ===== DIVINE (1) — holy / shields / interventions =====
+    // ===== DIVINE (1) — A judgement & motes · B consecration · C aegis (shields) · D devotion =====
     private static (string n, string d, System.Action<Player> a)[] DivineDefs() => new (string, string, System.Action<Player>)[]{
-        ("Sunfire","+4% damage", p=>A(p,0.04f)), ("Radiance","+4% damage", p=>A(p,0.04f)), ("Devout","+4% resistance", p=>Res(p,0.04f)), ("Warding","+25% shield cap", p=>p.S.ShieldPct+=0.05f),
-        ("Piercing Light","+1 pierce", p=>p.S.Pierce+=1), ("Zeal","+4% crit chance", p=>Crit(p,0.04f)), ("Fervor","+1s blessing", p=>p.BlessBonus+=1f), ("Sanctified","+25 max health", p=>HP(p,25f)),
-        ("Smite","+5% damage", p=>A(p,0.05f)), ("Consecrant","+shield regen", p=>p.S.ShieldRegen+=0.3f), ("Benediction","+1s blessing", p=>p.BlessBonus+=1f), ("Halo","+4% spell area", p=>Area(p,0.04f)),
-        ("Tithe","+8% ult charge", p=>Ult(p,0.08f)), ("Grace","+4% resistance", p=>Res(p,0.04f)), ("Ordained","+30 max health", p=>HP(p,30f)), ("Aegis","+25% shield cap", p=>p.S.ShieldPct+=0.05f),
-        ("Zealot","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Reckoner","+5% damage", p=>A(p,0.05f)), ("Consecrate","+6% spell area", p=>Area(p,0.06f)), ("Bulwark","+4% resistance", p=>Res(p,0.04f)),
-        ("Judgement","+14% crit damage", p=>CritD(p,0.14f)), ("Divine Might","+6% damage", p=>A(p,0.06f)), ("Sanctuary","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Heartlight","+30 max health", p=>HP(p,30f)),
-        ("Retribution","+6% damage", p=>A(p,0.06f)), ("Blessing","+1s blessing", p=>p.BlessBonus+=1f), ("Empyrean","+10% ult charge", p=>Ult(p,0.1f)), ("Devotion","+4% resistance", p=>Res(p,0.04f)),
-        ("Sunblade","+5% damage", p=>A(p,0.05f)), ("Faithguard","+30 max health", p=>HP(p,30f)), ("Sunburst","+12% crit damage", p=>CritD(p,0.12f)), ("Sanctum","+5% resistance", p=>Res(p,0.05f)),
-        ("Dawnbringer ★","+12% damage, +8% crit", p=>{A(p,0.12f); Crit(p,0.08f);}), ("Seraph ★","+1 Intervention, +8% resist", p=>{p.Interventions++; Res(p,0.08f);}),
-        ("Empyreal ★","+25% ult charge, +6% damage", p=>{Ult(p,0.25f); A(p,0.06f);}), ("Bulwark of Dawn ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),
+        ("Sunfire","+4% damage", p=>A(p,0.04f)), ("Radiance","+5% spell area", p=>Area(p,0.05f)), ("Warding","+25% shield capacity", p=>Shd(p,0.05f)), ("Devout","+4% resistance", p=>Res(p,0.04f)),
+        ("Piercing Light","+1 pierce", p=>Prc(p,1)), ("Halo","+8% spell range", p=>Rng(p,0.08f)), ("Consecrant","+0.4 shield regen", p=>ShdReg(p,0.4f)), ("Sanctified","+25 max health", p=>HP(p,25f)),
+        ("Zeal","+4% crit chance", p=>Crit(p,0.04f)), ("Twin Light","motes fork to +1 foe", p=>p.MoteFork++),
+        ("Benediction","+1s blessing", p=>p.BlessBonus+=1f), ("Smite","+5% damage", p=>A(p,0.05f)),
+        ("Aegis","shield recovers sooner", p=>ShdFast(p,0.86f)), ("Bastion","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Grace","+4% resistance", p=>Res(p,0.04f)), ("Ordained","+30 max health", p=>HP(p,30f)),
+        ("Zealot","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Consecrate","+7% area, +1s blessing", p=>{Area(p,0.07f); p.BlessBonus+=1f;}),
+        ("Sanctuary","+0.5 shield regen", p=>ShdReg(p,0.5f)), ("Bulwark","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Judgement","+16% crit damage", p=>CritD(p,0.16f)), ("Reckoner","motes fork to +1 foe", p=>p.MoteFork++),
+        ("Heartlight","+30% shield capacity", p=>Shd(p,0.06f)), ("Divine Might","+35 max health", p=>HP(p,35f)),
+        ("Retribution","+6% damage", p=>A(p,0.06f)), ("Sunblade","+1 pierce, +12% crit damage", p=>{Prc(p,1); CritD(p,0.12f);}),
+        ("Empyrean","+2s blessing", p=>p.BlessBonus+=2f), ("Dawnlight","+8% area, +8% range", p=>{Area(p,0.08f); Rng(p,0.08f);}),
+        ("Faithguard","shield recovers sooner", p=>ShdFast(p,0.86f)), ("Sunburst","+0.6 shield regen", p=>ShdReg(p,0.6f)),
+        ("Devotion","+5% resistance", p=>Res(p,0.05f)), ("Sanctum","+40 max health", p=>HP(p,40f)),
+        ("Dawnbringer ★","+12% damage, +8% crit, +1 pierce", p=>{A(p,0.12f); Crit(p,0.08f); Prc(p,1);}),                            // K1
+        ("Seraph ★","motes fork to +2 foes, +3s blessing", p=>{p.MoteFork+=2; p.BlessBonus+=3f;}),                                   // K2
+        ("Aegis Eternal ★","+50% shield, +1 regen, recovers fast", p=>{Shd(p,0.1f); ShdReg(p,1f); ShdFast(p,0.75f);}),               // K3
+        ("Bulwark of Dawn ★","+1 Intervention, +12% resist, +60 HP", p=>{p.Interventions++; Res(p,0.12f); HP(p,60f);}),              // K4
     };
     private static HiddenRoute[] DivineRoutes() => new[]{
-        new HiddenRoute { Name="Sun Cleric", Desc="hidden — +8% damage, +8% crit, +20% crit damage", Req=R5, Apply=p=>{A(p,0.08f); Crit(p,0.08f); CritD(p,0.2f);} },
-        new HiddenRoute { Name="Bulwark Saint", Desc="hidden — +12% resist, +60 health, +1 Intervention", Req=R9, Apply=p=>{Res(p,0.12f); HP(p,60f); p.Interventions++;} },
-        new HiddenRoute { Name="Archon", Desc="hidden — +15% damage, +2 Interventions, +40 health, +8% crit", Req=R13, Apply=p=>{A(p,0.15f); p.Interventions+=2; HP(p,40f); Crit(p,0.08f);} },
+        new HiddenRoute { Name="Sun Cleric", Desc="+2 mote forks, +8% crit, +20% crit dmg", Req=DivA, Apply=p=>{p.MoteFork+=2; Crit(p,0.08f); CritD(p,0.2f); A(p,0.06f);} },
+        new HiddenRoute { Name="Bulwark Saint", Desc="+60% shield, +1 regen, +12% resist, +50 HP", Req=DivC, Apply=p=>{Shd(p,0.12f); ShdReg(p,1f); Res(p,0.12f); HP(p,50f);} },
+        new HiddenRoute { Name="Archon", Desc="+2 Interventions, +3 mote forks, +40 HP", Req=DivAD, Apply=p=>{p.Interventions+=2; p.MoteFork+=3; HP(p,40f); Crit(p,0.08f);} },
     };
 
-    // ===== CRIMSON (2) — blood / lifesteal / crit =====
+    // ===== CRIMSON (2) — A butchery (crit) · B sanguine (aura/leech) · C frenzy (tempo) · D ironblood (armor) =====
     private static (string n, string d, System.Action<Player> a)[] CrimsonDefs() => new (string, string, System.Action<Player>)[]{
-        ("Leech","+5% lifesteal", p=>p.S.Lifesteal+=0.05f), ("Blooded","+4% damage", p=>A(p,0.04f)), ("Thickskin","+4% resistance", p=>Res(p,0.04f)), ("Vital","+25 max health", p=>HP(p,25f)),
-        ("Reckless","+4% crit chance", p=>Crit(p,0.04f)), ("Feast","+4% lifesteal", p=>p.S.Lifesteal+=0.04f), ("Wide Aura","+bigger blood aura", p=>p.AuraBonusR+=1.5f), ("Hardened","+25 max health", p=>HP(p,25f)),
-        ("Savagery","+14% crit damage", p=>CritD(p,0.14f)), ("Gorge","+5% lifesteal", p=>p.S.Lifesteal+=0.05f), ("Bloodpact","+5% damage", p=>A(p,0.05f)), ("Crimson Reach","+4% spell area", p=>Area(p,0.04f)),
-        ("Bloodhaste","+cast speed", p=>p.S.FireCd=Mathf.Max(0.1f,p.S.FireCd*0.94f)), ("Toughen","+4% resistance", p=>Res(p,0.04f)), ("Ironblood","+30 max health", p=>HP(p,30f)), ("Aura Well","+bigger blood aura", p=>p.AuraBonusR+=1.5f),
-        ("Berserk","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Ravage","+5% damage", p=>A(p,0.05f)), ("Crimson Tide","+6% spell area", p=>Area(p,0.06f)), ("Bloodguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Butchery","+16% crit damage", p=>CritD(p,0.16f)), ("Sanguine","+6% damage", p=>A(p,0.06f)), ("Bloodward","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Lifeblood","+30 max health", p=>HP(p,30f)),
-        ("Carnage","+6% damage", p=>A(p,0.06f)), ("Siphon","+5% lifesteal", p=>p.S.Lifesteal+=0.05f), ("Fleetblood","+move speed", p=>Sp(p,0.5f)), ("Crimson Skin","+4% resistance", p=>Res(p,0.04f)),
-        ("Gash","+5% damage", p=>A(p,0.05f)), ("Bloodplate","+30 max health", p=>HP(p,30f)), ("Slaughter","+12% crit damage", p=>CritD(p,0.12f)), ("Clotguard","+5% resistance", p=>Res(p,0.05f)),
-        ("Berserker ★","+12% crit, +40% crit damage", p=>{Crit(p,0.12f); CritD(p,0.4f);}), ("Vampiric ★","+12% lifesteal, +40 health", p=>{p.S.Lifesteal+=0.12f; HP(p,40f);}),
-        ("Bloodlord ★","+15% damage, +8% lifesteal", p=>{A(p,0.15f); p.S.Lifesteal+=0.08f;}), ("Ironheart ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),
+        ("Reckless","+4% crit chance", p=>Crit(p,0.04f)), ("Leech","+5% lifesteal", p=>Life(p,0.05f)), ("Blooded","+4% damage", p=>A(p,0.04f)), ("Thickskin","+4% resistance", p=>Res(p,0.04f)),
+        ("Savagery","+14% crit damage", p=>CritD(p,0.14f)), ("Wide Aura","+1.5 blood-aura radius", p=>p.AuraBonusR+=1.5f), ("Bloodhaste","+6% cast speed", p=>Cast(p,0.94f)), ("Vital","+30 max health", p=>HP(p,30f)),
+        ("Butcher's Eye","+4% crit chance", p=>Crit(p,0.04f)), ("Gash","+1 pierce", p=>Prc(p,1)),
+        ("Feast","+5% lifesteal", p=>Life(p,0.05f)), ("Communion","+20% aura healing", p=>p.AuraHealMul+=0.2f),
+        ("Bloodpact","blood finishers cost less HP", p=>FinCost(p,0.88f)), ("Ravage","+0.03 combo power", p=>Cmb(p,0.03f)),
+        ("Toughen","+4% resistance", p=>Res(p,0.04f)), ("Ironblood","+1 armor charge", p=>p.MaxArmor++),
+        ("Berserk","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Gorge","+6% lifesteal, +1.5 aura", p=>{Life(p,0.06f); p.AuraBonusR+=1.5f;}),
+        ("Crimson Tide","+7% spell area", p=>Area(p,0.07f)), ("Bloodguard","+35 HP, +4% resist", p=>{HP(p,35f); Res(p,0.04f);}),
+        ("Butchery","+18% crit damage", p=>CritD(p,0.18f)), ("Sanguine","+30% aura healing", p=>p.AuraHealMul+=0.3f),
+        ("Frenzy","+2 combo cap, +0.3s window", p=>{CmbCap(p,2); CmbWin(p,0.3f);}), ("Lifeblood","+40 max health", p=>HP(p,40f)),
+        ("Carnage","+7% damage", p=>A(p,0.07f)), ("Slaughter","+14% crit damage", p=>CritD(p,0.14f)),
+        ("Siphon","+6% lifesteal", p=>Life(p,0.06f)), ("Bloodwell","blood finishers cost less HP", p=>FinCost(p,0.88f)),
+        ("Fleetblood","+1.2 dash distance", p=>Dash(p,1.2f)), ("Gore Rush","+6% cast speed", p=>Cast(p,0.94f)),
+        ("Crimson Skin","+5% resistance", p=>Res(p,0.05f)), ("Bloodplate","+1 armor charge", p=>p.MaxArmor++),
+        ("Berserker ★","+12% crit, +40% crit damage", p=>{Crit(p,0.12f); CritD(p,0.4f);}),                                            // K1
+        ("Vampiric ★","+12% lifesteal, +50% aura heal, +3 aura", p=>{Life(p,0.12f); p.AuraHealMul+=0.5f; p.AuraBonusR+=3f;}),          // K2
+        ("Bloodlord ★","+15% dmg, +12% cast speed, +0.05 combo", p=>{A(p,0.15f); Cast(p,0.88f); Cmb(p,0.05f);}),                       // K3
+        ("Ironheart ★","+12% resist, +60 HP, +1 armor charge", p=>{Res(p,0.12f); HP(p,60f); p.MaxArmor++;}),                           // K4
     };
     private static HiddenRoute[] CrimsonRoutes() => new[]{
-        new HiddenRoute { Name="Bloodletter", Desc="hidden — +10% crit, +30% crit damage, +6% lifesteal", Req=R5, Apply=p=>{Crit(p,0.1f); CritD(p,0.3f); p.S.Lifesteal+=0.06f;} },
-        new HiddenRoute { Name="Sanguine Lord", Desc="hidden — +12% lifesteal, +60 health, +8% damage", Req=R9, Apply=p=>{p.S.Lifesteal+=0.12f; HP(p,60f); A(p,0.08f);} },
-        new HiddenRoute { Name="Crimson God", Desc="hidden — +18% damage, +15% lifesteal, +12% crit, +40 health", Req=R13, Apply=p=>{A(p,0.18f); p.S.Lifesteal+=0.15f; Crit(p,0.12f); HP(p,40f);} },
+        new HiddenRoute { Name="Bloodletter", Desc="+10% crit, +30% crit dmg, +1 pierce, +6% leech", Req=CrimA, Apply=p=>{Crit(p,0.1f); CritD(p,0.3f); Prc(p,1); Life(p,0.06f);} },
+        new HiddenRoute { Name="Sanguine Lord", Desc="+2 armor, +combo power, +60 HP, +12% resist", Req=CrimCD, Apply=p=>{p.MaxArmor+=2; Cmb(p,0.05f); HP(p,60f); Res(p,0.12f);} },
+        new HiddenRoute { Name="Crimson God", Desc="+15% lifesteal, +12% crit, cheap finishers", Req=CrimBA, Apply=p=>{Life(p,0.15f); Crit(p,0.12f); FinCost(p,0.55f); HP(p,40f); A(p,0.12f);} },
     };
 
-    // ===== VERDANT (3) — grove / poison / bulk =====
+    // ===== VERDANT (3) — A the grove (ents) · B blight (poison) · C wildgrowth (reach) · D bark (bulk) =====
     private static (string n, string d, System.Action<Player> a)[] VerdantDefs() => new (string, string, System.Action<Player>)[]{
-        ("Blighttouch","+4% damage", p=>A(p,0.04f)), ("Sapling","ents grow faster", p=>p.GroveEvery=Mathf.Max(6,p.GroveEvery-1)), ("Barkhide","+4% resistance", p=>Res(p,0.04f)), ("Heartwood","+30 max health", p=>HP(p,30f)),
-        ("Creeping Death","+5% damage", p=>A(p,0.05f)), ("Deep Roots","+1 max tree-ent", p=>p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+1)), ("Thornmail","+4% resistance", p=>Res(p,0.04f)), ("Toughbark","+30 max health", p=>HP(p,30f)),
-        ("Necrosis","+6% damage", p=>A(p,0.06f)), ("Seedfall","+1 max tree-ent", p=>p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+1)), ("Spread","+6% spell area", p=>Area(p,0.06f)), ("Regrowth","+4% resistance", p=>Res(p,0.04f)),
-        ("Overgrowth","+6% area", p=>Area(p,0.06f)), ("Ironroot","+5% resistance", p=>Res(p,0.05f)), ("Ancient Bark","+40 max health", p=>HP(p,40f)), ("Fast Grove","ents grow faster", p=>p.GroveEvery=Mathf.Max(6,p.GroveEvery-1)),
-        ("Plaguetouch","+6% damage", p=>A(p,0.06f)), ("Virulence","+6% damage", p=>A(p,0.06f)), ("Wildgrowth","+8% spell area", p=>Area(p,0.08f)), ("Bulwark Bark","+4% resistance", p=>Res(p,0.04f)),
-        ("Blight Bloom","+6% area, +4% dmg", p=>{Area(p,0.06f); A(p,0.04f);}), ("Rot","+6% damage", p=>A(p,0.06f)), ("Grove Ward","+40 HP, +4% resist", p=>{HP(p,40f); Res(p,0.04f);}), ("Vitality","+40 max health", p=>HP(p,40f)),
-        ("Decay","+6% damage", p=>A(p,0.06f)), ("Elder Seed","+1 max tree-ent", p=>p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+1)), ("Swiftgrove","ents grow faster", p=>p.GroveEvery=Mathf.Max(6,p.GroveEvery-1)), ("Mossguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Toxin","+5% damage", p=>A(p,0.05f)), ("Deadwood","+40 max health", p=>HP(p,40f)), ("Wither","+6% damage", p=>A(p,0.06f)), ("Barkplate","+5% resistance", p=>Res(p,0.05f)),
-        ("Plaguelord ★","+15% damage, +12% spell area", p=>{A(p,0.15f); Area(p,0.12f);}), ("Elder Grove ★","+2 tree-ents, faster growth", p=>{p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+2); p.GroveEvery=Mathf.Max(6,p.GroveEvery-2);}),
-        ("Wildheart ★","+10% area, +40 health", p=>{Area(p,0.1f); HP(p,40f);}), ("Ironbark ★","+12% resistance, +80 health", p=>{Res(p,0.12f); HP(p,80f);}),
+        ("Sapling","tree-ents grow faster", p=>Grow(p,1)), ("Blighttouch","+15% poison damage", p=>p.PoisonMul+=0.15f), ("Spread","+6% spell area", p=>Area(p,0.06f)), ("Barkhide","+4% resistance", p=>Res(p,0.04f)),
+        ("Deep Roots","+1 max tree-ent", p=>Ents(p,1)), ("Creeping Death","+5% damage", p=>A(p,0.05f)), ("Overgrowth","+7% spell area", p=>Area(p,0.07f)), ("Heartwood","+35 max health", p=>HP(p,35f)),
+        ("Seedfall","+15% tree-ent damage", p=>p.MinionDmgMul+=0.15f), ("Quick Roots","tree-ents grow faster", p=>Grow(p,1)),
+        ("Necrosis","+15% poison damage", p=>p.PoisonMul+=0.15f), ("Virulence","+6% damage", p=>A(p,0.06f)),
+        ("Wildgrowth","+8% spell range", p=>Rng(p,0.08f)), ("Bloom","+7% spell area", p=>Area(p,0.07f)),
+        ("Thornmail","+5% resistance", p=>Res(p,0.05f)), ("Toughbark","+0.5 shield regen", p=>ShdReg(p,0.5f)),
+        ("Elder Seed","+1 tree-ent, +15% ent damage", p=>{Ents(p,1); p.MinionDmgMul+=0.15f;}), ("Plaguetouch","+20% poison, +5% damage", p=>{p.PoisonMul+=0.2f; A(p,0.05f);}),
+        ("Canopy","+8% area, +8% range", p=>{Area(p,0.08f); Rng(p,0.08f);}), ("Ironroot","+40 HP, +4% resist", p=>{HP(p,40f); Res(p,0.04f);}),
+        ("Grovewarden","+20% tree-ent damage", p=>p.MinionDmgMul+=0.2f), ("Rot","+7% damage", p=>A(p,0.07f)),
+        ("Blight Bloom","+9% area, +5% damage", p=>{Area(p,0.09f); A(p,0.05f);}), ("Vitality","+45 max health", p=>HP(p,45f)),
+        ("Worldseed","+1 max tree-ent", p=>Ents(p,1)), ("Swiftgrove","tree-ents grow faster", p=>Grow(p,1)),
+        ("Wither","+25% poison damage", p=>p.PoisonMul+=0.25f), ("Decay","+7% damage", p=>A(p,0.07f)),
+        ("Wildheart","+10% spell area", p=>Area(p,0.1f)), ("Longvine","+10% spell range", p=>Rng(p,0.1f)),
+        ("Mossguard","+5% resistance", p=>Res(p,0.05f)), ("Deadwood","+45 max health", p=>HP(p,45f)),
+        ("Elder Grove ★","+2 tree-ents, +40% ent dmg, grow fast", p=>{Ents(p,2); p.MinionDmgMul+=0.4f; Grow(p,2);}),                   // K1
+        ("Plaguelord ★","+60% poison damage, +12% damage", p=>{p.PoisonMul+=0.6f; A(p,0.12f);}),                                       // K2
+        ("Worldbloom ★","+14% spell area, +12% range", p=>{Area(p,0.14f); Rng(p,0.12f);}),                                             // K3
+        ("Ironbark ★","+12% resistance, +80 health", p=>{Res(p,0.12f); HP(p,80f);}),                                                   // K4
     };
     private static HiddenRoute[] VerdantRoutes() => new[]{
-        new HiddenRoute { Name="Grovekeeper", Desc="hidden — +2 tree-ents, faster growth", Req=R5, Apply=p=>{p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+2); p.GroveEvery=Mathf.Max(6,p.GroveEvery-1);} },
-        new HiddenRoute { Name="Ancient Warden", Desc="hidden — +80 health, +12% resist, +8% damage", Req=R9, Apply=p=>{HP(p,80f); Res(p,0.12f); A(p,0.08f);} },
-        new HiddenRoute { Name="Worldtree", Desc="hidden — +3 tree-ents, +15% damage, +12% area, +60 health", Req=R13, Apply=p=>{p.GroveBonusEnts=Mathf.Min(8,p.GroveBonusEnts+3); A(p,0.15f); Area(p,0.12f); HP(p,60f);} },
+        new HiddenRoute { Name="Grovekeeper", Desc="+2 tree-ents, +50% ent damage, grow faster", Req=VerA, Apply=p=>{Ents(p,2); p.MinionDmgMul+=0.5f; Grow(p,1);} },
+        new HiddenRoute { Name="Ancient Warden", Desc="+80 HP, +12% resist, +12% area, +10% range", Req=VerCD, Apply=p=>{HP(p,80f); Res(p,0.12f); Area(p,0.12f); Rng(p,0.1f);} },
+        new HiddenRoute { Name="Worldtree", Desc="+3 ents, +50% ent dmg, +60% poison, +60 HP", Req=VerAB, Apply=p=>{Ents(p,3); p.MinionDmgMul+=0.5f; p.PoisonMul+=0.6f; HP(p,60f);} },
     };
 
-    // ===== GALE (4) — wind / mobility / airborne =====
+    // ===== GALE (4) — A duelist · B gusts · C flight (dash/jump) · D stormguard =====
     private static (string n, string d, System.Action<Player> a)[] GaleDefs() => new (string, string, System.Action<Player>)[]{
-        ("Gale Force","+4% damage", p=>A(p,0.04f)), ("Fleet","+move speed", p=>Sp(p,0.5f)), ("Windguard","+4% resistance", p=>Res(p,0.04f)), ("Airborne","+30 max health", p=>HP(p,30f)),
-        ("Cutting Gust","+4% crit", p=>Crit(p,0.04f)), ("Slipwind","+1 dash charge", p=>p.S.DashCharges++), ("Tailwind","+move speed", p=>Sp(p,0.5f)), ("Featherfall","+8% jump height", p=>p.S.JumpMul+=0.08f),
-        ("Buffet","+stronger gusts", p=>p.GustPower=Mathf.Min(2.5f,p.GustPower+0.15f)), ("Quickstep","faster dash cd", p=>p.S.DashCd=Mathf.Max(0.9f,p.S.DashCd*0.9f)), ("Updraft","+8% jump height", p=>p.S.JumpMul+=0.08f), ("Whirl","+6% spell area", p=>Area(p,0.06f)),
-        ("Crosswind","+stronger gusts", p=>p.GustPower=Mathf.Min(2.5f,p.GustPower+0.15f)), ("Slipstream","+4% resistance", p=>Res(p,0.04f)), ("Skysong","+30 max health", p=>HP(p,30f)), ("Zephyr","+move speed", p=>Sp(p,0.5f)),
-        ("Stormheart","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Aloft","+5% damage", p=>A(p,0.05f)), ("Cyclone","+6% spell area", p=>Area(p,0.06f)), ("Gustguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Tempest","+14% crit damage", p=>CritD(p,0.14f)), ("Windblade","+6% damage", p=>A(p,0.06f)), ("Skyward","+30 HP, +8% jump", p=>{HP(p,30f); p.S.JumpMul+=0.08f;}), ("Gale Skin","+30 max health", p=>HP(p,30f)),
-        ("Riptide","+6% damage", p=>A(p,0.06f)), ("Maelstrom","+stronger gusts", p=>p.GustPower=Mathf.Min(2.5f,p.GustPower+0.15f)), ("Second Wind","+move speed", p=>Sp(p,0.5f)), ("Eye Calm","+4% resistance", p=>Res(p,0.04f)),
-        ("Downburst","+5% damage", p=>A(p,0.05f)), ("Windwall","+30 max health", p=>HP(p,30f)), ("Jetstream","+12% crit damage", p=>CritD(p,0.12f)), ("Stormguard","+5% resistance", p=>Res(p,0.05f)),
-        ("Windwalker ★","+1 dash, +8% damage", p=>{p.S.DashCharges++; A(p,0.08f);}), ("Stormheart ★","+14% damage, +10% crit", p=>{A(p,0.14f); Crit(p,0.1f);}),
-        ("Tempest Lord ★","+15% damage, +12% area", p=>{A(p,0.15f); Area(p,0.12f);}), ("Eye of Calm ★","+8% resistance, +1 dash charge", p=>{Res(p,0.08f); p.S.DashCharges++;}),
+        ("Cutting Gust","+4% crit chance", p=>Crit(p,0.04f)), ("Buffet","+15% gust power", p=>Gust(p,0.15f)), ("Fleet","+0.5 move speed", p=>Sp(p,0.5f)), ("Windguard","+4% resistance", p=>Res(p,0.04f)),
+        ("Gale Force","+5% damage", p=>A(p,0.05f)), ("Whirl","+6% spell area", p=>Area(p,0.06f)), ("Slipwind","+1 dash charge", p=>p.S.DashCharges++), ("Airborne","+30 max health", p=>HP(p,30f)),
+        ("Windblade","+1 pierce", p=>Prc(p,1)), ("Jetstream","+14% crit damage", p=>CritD(p,0.14f)),
+        ("Crosswind","+15% gust power", p=>Gust(p,0.15f)), ("Downdraft","+8% spell range", p=>Rng(p,0.08f)),
+        ("Quickstep","dash recovers faster", p=>DashCut(p,0.88f)), ("Updraft","+10% jump height", p=>Jmp(p,0.1f)),
+        ("Slipstream","+4% resistance", p=>Res(p,0.04f)), ("Skysong","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Stormheart","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Maelstrom","+20% gust power, +6% area", p=>{Gust(p,0.2f); Area(p,0.06f);}),
+        ("Tailwind","+1.5 dash distance", p=>Dash(p,1.5f)), ("Gustguard","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Tempest","+16% crit damage", p=>CritD(p,0.16f)), ("Cyclone","+8% area, +8% range", p=>{Area(p,0.08f); Rng(p,0.08f);}),
+        ("Zephyr","+0.8 move speed, +10% jump", p=>{Sp(p,0.8f); Jmp(p,0.1f);}), ("Gale Skin","+35 max health", p=>HP(p,35f)),
+        ("Riptide","+7% damage", p=>A(p,0.07f)), ("Windshear","+1 pierce, +12% crit damage", p=>{Prc(p,1); CritD(p,0.12f);}),
+        ("Eyewall","+20% gust power", p=>Gust(p,0.2f)), ("Downburst","+7% damage, +6% area", p=>{A(p,0.07f); Area(p,0.06f);}),
+        ("Second Wind","+1 dash charge", p=>p.S.DashCharges++), ("Skydancer","+1.5 dash distance", p=>Dash(p,1.5f)),
+        ("Eye Calm","+5% resistance", p=>Res(p,0.05f)), ("Windwall","+0.5 shield regen", p=>ShdReg(p,0.5f)),
+        ("Stormheart ★","+14% damage, +10% crit, +1 pierce", p=>{A(p,0.14f); Crit(p,0.1f); Prc(p,1);}),                                // K1
+        ("Tempest Lord ★","+60% gust power, +12% spell area", p=>{Gust(p,0.6f); Area(p,0.12f);}),                                      // K2
+        ("Windwalker ★","+2 dash charges, +3 distance, +20% jump", p=>{p.S.DashCharges+=2; Dash(p,3f); Jmp(p,0.2f);}),                  // K3
+        ("Eye of Calm ★","+12% resist, +60 HP, +50% shield", p=>{Res(p,0.12f); HP(p,60f); Shd(p,0.1f);}),                               // K4
     };
     private static HiddenRoute[] GaleRoutes() => new[]{
-        new HiddenRoute { Name="Duelist", Desc="hidden — +10% crit, +25% crit damage, +1 dash", Req=R5, Apply=p=>{Crit(p,0.1f); CritD(p,0.25f); p.S.DashCharges++;} },
-        new HiddenRoute { Name="Skydancer", Desc="hidden — +move speed, +15% jump, +8% damage, +40 health", Req=R9, Apply=p=>{Sp(p,1.2f); p.S.JumpMul+=0.15f; A(p,0.08f); HP(p,40f);} },
-        new HiddenRoute { Name="Storm Sovereign", Desc="hidden — +18% damage, +2 dash charges, +12% crit, +12% area", Req=R13, Apply=p=>{A(p,0.18f); p.S.DashCharges+=2; Crit(p,0.12f); Area(p,0.12f);} },
+        new HiddenRoute { Name="Duelist", Desc="+10% crit, +25% crit dmg, +2 pierce, +8% dmg", Req=GalA, Apply=p=>{Crit(p,0.1f); CritD(p,0.25f); Prc(p,2); A(p,0.08f);} },
+        new HiddenRoute { Name="Skydancer", Desc="+2 dash charges, +2.5 distance, +25% jump", Req=GalC, Apply=p=>{p.S.DashCharges+=2; Dash(p,2.5f); Jmp(p,0.25f); HP(p,40f);} },
+        new HiddenRoute { Name="Storm Sovereign", Desc="+70% gust power, +18% dmg, +12% crit", Req=GalBC, Apply=p=>{Gust(p,0.7f); A(p,0.18f); Crit(p,0.12f); Area(p,0.12f);} },
     };
 
-    // ===== FROST (5) — freeze / shatter / snipe =====
+    // ===== FROST (5) — A the snipe (range/charge) · B rime (freeze) · C shatter · D rimeguard =====
     private static (string n, string d, System.Action<Player> a)[] FrostDefs() => new (string, string, System.Action<Player>)[]{
-        ("Chillblade","+4% damage", p=>A(p,0.04f)), ("Hoarfrost","+freeze buildup", p=>p.FreezeRate+=0.2f), ("Frostmail","+4% resistance", p=>Res(p,0.04f)), ("Rimeguard","+25 max health", p=>HP(p,25f)),
-        ("Longsight","+8% spell range", p=>p.S.SpellRange+=0.08f), ("Permafrost","+0.4s frozen", p=>p.FrostDurBonus+=0.4f), ("Coldsnap","+4% resistance", p=>Res(p,0.04f)), ("Frostskin","+25 max health", p=>HP(p,25f)),
-        ("Coldsteel","+4% crit", p=>Crit(p,0.04f)), ("Flashfreeze","freeze sooner", p=>p.FreezeThreshMul=Mathf.Max(0.4f,p.FreezeThreshMul*0.95f)), ("Riftsplit","+12% shatter dmg", p=>p.ShatterPowerMul+=0.12f), ("Icebound","+6% spell area", p=>Area(p,0.06f)),
-        ("Deepwinter","+5% damage", p=>A(p,0.05f)), ("Rimeplate","+4% resistance", p=>Res(p,0.04f)), ("Glacial HP","+30 max health", p=>HP(p,30f)), ("Farsight","+8% spell range", p=>p.S.SpellRange+=0.08f),
-        ("Winter Bite","+6% damage, +4% crit", p=>{A(p,0.06f); Crit(p,0.04f);}), ("Shardburst","+shatter freeze", p=>p.ShatterFreezeStacks+=0.4f), ("Icefall","+12% shatter dmg", p=>p.ShatterPowerMul+=0.12f), ("Coldguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Frostbite","+14% crit damage", p=>CritD(p,0.14f)), ("Cryo","+6% damage", p=>A(p,0.06f)), ("Frost Ward","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Snowdrift","+30 max health", p=>HP(p,30f)),
-        ("Fracture","+12% shatter dmg", p=>p.ShatterPowerMul+=0.12f), ("Deep Rime","+freeze buildup", p=>p.FreezeRate+=0.2f), ("Cold Step","+move speed", p=>Sp(p,0.4f)), ("Iceguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Sleet","+5% damage", p=>A(p,0.05f)), ("Glacier HP","+30 max health", p=>HP(p,30f)), ("Splinter","+12% crit damage", p=>CritD(p,0.12f)), ("Frostwall","+5% resistance", p=>Res(p,0.05f)),
-        ("Winter Sovereign ★","+14% damage, +10% crit", p=>{A(p,0.14f); Crit(p,0.1f);}), ("Zero Point ★","+freeze buildup, freeze sooner", p=>{p.FreezeRate+=0.5f; p.FrostDurBonus+=0.6f; p.FreezeThreshMul=Mathf.Max(0.35f,p.FreezeThreshMul*0.85f);}),
-        ("Grand Shatter ★","+40% shatter damage, +8% damage", p=>{p.ShatterPowerMul+=0.4f; A(p,0.08f);}), ("Cold Sovereign ★","+12% resistance, +50 health", p=>{Res(p,0.12f); HP(p,50f);}),
+        ("Longsight","+8% spell range", p=>Rng(p,0.08f)), ("Hoarfrost","+freeze buildup", p=>p.FreezeRate+=0.2f), ("Riftsplit","+12% shatter damage", p=>p.ShatterPowerMul+=0.12f), ("Frostmail","+4% resistance", p=>Res(p,0.04f)),
+        ("Coldsteel","+4% crit chance", p=>Crit(p,0.04f)), ("Permafrost","+0.4s frozen", p=>p.FrostDurBonus+=0.4f), ("Shardburst","shatters seed more freeze", p=>p.ShatterFreezeStacks+=0.4f), ("Rimeguard","+30 max health", p=>HP(p,30f)),
+        ("Farsight","+8% spell range", p=>Rng(p,0.08f)), ("Chillblade","+14% crit damage", p=>CritD(p,0.14f)),
+        ("Flashfreeze","foes freeze sooner", p=>Thaw(p,0.95f)), ("Deep Rime","+freeze buildup", p=>p.FreezeRate+=0.2f),
+        ("Icefall","+12% shatter damage", p=>p.ShatterPowerMul+=0.12f), ("Icebound","+7% spell area", p=>Area(p,0.07f)),
+        ("Coldsnap","+4% resistance", p=>Res(p,0.04f)), ("Frostskin","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Winter Bite","+0.25 charge speed", p=>Chg(p,0.25f)), ("Lingering Ice","+0.6s frozen, +freeze buildup", p=>{p.FrostDurBonus+=0.6f; p.FreezeRate+=0.2f;}),
+        ("Fracture","+15% shatter damage", p=>p.ShatterPowerMul+=0.15f), ("Rimeplate","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Frostbite","+16% crit damage", p=>CritD(p,0.16f)), ("Brittle","foes freeze much sooner", p=>Thaw(p,0.92f)),
+        ("Splinter","shatters seed more freeze", p=>p.ShatterFreezeStacks+=0.5f), ("Snowdrift","+35 max health", p=>HP(p,35f)),
+        ("Deepwinter","+0.3 charged power", p=>Pow(p,0.3f)), ("Sleet","+8% range, +8% projectile speed", p=>{Rng(p,0.08f); Prj(p,0.08f);}),
+        ("Zero Rime","+0.6s frozen", p=>p.FrostDurBonus+=0.6f), ("Cryo","+freeze buildup", p=>p.FreezeRate+=0.25f),
+        ("Glacier","+18% shatter damage", p=>p.ShatterPowerMul+=0.18f), ("Cold Step","+1.2 dash distance", p=>Dash(p,1.2f)),
+        ("Iceguard","+5% resistance", p=>Res(p,0.05f)), ("Frostwall","+0.5 shield regen", p=>ShdReg(p,0.5f)),
+        ("Winter Sovereign ★","+0.5 charge speed, +0.5 power, +10% crit", p=>{Chg(p,0.5f); Pow(p,0.5f); Crit(p,0.1f);}),                 // K1
+        ("Zero Point ★","+freeze buildup, +1s frozen, freeze fast", p=>{p.FreezeRate+=0.5f; p.FrostDurBonus+=1f; Thaw(p,0.85f);}),      // K2
+        ("Grand Shatter ★","+45% shatter damage, +1 freeze seed", p=>{p.ShatterPowerMul+=0.45f; p.ShatterFreezeStacks+=1f;}),           // K3
+        ("Cold Sovereign ★","+12% resist, +55 HP, +50% shield", p=>{Res(p,0.12f); HP(p,55f); Shd(p,0.1f);}),                            // K4
     };
     private static HiddenRoute[] FrostRoutes() => new[]{
-        new HiddenRoute { Name="Icebreaker", Desc="hidden — +30% shatter damage, +10% crit, +25% crit dmg", Req=R5, Apply=p=>{p.ShatterPowerMul+=0.3f; Crit(p,0.1f); CritD(p,0.25f);} },
-        new HiddenRoute { Name="Frost Fortress", Desc="hidden — +12% resist, +60 health, +freeze buildup & duration", Req=R9, Apply=p=>{Res(p,0.12f); HP(p,60f); p.FreezeRate+=0.5f; p.FrostDurBonus+=0.6f;} },
-        new HiddenRoute { Name="Absolute Zero", Desc="hidden — +50% shatter, +15% damage, foes freeze instantly, +40 health", Req=R13, Apply=p=>{p.ShatterPowerMul+=0.5f; A(p,0.15f); p.FreezeThreshMul=Mathf.Max(0.25f,p.FreezeThreshMul*0.6f); HP(p,40f);} },
+        new HiddenRoute { Name="Frozen Sniper", Desc="+20% range, +0.6 charge, +0.5 power, +25% crit", Req=FroA, Apply=p=>{Rng(p,0.2f); Chg(p,0.6f); Pow(p,0.5f); CritD(p,0.25f);} },
+        new HiddenRoute { Name="Frost Fortress", Desc="+40% shatter, +1.5 freeze seed, +60 HP", Req=FroCD, Apply=p=>{p.ShatterPowerMul+=0.4f; p.ShatterFreezeStacks+=1.5f; HP(p,60f); Res(p,0.12f);} },
+        new HiddenRoute { Name="Absolute Zero", Desc="freeze near-instantly, +1.5s frozen, +50% shatter", Req=FroBC, Apply=p=>{Thaw(p,0.6f); p.FrostDurBonus+=1.5f; p.ShatterPowerMul+=0.5f; p.FreezeRate+=0.6f; HP(p,40f);} },
     };
 
-    // ===== FORSAKEN (6) — curse / tethers / siphon =====
+    // ===== FORSAKEN (6) — A the Doom · B the spread · C the focus · D wraith =====
+    // (DOOM REWORK) her columns kept their shape; two knobs changed meaning underneath. CurseStackCap was the crush's
+    // effective-stack ceiling and became meaningless when strings went away, so the six nodes that fed it now feed
+    // DoomPower — how hard everything she applies banks. Every node keeps its name, column and build identity.
     private static (string n, string d, System.Action<Player> a)[] ForsakenDefs() => new (string, string, System.Action<Player>)[]{
-        ("Maleficence","+4% damage", p=>A(p,0.04f)), ("Blight","+curse buildup", p=>p.CurseRate+=0.4f), ("Insubstantial","+4% resistance", p=>Res(p,0.04f)), ("Dreadbone","+25 max health", p=>HP(p,25f)),
-        ("Virulence","+8% dmg to cursed", p=>p.CurseBonusMul+=0.08f), ("Bindings","+1 tether", p=>p.MaxLinks=Mathf.Min(12,p.MaxLinks+1)), ("Ghoststep","+move speed", p=>Sp(p,0.4f)), ("Wraithskin","+25 max health", p=>HP(p,25f)),
-        ("Anathema","+2 crush ceiling", p=>p.CurseStackCap+=2f), ("Contagion","+curse buildup", p=>p.CurseRate+=0.4f), ("Siphon","+beam lifesteal", p=>p.CurseBeamLifesteal=Mathf.Min(1f,p.CurseBeamLifesteal+0.08f)), ("Spread","+curse spread range", p=>p.CurseSpreadRange+=2f),
-        ("Sympathy","+damage sharing", p=>p.CurseShareFrac=Mathf.Min(1f,p.CurseShareFrac+0.08f)), ("Rotplate","+4% resistance", p=>Res(p,0.04f)), ("Soulhide","+30 max health", p=>HP(p,30f)), ("Farhex","+curse spread range", p=>p.CurseSpreadRange+=2f),
-        ("Doombrand","+8% dmg to cursed", p=>p.CurseBonusMul+=0.08f), ("Exsanguinate","+6% lifesteal", p=>p.S.Lifesteal+=0.06f), ("Wither","+6% spell area", p=>Area(p,0.06f)), ("Hexguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Malefic","+14% crit damage", p=>CritD(p,0.14f)), ("Reap","+6% damage", p=>A(p,0.06f)), ("Soulward","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Deathbind","+30 max health", p=>HP(p,30f)),
-        ("Plague","+6% damage", p=>A(p,0.06f)), ("Deep Curse","+curse buildup", p=>p.CurseRate+=0.4f), ("Revenant","+move speed", p=>Sp(p,0.4f)), ("Boneguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Blight II","+5% damage", p=>A(p,0.05f)), ("Gravemark","+30 max health", p=>HP(p,30f)), ("Torment","+8% dmg to cursed", p=>p.CurseBonusMul+=0.08f), ("Shroud","+5% resistance", p=>Res(p,0.05f)),
-        ("Doomherald ★","+14% damage, +12% to cursed", p=>{A(p,0.14f); p.CurseBonusMul+=0.12f;}), ("Coven's Grip ★","+2 tethers, +damage sharing", p=>{p.MaxLinks=Mathf.Min(12,p.MaxLinks+2); p.CurseShareFrac=Mathf.Min(1f,p.CurseShareFrac+0.1f);}),
-        ("Soul Glutton ★","+15% beam lifesteal, +10% damage", p=>{p.CurseBeamLifesteal=Mathf.Min(1f,p.CurseBeamLifesteal+0.15f); A(p,0.1f);}), ("Revenant King ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),
+        ("Blight","+Doom buildup", p=>p.CurseRate+=0.4f), ("Bindings","+1 blast seed", p=>Links(p,1)), ("Siphon","+beam siphon", p=>Beam(p,0.06f)), ("Insubstantial","+4% resistance", p=>Res(p,0.04f)),
+        ("Virulence","+10% damage to doomed", p=>p.CurseBonusMul+=0.1f), ("Farhex","+0.7 blast reach", p=>p.DoomSpreadRadius+=0.7f), ("Exsanguinate","+5% lifesteal", p=>Life(p,0.05f)), ("Dreadbone","+30 max health", p=>HP(p,30f)),
+        ("Anathema","+15% Doom power", p=>p.DoomPower+=0.15f), ("Contagion","+Doom buildup", p=>p.CurseRate+=0.4f),
+        ("Sympathy","+10% damage sharing", p=>Share(p,0.1f)), ("Coven Bind","+1 blast seed", p=>Links(p,1)),
+        ("Soul Drain","+beam siphon", p=>Beam(p,0.06f)), ("Ghoststep","+0.5 move speed", p=>Sp(p,0.5f)),
+        ("Rotplate","+4% resistance", p=>Res(p,0.04f)), ("Soulhide","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Doombrand","+12% to doomed, +15% Doom power", p=>{p.CurseBonusMul+=0.12f; p.DoomPower+=0.15f;}), ("Soulbind","+1 blast seed, +0.9 reach", p=>{Links(p,1); p.DoomSpreadRadius+=0.9f;}),
+        ("Rapture","+6% lifesteal", p=>Life(p,0.06f)), ("Hexguard","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Malefic","+16% crit damage", p=>CritD(p,0.16f)), ("Grim Chorus","+12% damage sharing", p=>Share(p,0.12f)),
+        ("Revenant","+1.2 dash distance", p=>Dash(p,1.2f)), ("Deathbind","+35 max health", p=>HP(p,35f)),
+        ("Torment","+12% damage to doomed", p=>p.CurseBonusMul+=0.12f), ("Plague","+Doom buildup, +15% Doom power", p=>{p.CurseRate+=0.4f; p.DoomPower+=0.15f;}),
+        ("Wraith Choir","+1 blast seed", p=>Links(p,1)), ("Deep Hex","+1.1 blast reach", p=>p.DoomSpreadRadius+=1.1f),
+        ("Soul Glutton","+beam siphon", p=>Beam(p,0.07f)), ("Gravemark","+7% damage", p=>A(p,0.07f)),
+        ("Boneguard","+5% resistance", p=>Res(p,0.05f)), ("Shroud","+0.5 shield regen", p=>ShdReg(p,0.5f)),
+        ("Doomherald ★","+25% damage to doomed, +35% Doom power", p=>{p.CurseBonusMul+=0.25f; p.DoomPower+=0.35f;}),                  // K1
+        ("Coven's Grip ★","+3 blast seeds, +2 reach", p=>{Links(p,3); Share(p,0.25f); p.DoomSpreadRadius+=2f;}),             // K2
+        ("Soul Glutton ★","+15% beam siphon, +8% lifesteal", p=>{Beam(p,0.15f); Life(p,0.08f);}),                                       // K3
+        ("Revenant King ★","+12% resist, +60 HP, +50% shield", p=>{Res(p,0.12f); HP(p,60f); Shd(p,0.1f);}),                             // K4
     };
     private static HiddenRoute[] ForsakenRoutes() => new[]{
-        new HiddenRoute { Name="Hexer", Desc="hidden — +15% damage to cursed, +2 crush ceiling, +curse buildup", Req=R5, Apply=p=>{p.CurseBonusMul+=0.15f; p.CurseStackCap+=2f; p.CurseRate+=0.5f;} },
-        new HiddenRoute { Name="Soulbinder", Desc="hidden — +3 tethers, +damage sharing, +12% beam lifesteal", Req=R9, Apply=p=>{p.MaxLinks=Mathf.Min(12,p.MaxLinks+3); p.CurseShareFrac=Mathf.Min(1f,p.CurseShareFrac+0.15f); p.CurseBeamLifesteal=Mathf.Min(1f,p.CurseBeamLifesteal+0.12f);} },
-        new HiddenRoute { Name="Doom Herald", Desc="hidden — +18% damage, +18% to cursed, +15% siphon, +40 health", Req=R13, Apply=p=>{A(p,0.18f); p.CurseBonusMul+=0.18f; p.CurseBeamLifesteal=Mathf.Min(1f,p.CurseBeamLifesteal+0.15f); HP(p,40f);} },
+        new HiddenRoute { Name="Hexer", Desc="+20% to doomed, +35% Doom power, +buildup", Req=ForA, Apply=p=>{p.CurseBonusMul+=0.2f; p.DoomPower+=0.35f; p.CurseRate+=0.5f;} },
+        new HiddenRoute { Name="Soul Eater", Desc="+15% beam siphon, +10% lifesteal, +60 HP", Req=ForCD, Apply=p=>{Beam(p,0.15f); Life(p,0.1f); HP(p,60f); Res(p,0.12f);} },
+        new HiddenRoute { Name="Doom Herald", Desc="+4 blast seeds, +25% to doomed, +1.5 reach", Req=ForBA, Apply=p=>{Links(p,4); p.CurseBonusMul+=0.25f; p.DoomSpreadRadius+=1.5f; Beam(p,0.15f); HP(p,40f);} },
     };
 
-    // ===== EMBER (7) — burn / Living Bomb / meteor =====
+    // ===== EMBER (7) — A burn · B Living Bomb · C reach & meteor · D cinder =====
     private static (string n, string d, System.Action<Player> a)[] EmberDefs() => new (string, string, System.Action<Player>)[]{
-        ("Emberfeed","+12% burn damage", p=>p.EmberBurnMul+=0.12f), ("Kindling","+4% damage", p=>A(p,0.04f)), ("Heatshimmer","+4% resistance", p=>Res(p,0.04f)), ("Emberward","+25 max health", p=>HP(p,25f)),
-        ("Scatterspark","+flame reach", p=>p.FlameReachMul+=0.1f), ("Slowburn","+6% spell area", p=>Area(p,0.06f)), ("Cinderskin","+4% resistance", p=>Res(p,0.04f)), ("Ashguard","+25 max health", p=>HP(p,25f)),
-        ("Firestarter","+4% crit", p=>Crit(p,0.04f)), ("Contagion","+20% Living Bomb", p=>p.LivingBombMul+=0.2f), ("Wildheat","+5% damage", p=>A(p,0.05f)), ("Backdraft","+6% spell area", p=>Area(p,0.06f)),
-        ("Overheat","+14% crit damage", p=>CritD(p,0.14f)), ("Heatplate","+4% resistance", p=>Res(p,0.04f)), ("Phoenix HP","+30 max health", p=>HP(p,30f)), ("Longflame","+flame reach", p=>p.FlameReachMul+=0.1f),
-        ("Conflagrate","+12% burn dmg", p=>p.EmberBurnMul+=0.12f), ("Airburst","+5% damage", p=>A(p,0.05f)), ("Firestorm","+8% spell area", p=>Area(p,0.08f)), ("Cinderguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Detonator","+16% crit damage", p=>CritD(p,0.16f)), ("Pyre","+6% damage", p=>A(p,0.06f)), ("Ember Ward","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Cinderheart","+30 max health", p=>HP(p,30f)),
-        ("Falling Sky","+6% damage", p=>A(p,0.06f)), ("Chain Bomb","+20% Living Bomb", p=>p.LivingBombMul+=0.2f), ("Phoenix Step","+move speed", p=>Sp(p,0.4f)), ("Heatshield","+4% resistance", p=>Res(p,0.04f)),
-        ("Scorch","+5% damage", p=>A(p,0.05f)), ("Ashplate","+30 max health", p=>HP(p,30f)), ("Meteoric","+12% crit damage", p=>CritD(p,0.12f)), ("Flamewall","+5% resistance", p=>Res(p,0.05f)),
-        ("Conflagration ★","+40% burn damage, +8% area", p=>{p.EmberBurnMul+=0.4f; Area(p,0.08f);}), ("Chain Detonation ★","+50% Living Bomb, +reach", p=>{p.LivingBombMul+=0.5f; p.FlameReachMul+=0.15f;}),
-        ("Falling Sky ★","+15% damage, +12% area, +30% crit dmg", p=>{A(p,0.15f); Area(p,0.12f); CritD(p,0.3f);}), ("Living Pyre ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),
+        ("Emberfeed","+12% burn damage", p=>p.EmberBurnMul+=0.12f), ("Contagion","+20% Living Bomb", p=>p.LivingBombMul+=0.2f), ("Scatterspark","+10% flame reach", p=>p.FlameReachMul+=0.1f), ("Heatshimmer","+4% resistance", p=>Res(p,0.04f)),
+        ("Kindling","+12% burn damage", p=>p.EmberBurnMul+=0.12f), ("Backdraft","+6% spell area", p=>Area(p,0.06f)), ("Longflame","+10% flame reach", p=>p.FlameReachMul+=0.1f), ("Emberward","+30 max health", p=>HP(p,30f)),
+        ("Firestarter","+4% crit chance", p=>Crit(p,0.04f)), ("Slowburn","+14% burn damage", p=>p.EmberBurnMul+=0.14f),
+        ("Chain Bomb","+20% Living Bomb", p=>p.LivingBombMul+=0.2f), ("Wildheat","+7% spell area", p=>Area(p,0.07f)),
+        ("Airburst","+0.25 charge speed", p=>Chg(p,0.25f)), ("Falling Sky","+8% spell range", p=>Rng(p,0.08f)),
+        ("Cinderskin","+4% resistance", p=>Res(p,0.04f)), ("Ashguard","+25% shield capacity", p=>Shd(p,0.05f)),
+        ("Conflagrate","+16% burn damage, +4% crit", p=>{p.EmberBurnMul+=0.16f; Crit(p,0.04f);}), ("Detonator","+25% Living Bomb, +6% area", p=>{p.LivingBombMul+=0.25f; Area(p,0.06f);}),
+        ("Meteoric","+0.3 charged power", p=>Pow(p,0.3f)), ("Heatplate","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Overheat","+16% crit damage", p=>CritD(p,0.16f)), ("Firestorm","+9% spell area", p=>Area(p,0.09f)),
+        ("Pyre Reach","+15% flame reach", p=>p.FlameReachMul+=0.15f), ("Cinderheart","+35 max health", p=>HP(p,35f)),
+        ("Scorch","+18% burn damage", p=>p.EmberBurnMul+=0.18f), ("Wildfire","+7% damage", p=>A(p,0.07f)),
+        ("Cataclysm","+25% Living Bomb", p=>p.LivingBombMul+=0.25f), ("Blast Wave","+9% area, +8% range", p=>{Area(p,0.09f); Rng(p,0.08f);}),
+        ("Phoenix Step","+1.2 dash distance", p=>Dash(p,1.2f)), ("Sunflare","+15% flame reach", p=>p.FlameReachMul+=0.15f),
+        ("Heatshield","+5% resistance", p=>Res(p,0.05f)), ("Ashplate","+0.5 shield regen", p=>ShdReg(p,0.5f)),
+        ("Conflagration ★","+50% burn damage, +8% crit", p=>{p.EmberBurnMul+=0.5f; Crit(p,0.08f);}),                                    // K1
+        ("Chain Detonation ★","+55% Living Bomb, +10% spell area", p=>{p.LivingBombMul+=0.55f; Area(p,0.1f);}),                          // K2
+        ("Falling Sky ★","+35% reach, +0.5 charged power, +12% range", p=>{p.FlameReachMul+=0.35f; Pow(p,0.5f); Rng(p,0.12f);}),         // K3
+        ("Living Pyre ★","+12% resist, +60 HP, +50% shield", p=>{Res(p,0.12f); HP(p,60f); Shd(p,0.1f);}),                                // K4
     };
     private static HiddenRoute[] EmberRoutes() => new[]{
-        new HiddenRoute { Name="Firestarter", Desc="hidden — +30% burn damage, +10% crit, +flame reach", Req=R5, Apply=p=>{p.EmberBurnMul+=0.3f; Crit(p,0.1f); p.FlameReachMul+=0.15f;} },
-        new HiddenRoute { Name="Pyromancer", Desc="hidden — +40% Living Bomb, +12% area, +8% damage, +40 health", Req=R9, Apply=p=>{p.LivingBombMul+=0.4f; Area(p,0.12f); A(p,0.08f); HP(p,40f);} },
-        new HiddenRoute { Name="Cataclysm", Desc="hidden — +50% burn, +40% Living Bomb, +15% damage, +40 health", Req=R13, Apply=p=>{p.EmberBurnMul+=0.5f; p.LivingBombMul+=0.4f; A(p,0.15f); HP(p,40f);} },
+        new HiddenRoute { Name="Firestarter", Desc="+60% burn damage, +10% crit, +25% crit dmg", Req=EmbA, Apply=p=>{p.EmberBurnMul+=0.6f; Crit(p,0.1f); CritD(p,0.25f);} },
+        new HiddenRoute { Name="Skyfire", Desc="+40% flame reach, +0.6 power, +12% range", Req=EmbC, Apply=p=>{p.FlameReachMul+=0.4f; Pow(p,0.6f); Rng(p,0.12f); HP(p,40f);} },
+        new HiddenRoute { Name="Cataclysm", Desc="+50% burn, +50% Living Bomb, +25% reach", Req=EmbAB, Apply=p=>{p.EmberBurnMul+=0.5f; p.LivingBombMul+=0.5f; p.FlameReachMul+=0.25f; HP(p,40f);} },
     };
 
-    // ===== ARCANE (8) — missiles / marks / crit-heal =====
+    // ===== ARCANE (8) — A the barrage · B sigils (marks) · C the blink · D ward =====
+    // NOTE: her missiles are homing and her beam is hitscan, so S.Pierce is deliberately absent from this tree.
     private static (string n, string d, System.Action<Player> a)[] ArcaneDefs() => new (string, string, System.Action<Player>)[]{
-        ("Volley","+4% damage", p=>A(p,0.04f)), ("Attune","+4% damage", p=>A(p,0.04f)), ("Arcane Shell","+4% resistance", p=>Res(p,0.04f)), ("Ward","+25 max health", p=>HP(p,25f)),
-        ("Precision","+4% crit", p=>Crit(p,0.04f)), ("Swiftcast","+cast speed", p=>p.S.FireCd=Mathf.Max(0.08f,p.S.FireCd*0.94f)), ("Farcast","+8% spell range", p=>p.S.SpellRange+=0.08f), ("Recall","+move speed", p=>Sp(p,0.4f)),
-        ("Multishot","+8% projectile speed", p=>p.S.ProjSpeed+=0.08f), ("Overload","+arcane mark duration", p=>p.ArcaneMarkDur+=0.6f), ("Empower","+14% crit damage", p=>CritD(p,0.14f)), ("Resonance","+6% spell range", p=>p.S.SpellRange+=0.06f),
-        ("Feedback","+crit-heal", p=>p.ArcaneCritHealBonus+=0.04f), ("Sigilplate","+4% resistance", p=>Res(p,0.04f)), ("Arcane HP","+30 max health", p=>HP(p,30f)), ("Longcast","+8% spell range", p=>p.S.SpellRange+=0.08f),
-        ("Barrage","+6% damage, +proj speed", p=>{A(p,0.06f); p.S.ProjSpeed+=0.06f;}), ("Amplify","+5% damage", p=>A(p,0.05f)), ("Conduit","+arcane mark duration", p=>p.ArcaneMarkDur+=0.6f), ("Shellguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Overcharge","+16% crit damage", p=>CritD(p,0.16f)), ("Attunement","+6% damage", p=>A(p,0.06f)), ("Sigil Ward","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}), ("Focus","+30 max health", p=>HP(p,30f)),
-        ("Singular","+6% damage", p=>A(p,0.06f)), ("Feedback Loop","+crit-heal", p=>p.ArcaneCritHealBonus+=0.04f), ("Blink Step","+move speed", p=>Sp(p,0.4f)), ("Shieldguard","+4% resistance", p=>Res(p,0.04f)),
-        ("Missile","+5% damage", p=>A(p,0.05f)), ("Wardplate","+30 max health", p=>HP(p,30f)), ("Amplifier","+12% crit damage", p=>CritD(p,0.12f)), ("Runeguard","+5% resistance", p=>Res(p,0.05f)),
-        ("Barrage ★","+15% damage, +10% proj speed", p=>{A(p,0.15f); p.S.ProjSpeed+=0.1f;}), ("Conduit Sovereign ★","+13% damage, +10% spell range", p=>{A(p,0.13f); p.S.SpellRange+=0.1f;}),
-        ("Ascendant Mind ★","+15% damage, +10% crit, +40% crit damage", p=>{A(p,0.15f); Crit(p,0.1f); CritD(p,0.4f);}), ("Warpguard ★","+12% resistance, +60 health", p=>{Res(p,0.12f); HP(p,60f);}),
+        ("Volley","+8% projectile speed", p=>Prj(p,0.08f)), ("Attune","+6% arcane damage", p=>p.ArcanePowerMul+=0.06f), ("Recall","+0.8 dash distance", p=>Dash(p,0.8f)), ("Arcane Shell","+4% resistance", p=>Res(p,0.04f)),
+        ("Precision","+4% crit chance", p=>Crit(p,0.04f)), ("Farcast","+8% spell range", p=>Rng(p,0.08f)), ("Swiftcast","+6% cast speed", p=>Cast(p,0.94f)), ("Ward","+30 max health", p=>HP(p,30f)),
+        ("Multishot","+10% projectile speed", p=>Prj(p,0.1f)), ("Empower","+14% crit damage", p=>CritD(p,0.14f)),
+        ("Overload","+0.6s arcane mark", p=>p.ArcaneMarkDur+=0.6f), ("Resonance","+7% arcane damage", p=>p.ArcanePowerMul+=0.07f),
+        ("Blink Step","+1.2 dash distance", p=>Dash(p,1.2f)), ("Deep Reserve","+0.5 max mana", p=>Mana(p,0.5f)),
+        ("Sigilplate","+4% resistance", p=>Res(p,0.04f)), ("Feedback","+4% crit-heal", p=>p.ArcaneCritHealBonus+=0.04f),
+        ("Barrage","+8% arcane dmg, +8% proj speed", p=>{p.ArcanePowerMul+=0.08f; Prj(p,0.08f);}), ("Conduit","+0.8s mark, +8% range", p=>{p.ArcaneMarkDur+=0.8f; Rng(p,0.08f);}),
+        ("Phase Step","dash recovers faster", p=>DashCut(p,0.86f)), ("Shellguard","+30 HP, +4% resist", p=>{HP(p,30f); Res(p,0.04f);}),
+        ("Overcharge","+18% crit damage", p=>CritD(p,0.18f)), ("Amplify","+9% arcane damage", p=>p.ArcanePowerMul+=0.09f),
+        ("Warp","+1 dash charge", p=>p.S.DashCharges++), ("Focus","+35 max health", p=>HP(p,35f)),
+        ("Singular","+14% projectile speed", p=>Prj(p,0.14f)), ("Missile","+8% arcane damage", p=>p.ArcanePowerMul+=0.08f),
+        ("Sigil Storm","+1s arcane mark", p=>p.ArcaneMarkDur+=1f), ("Attunement","+9% range, +7% area", p=>{Rng(p,0.09f); Area(p,0.07f);}),
+        ("Flicker","+1.6 dash distance", p=>Dash(p,1.6f)), ("Mana Font","+0.05 mana per hit", p=>Regen(p,0.05f)),
+        ("Runeguard","+5% resistance", p=>Res(p,0.05f)), ("Feedback Loop","+5% crit-heal", p=>p.ArcaneCritHealBonus+=0.05f),
+        ("Barrage ★","+18% arcane damage, +20% proj speed", p=>{p.ArcanePowerMul+=0.18f; Prj(p,0.2f);}),                                 // K1
+        ("Conduit Sovereign ★","+2s mark, +12% range, +12% arcane dmg", p=>{p.ArcaneMarkDur+=2f; Rng(p,0.12f); p.ArcanePowerMul+=0.12f;}), // K2
+        ("Blinkmaster ★","+3 dash distance, +1 charge, fast recovery", p=>{Dash(p,3f); p.S.DashCharges++; DashCut(p,0.75f);}),           // K3
+        ("Warpguard ★","+12% resist, +60 HP, +8% crit-heal", p=>{Res(p,0.12f); HP(p,60f); p.ArcaneCritHealBonus+=0.08f;}),               // K4
     };
     private static HiddenRoute[] ArcaneRoutes() => new[]{
-        new HiddenRoute { Name="Spellblade", Desc="hidden — +12% crit, +30% crit damage, +crit-heal", Req=R5, Apply=p=>{Crit(p,0.12f); CritD(p,0.3f); p.ArcaneCritHealBonus+=0.06f;} },
-        new HiddenRoute { Name="Archmage", Desc="hidden — +15% damage, +10% range, +40 health, +proj speed", Req=R9, Apply=p=>{A(p,0.15f); p.S.SpellRange+=0.1f; HP(p,40f); p.S.ProjSpeed+=0.1f;} },
-        new HiddenRoute { Name="Singularity", Desc="hidden — +18% damage, +12% crit, +50% crit damage, +crit-heal", Req=R13, Apply=p=>{A(p,0.18f); Crit(p,0.12f); CritD(p,0.5f); p.ArcaneCritHealBonus+=0.08f;} },
+        new HiddenRoute { Name="Spellblade", Desc="+12% crit, +30% crit dmg, +25% proj speed", Req=ArcA, Apply=p=>{Crit(p,0.12f); CritD(p,0.3f); Prj(p,0.25f); p.ArcaneCritHealBonus+=0.06f;} },
+        new HiddenRoute { Name="Phase Walker", Desc="+3 dash distance, +1 charge, +1 mana", Req=ArcC, Apply=p=>{Dash(p,3f); p.S.DashCharges++; DashCut(p,0.8f); Mana(p,1f); Res(p,0.12f);} },
+        new HiddenRoute { Name="Singularity", Desc="+25% arcane dmg, +12% crit, +50% crit dmg", Req=ArcAB, Apply=p=>{p.ArcanePowerMul+=0.25f; Crit(p,0.12f); CritD(p,0.5f); p.ArcaneCritHealBonus+=0.08f;} },
     };
 
     // ===== fallback generic (unused now that all 9 are themed) =====

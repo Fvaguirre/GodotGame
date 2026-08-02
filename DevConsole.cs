@@ -162,6 +162,22 @@ public partial class DevConsole : CanvasLayer
                 Print($"perf overlay {(on ? "ON" : "OFF")} (whole lobby)");
                 return;
             }
+            case "routes": case "unlockroutes": case "hiddenroutes":
+            {
+                // bare 'routes' TOGGLES: if any of the 27 are still hidden, reveal them all; otherwise wipe the catalogue.
+                bool on = Perks.DiscoveredCount < Perks.RouteTotal;
+                if (parts.Length > 1)
+                {
+                    string a = parts[1].ToLowerInvariant();
+                    on = a == "on" || a == "all" || a == "true" || a == "1";
+                }
+                Perks.SetAllDiscovered(on);
+                Print(on
+                    ? $"hidden routes: ALL {Perks.RouteTotal} catalogued (9 witches x 3) — open the Coven page to read their names + node paths."
+                    : "hidden routes: catalogue CLEARED — all 27 are '??? undiscovered' again.");
+                Print("  (this is the discovery log only; a route still fires in a run when you actually own its node-set)");
+                return;
+            }
             case "listplayers": ListPlayers(); return;
             case "listallspellcombos": ListCombos(); return;
             case "listallspellcombominors": ListMinors(); return;
@@ -306,6 +322,12 @@ public partial class DevConsole : CanvasLayer
                 float ht = parts.Length > 2 && float.TryParse(parts[2], out var hh) ? hh : -1f;
                 float lat = parts.Length > 3 && float.TryParse(parts[3], out var ll) ? ll : -999f;
                 Print(g.Player.ToggleThirdPersonPlay(d, ht, lat));
+                return;
+            }
+            case "fppose": case "handpose":
+            {
+                var g = Game.I; if (g == null || g.Player == null) { Print("no game."); return; }
+                Print(g.Player.ToggleFpHandPose());
                 return;
             }
             case "colliders": case "collision": case "col":
@@ -657,6 +679,7 @@ public partial class DevConsole : CanvasLayer
         Print("listplayers");
         Print("listallzombies                             (enemy types + uids)   [alias: listfoes]");
         Print("spawnfoe <uid> <count>                     (spawn foes near you)   [alias: spawnfoes]");
+        Print("routes [on|off]                            (TOGGLE: catalogue all 27 hidden perk routes vs none)   [alias: unlockroutes, hiddenroutes]");
         Print("sky                                        (force-enter the jungle Sky-Islands ritual now; run again to exit)   [alias: skyritual]");
         Print("ultwindow [witch uid]                      (preview the ally ult-cast cutout window — co-op-only feature)");
         Print("singleplayerultwindow [true|false]         (toggle: your OWN ults pop a cutout in single player for testing)");

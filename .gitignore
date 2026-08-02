@@ -16,11 +16,20 @@ export_presets.cfg
 *.userprefs
 mono_crash.*.json
 
-# ---- Claude Code (local machine state/settings) ----
-.claude/
+# ---- Claude Code ----
+# Version the shareable config (agents/commands/skills, settings.json) so the
+# handoff system is durable; ignore only machine-local state + the local override.
+.claude/settings.local.json
+.claude/*.local.json
 
-# ---- Local MCP config ----
+# ---- Local MCP config (contains the Meshy API key — never commit) ----
 .mcp.json
+
+# ---- AI knowledge-system caches (generated; safe to clear) ----
+# Meshy MCP payloads + other cached tool output (.cache/meshy/)
+.cache/
+# filtered-command full logs (run-filtered.ps1)
+artifacts/logs/
 
 # ---- AI visual-test harness artifacts (generated; safe to clear between runs) ----
 artifacts/ai/

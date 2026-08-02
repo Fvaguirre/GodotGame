@@ -206,7 +206,7 @@ public partial class Lobby : Control
         var v = TabBody("Graphics");
         var g = Game.I;
         var quality = new OptionButton();
-        quality.AddItem("Low"); quality.AddItem("Medium"); quality.AddItem("High");
+        quality.AddItem("Low"); quality.AddItem("Medium"); quality.AddItem("High"); quality.AddItem("Ultra");   // Ultra adds SSIL (fake GI) — the priciest effect
         quality.Selected = g != null ? g.GfxQuality : 2;
         quality.ItemSelected += idx => { Game.I?.SetGfxQuality((int)idx); Game.I?.SaveGold(); SyncGraphicsChecks(); };
         v.AddChild(Row("Quality Preset", quality));
@@ -269,7 +269,16 @@ public partial class Lobby : Control
         mode.ItemSelected += idx => { if (Game.I != null) { Game.I.WindowMode = (int)idx; Game.I.ApplyWindow(); Game.I.SaveGold(); if (_res != null) _res.Disabled = idx == 1; } };
         v.AddChild(Row("Window Mode", mode));
         _res = new OptionButton();
-        foreach (var r in Game.ResChoices) _res.AddItem($"{r.X} × {r.Y}");
+        // ApplyWindow clamps any pick to the usable rect (taskbar excluded), so an entry bigger than this monitor would
+        // claim one size and quietly hand back another. Label those instead of lying about them.
+        var usable = DisplayServer.ScreenGetUsableRect(DisplayServer.WindowGetCurrentScreen()).Size;
+        for (int i = 0; i < Game.ResChoices.Length; i++)
+        {
+            var r = Game.ResChoices[i];
+            bool fits = r.X <= usable.X && r.Y <= usable.Y;
+            _res.AddItem(fits ? $"{r.X} × {r.Y}" : $"{r.X} × {r.Y}  (larger than this screen)");
+            if (!fits) _res.SetItemDisabled(i, true);
+        }
         _res.Selected = g != null ? g.ResIndex : 2;
         _res.Disabled = g != null && g.WindowMode == 1;
         _res.ItemSelected += idx => { if (Game.I != null) { Game.I.ResIndex = (int)idx; Game.I.ApplyWindow(); Game.I.SaveGold(); } };
@@ -281,6 +290,19 @@ public partial class Lobby : Control
         fps.Selected = fpsSel;
         fps.ItemSelected += idx => { Game.I?.SetMaxFps(Game.FpsChoices[(int)idx]); Game.I?.SaveGold(); };
         v.AddChild(Row("Max FPS", fps));
+        // (PERF) 3D Render Scale — the biggest lever at high resolutions; renders the world lower and upscales, UI stays sharp.
+        var rscale = new OptionButton();
+        int rsSel = Game.RenderScaleChoices.Length - 1;
+        for (int i = 0; i < Game.RenderScaleChoices.Length; i++) { rscale.AddItem($"{Mathf.RoundToInt(Game.RenderScaleChoices[i] * 100)}%"); if (g != null && Mathf.Abs(g.RenderScale - Game.RenderScaleChoices[i]) < 0.01f) rsSel = i; }
+        rscale.Selected = rsSel;
+        rscale.ItemSelected += idx => { Game.I?.SetRenderScale(Game.RenderScaleChoices[(int)idx]); Game.I?.SaveGold(); };
+        v.AddChild(Row("Render Scale (3D)", rscale));
+        // (UPSCALER) how the reduced 3D image is scaled up — FSR 2.2 is the DLSS-equivalent (temporal, near-native) Godot ships.
+        var up = new OptionButton();
+        up.AddItem("Bilinear"); up.AddItem("FSR 1.0"); up.AddItem("FSR 2.2");
+        up.Selected = g != null ? g.UpscaleMode : 0;
+        up.ItemSelected += idx => { Game.I?.SetUpscaleMode((int)idx); Game.I?.SaveGold(); };
+        v.AddChild(Row("Upscaler", up));
         var view = new OptionButton();
         view.AddItem("Low"); view.AddItem("Medium"); view.AddItem("High");
         view.Selected = g != null ? g.ViewDist : 1;

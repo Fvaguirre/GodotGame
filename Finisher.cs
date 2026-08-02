@@ -5,7 +5,7 @@ using Godot;
 // Granted by a FinCard (Upgrade.cs), equipped via Player.EquipFinisher, and EXECUTED in the big
 // switch in Player.ExecuteFinisher (each case calls a Fin* method + an arm pose). To add one:
 // extend this enum + FinMeta, add the execution case in Player, add a FinCard Def in UpgradePool.
-public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls, SoulReap, HexChains, DoomSigil, FireWall, Fireball, EmberFervor, LunarNova, CrescentStorm, ArcaneBlink, ArcaneBlast }   // ArcaneBlink/ArcaneBlast = Arcane (NEW)
+public enum FinType { Wave, Beam, Volley, Fullmod, Heal, Root, Swarm, HexField, Crescendo, Halo, Lance, BloodNova, CrimsonRush, BloodCurse, PoisonField, SeedMine, ThornSkin, Updraft, WindRush, WindSlice, IceSpike, FrostVault, FrostWalls, SoulReap, HexChains, DoomSigil, FireWall, Fireball, EmberFervor, LunarNova, CrescentStorm, ArcaneBlink, ArcaneBlast, DanseMacabre, Rout, CurtainCall }   // ArcaneBlink/ArcaneBlast = Arcane; DanseMacabre/Rout/CurtainCall = the Doom kit (NEW)
 
 public static class FinMeta
 {
@@ -43,6 +43,9 @@ public static class FinMeta
         FinType.CrescentStorm => "Crescent Storm",
         FinType.ArcaneBlink => "Arcane Blink",
         FinType.ArcaneBlast => "Arcane Torrent",
+        FinType.DanseMacabre => "Danse Macabre",
+        FinType.Rout => "Rout",
+        FinType.CurtainCall => "Curtain Call",
         _ => "?" };
 
     public static bool Passive(FinType t) => t == FinType.Crescendo;   // no key-press, but still occupies a slot
@@ -82,6 +85,9 @@ public static class FinMeta
         FinType.CrescentStorm => "Looses a storm of homing crescent blades that arc out and scythe through nearby foes.",
         FinType.ArcaneBlink => "Blink the way you're moving in a flash of raw arcane (reach grows with rarity, ~9→23u). An arcane rift erupts where you left AND where you land, detonating a moment later for area damage.",
         FinType.ArcaneBlast => "Unleash a wide torrent of raw arcane straight ahead — hits everything in a broad line and hurls them back.",
+        FinType.DanseMacabre => "Aimed where you're looking: everything in the area is doomed, and every doomed foe turns on whoever is nearest and beats it with its own attacks. The blows they land feed their victims' Doom.",
+        FinType.Rout => "Dooms everything around you and sends it fleeing in a panic. Little damage — you're buying room, and a fleeing foe detonates inside its own pack.",
+        FinType.CurtainCall => "A cone of dread: the heaviest Doom load in the kit, and doomed foes drop to their knees, held in place and taking amplified damage.",
         _ => "" };
 
     public static DamageType DType(FinType t) => t switch {
@@ -111,6 +117,9 @@ public static class FinMeta
         FinType.SoulReap => DamageType.Curse,
         FinType.HexChains => DamageType.Curse,
         FinType.DoomSigil => DamageType.Curse,
+        FinType.DanseMacabre => DamageType.Curse,
+        FinType.Rout => DamageType.Curse,
+        FinType.CurtainCall => DamageType.Curse,
         FinType.FireWall => DamageType.Ember,
         FinType.Fireball => DamageType.Ember,
         FinType.EmberFervor => DamageType.Ember,

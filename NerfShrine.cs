@@ -1,8 +1,12 @@
 using Godot;
 
-// NerfShrine.cs — a hidden GROVE shrine you find by exploring. Each weakens the coming boss fight in its own way (see Game
-// for the logic). Kinds: Summoner (ward-defend → an arcane unicorn that nukes the boss on spawn), Sacrifice (pay 40% HP +
-// slay a miniboss per player → a crimson drain sigil under the boss), Sanctuary (pay souls → a 2 HP/s party regen in the fight).
+// NerfShrine.cs — the standing GROVE shrine you find by exploring; ONE at a time, rolled at random from the three kinds, and
+// single-use (see Game for the logic + the escalating soul toll). Each weakens the coming boss fight on its OWN axis:
+//   Summoner  (damage)       — hold the ward 45s → an arcane unicorn that nukes the boss on spawn
+//   Sacrifice (the siege)    — 40% HP + slay a guardian per player → the CRIMSON RITE opens in the boss fight: light one
+//                              blood-sigil per warden, a pentagram draws over the boss, then every non-boss foe is cut down
+//                              and the world stops spawning for 20s/warden (max 50s)
+//   Sanctuary (sustain)      — pay the toll → 1%-of-max-HP/s party regen for the whole fight
 // State: 0 dormant · 1 in-progress · 2 armed/complete. Not marked on the minimap until you're near it; once armed it lights up.
 public enum NerfKind { Summoner, Sacrifice, Sanctuary }
 
@@ -12,9 +16,10 @@ public partial class NerfShrine : Node3D
     public int NetId = 0;
     public bool Remote = false;
     public int State = 0;             // 0 dormant · 1 in-progress · 2 armed
+    public bool Stalled = false;      // (Summoner) State 1 but NOBODY is standing in the circle → the ward goes dim + stops turning
     public const float Radius = 4.0f; // hold-E interaction reach
 
-    private float _t;
+    private float _t, _wardSpin;
     private OmniLight3D _light;
     private MeshInstance3D _core;
     private StandardMaterial3D _coreMat;
@@ -93,7 +98,14 @@ public partial class NerfShrine : Node3D
     public override void _Process(double delta)
     {
         _t += (float)delta;
-        if (_ward != null) { _ward.Rotation = new Vector3(0, _t * 0.35f, 0); _ward.Scale = Vector3.One * (1f + Mathf.Sin(_t * 3f) * 0.02f); }   // the circle turns + breathes
+        if (_ward != null)
+        {
+            // held → the circle turns + breathes. STALLED (nobody inside) → it stops dead and shrinks slightly: an unmistakable
+            // "the rite has paused, get back in here" read that matches the frozen countdown.
+            if (!Stalled) { _wardSpin += (float)delta * 0.35f; _ward.Scale = Vector3.One * (1f + Mathf.Sin(_t * 3f) * 0.02f); }
+            else _ward.Scale = _ward.Scale.Lerp(Vector3.One * 0.94f, (float)delta * 4f);
+            _ward.Rotation = new Vector3(0, _wardSpin, 0);
+        }
         if (_core != null)
         {
             _core.Rotation = new Vector3(0, _t * 0.8f, 0);

@@ -320,10 +320,13 @@ public partial class Hud : Control
             DrawCircle(sp, 4.8f * u, new Color(col.R, col.G, col.B, 0.28f));
             Diamond(sp, 3.6f * u, col);
         }
-        foreach (var gp in g.GalePads)   // (GALE NET) wind pad: a dot with a tick pointing the way it launches you (dir rotated into the player-locked frame)
+        // (GALE NET) wind pad: a dot with a tick pointing the way it launches you (dir rotated into the player-locked frame).
+        // NOT edge-clamped — with 20 pads, clamping pinned a permanent ring of them to the rim; they only show when actually on the radar.
+        foreach (var gp in g.GalePads)
         {
             if (gp == null || !GodotObject.IsInstanceValid(gp) || !g.Discovered(gp.GlobalPosition)) continue;
-            var sp = Clamp(Plot(gp.GlobalPosition, out _));
+            var sp = Plot(gp.GlobalPosition, out bool gpIn);
+            if (!gpIn || sp.DistanceTo(ctr) > radius - 4f * u) continue;
             var wc = DamageTypes.Col(DamageType.Wind).Lerp(Colors.White, 0.2f);
             var ld = gp.LaunchDir;
             float tx = ld.X * cosY - ld.Z * sinY, tz = ld.X * sinY + ld.Z * cosY;
@@ -343,16 +346,30 @@ public partial class Hud : Control
             DrawRect(new Rect2(sp.X + 1.3f * u, sp.Y - 3.2f * u, 1.7f * u, 5f * u), mc);      // right prong
             DrawRect(new Rect2(sp.X - 3f * u, sp.Y + 1.4f * u, 6f * u, 1.7f * u), mc);        // base
         }
-        // (NERFER) the 3 boss-weakening shrines — ALWAYS revealed (no fog gate) and edge-CLAMPED to the radar rim, so they
-        // read as a standing objective you can navigate to from anywhere. Brighter + a pulse ring once armed.
+        // (NERFER) the standing boss-weakening shrine — ALWAYS revealed (no fog gate) and edge-CLAMPED to the radar rim, so it
+        // reads as an objective you can navigate to from anywhere. Once it's ARMED (State 2) it's spent — drop the pin entirely
+        // so a finished shrine stops competing with live objectives for your attention.
         foreach (var s in g.Nerfers)
         {
-            if (s == null || !GodotObject.IsInstanceValid(s)) continue;
+            if (s == null || !GodotObject.IsInstanceValid(s) || s.State == 2) continue;
             var sp = Clamp(Plot(s.GlobalPosition, out var ir));
             var nc = s.IconColor;
             if (!ir) DrawCircle(sp, 6.5f * u, new Color(nc.R, nc.G, nc.B, 0.25f));     // off-radar: a soft halo so the clamped pin reads as "over there"
             DrawArc(sp, 4.8f * u, 0, Tau, 18, nc, (s.State == 2 ? 2.4f : 1.6f) * u);   // ring
             DrawCircle(sp, 2f * u, nc);                                                // core
+        }
+        // (CRIMSON RITE) the blood sigils — an active objective, so always revealed and edge-clamped like the nerfer shrine.
+        // A LIT sigil is done: it drops off the radar entirely (per design), leaving only the ones still needing a warden.
+        foreach (var rs in g.RiteSigils)
+        {
+            if (rs == null || !GodotObject.IsInstanceValid(rs) || rs.Lit) continue;
+            var sp = Clamp(Plot(rs.GlobalPosition, out var rsIn));
+            var rc2 = RiteSigil.Col;
+            if (!rsIn) DrawCircle(sp, 6.5f * u, new Color(rc2.R, rc2.G, rc2.B, 0.25f));      // off-radar halo → "over there"
+            DrawArc(sp, 4.6f * u, 0, Tau, 18, new Color(rc2.R, rc2.G, rc2.B, 0.55f), 1.5f * u);
+            if (rs.Charge > 0.001f)                                                           // partial fill reads on the pin too
+                DrawArc(sp, 4.6f * u, -Mathf.Pi / 2f, -Mathf.Pi / 2f + Tau * Mathf.Clamp(rs.Charge, 0f, 1f), 20, rc2, 2.6f * u);
+            DrawCircle(sp, 1.9f * u, rc2);
         }
         // vendors — each its own icon (fog-gated like the other discoverables)
         if (g.VendorMystic != null && GodotObject.IsInstanceValid(g.VendorMystic) && g.Discovered(g.VendorMystic.GlobalPosition))
@@ -796,10 +813,10 @@ public partial class Hud : Control
             if (p.ShieldBreakT > 0.001f) Vignette(vp, new Color(0.42f, 0.78f, 1f), Mathf.Clamp(p.ShieldBreakT / 0.6f, 0f, 1f) * 0.7f);
         }
 
-        // (CONTINUOUS) top-left: shrines found (replaces the wave counter) + the run score
-        int shrDone = g.ShrinesDone;
-        string shrStr = $"{shrDone}/{Game.ShrinesTotal} SHRINES";
-        T(_head, new Vector2(m, m + 24 * u), shrStr, 24 * u, shrDone >= Game.ShrinesTotal ? new Color(1f, 0.86f, 0.35f) : Gold, HorizontalAlignment.Left, -1, Mathf.RoundToInt(3 * u));
+        // (CONTINUOUS) top-left: the standing nerfer shrine + its escalating soul toll (replaces the old x/3 counter) + the run score
+        var curNerf = g.CurrentNerfer;
+        var shrCol = curNerf != null && curNerf.State == 0 ? NerfShrine.KindColor(curNerf.Kind).Lerp(Colors.White, 0.35f) : Gold;
+        T(_head, new Vector2(m, m + 24 * u), g.NerferHudLine(), 22 * u, shrCol, HorizontalAlignment.Left, -1, Mathf.RoundToInt(3 * u));
         T(_body, new Vector2(m, m + 50 * u), $"{g.Score} score", 15 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(2 * u));
 
         // (CONTINUOUS) DIFFICULTY meter — a climbing tier + escalating name + intensifying colour + a bar filling within the band
@@ -811,7 +828,7 @@ public partial class Hud : Control
             float frac = Mathf.Clamp((d - lo) / Mathf.Max(0.01f, hi - lo), 0f, 1f);
             var hc = band.col;
             if (bi >= DiffBands.Length - 3) { float pz = 0.72f + 0.28f * Mathf.Sin((float)Time.GetTicksMsec() * 0.008f); hc = new Color(hc.R * pz + (1 - pz), hc.G * pz, hc.B * pz + (1 - pz) * 0.5f, 1f); }   // top bands seethe
-            var ssz = _head.GetStringSize(shrStr, HorizontalAlignment.Left, -1, Mathf.RoundToInt(24 * u));
+            var ssz = _head.GetStringSize(g.NerferHudLine(), HorizontalAlignment.Left, -1, Mathf.RoundToInt(22 * u));
             float hx = m + ssz.X + 26 * u, hw = 150 * u, hh = 13 * u;
             T(_body, new Vector2(hx, m + 10 * u), $"DIFFICULTY  ·  tier {Mathf.FloorToInt(d)}", 12 * u, GoldDim, HorizontalAlignment.Left, -1, Mathf.RoundToInt(1 * u));
             DrawRect(new Rect2(hx, m + 12 * u, hw, hh), new Color(0, 0, 0, 0.5f));
@@ -894,6 +911,9 @@ public partial class Hud : Control
         if (p != null && g.PlayerInHaunt && g.State == GameState.Playing) DrawHaunt(g, vp, u);   // (HAUNT) "in the zone" banner + break meter
         if (p != null) DrawRituals(u);
         if (p != null && g.SummonerActive) DrawSummonerTimer(g, vp, u);   // (NERFER) the Summoning defend-timer
+        // (NERFER Sacrifice) sigils → pentagram → silence. Gated on Playing: purging 30 foes almost always pops the level-up
+        // pick-3 a beat later, and the tracker was drawing straight through its header.
+        if (p != null && g.State == GameState.Playing && (g.RiteOpen || g.RiteDrawing || g.SpawnStalled)) DrawCrimsonRite(g, vp, u);
         if (p != null && g.InIntermission) DrawIntermission(g, vp, u);
         if (p != null && p.Downed) DrawDowned(g, vp, u);
         if (p != null && g.State == GameState.Playing && !g.WorldRunning) DrawWaiting(g, vp, u);
@@ -1869,13 +1889,74 @@ public partial class Hud : Control
     private void DrawSummonerTimer(Game g, Vector2 vp, float u)
     {
         float tl = g.SummonerTimeLeft;
+        bool held = g.SummonerHeld;
         var col = NerfShrine.KindColor(NerfKind.Summoner);
         float y = vp.Y * 0.11f;
-        T(_body, new Vector2(0, y), "DEFEND THE SUMMONING", 20 * u, col.Lerp(Colors.White, 0.3f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
-        T(_body, new Vector2(0, y + 26 * u), $"{Mathf.CeilToInt(tl)}s", 26 * u, Colors.White, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        // (FIX) the clock only runs while someone stands in the circle — say so loudly when it's stalled, or the frozen number reads as a bug
+        var warn = new Color(1f, 0.42f, 0.32f);
+        float pulse = 0.65f + 0.35f * Mathf.Sin((float)Time.GetTicksMsec() * 0.008f);
+        T(_body, new Vector2(0, y), held ? "HOLD THE SUMMONING" : "STAND IN THE CIRCLE!", 20 * u,
+          held ? col.Lerp(Colors.White, 0.3f) : new Color(warn.R, warn.G, warn.B, pulse), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        T(_body, new Vector2(0, y + 26 * u), $"{Mathf.CeilToInt(tl)}s", 26 * u,
+          held ? Colors.White : new Color(0.72f, 0.6f, 0.6f), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
         float bw = 260 * u, bh = 8 * u, bx = vp.X / 2f - bw / 2f, by = y + 62 * u;
         DrawRect(new Rect2(bx - 1.5f * u, by - 1.5f * u, bw + 3 * u, bh + 3 * u), new Color(0, 0, 0, 0.55f));
-        DrawRect(new Rect2(bx, by, bw * Mathf.Clamp(tl / 45f, 0f, 1f), bh), col);
+        DrawRect(new Rect2(bx, by, bw * Mathf.Clamp(tl / Game.SummonerDur, 0f, 1f), bh), held ? col : col.Darkened(0.5f));
+    }
+
+    // (NERFER Sacrifice) the Crimson Rite tracker. Three states, one slot: how many sigils are still unlit → the pentagram
+    // drawing itself → the silence counting down. Sits just under the Summoning band so the two can never collide.
+    private void DrawCrimsonRite(Game g, Vector2 vp, float u)
+    {
+        var col = RiteSigil.Col.Lerp(Colors.White, 0.25f);
+        float y = vp.Y * 0.11f + (g.SummonerActive ? 84 * u : 0f);
+        string top; float frac; Color bar;
+        if (g.SpawnStalled)
+        {
+            top = "THE HORDE IS BROKEN";
+            frac = Mathf.Clamp(g.SpawnStallT / Game.RiteStallCap, 0f, 1f);
+            bar = new Color(0.55f, 0.95f, 0.6f);   // green: this one is RELIEF, not a threat — read it apart from the red states
+            T(_body, new Vector2(0, y), top, 20 * u, bar, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(0, y + 26 * u), $"{Mathf.CeilToInt(g.SpawnStallT)}s of silence", 22 * u, Colors.White, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+        }
+        else if (g.RiteDrawing)
+        {
+            float pulse = 0.6f + 0.4f * Mathf.Sin((float)Time.GetTicksMsec() * 0.012f);
+            T(_body, new Vector2(0, y), "THE RITE IS COMPLETE", 20 * u, new Color(col.R, col.G, col.B, pulse), HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(0, y + 26 * u), "blood answers…", 18 * u, Colors.White, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            frac = g.RiteDrawProgress; bar = col;   // the bar tracks the figure actually drawing itself
+
+        }
+        else
+        {
+            int lit = g.RiteLit, tot = g.RiteTotal;
+            T(_body, new Vector2(0, y), "THE CRIMSON RITE", 20 * u, col, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            T(_body, new Vector2(0, y + 26 * u), tot > 1 ? $"{lit}/{tot} sigils lit — stand in one" : "stand in the sigil", 18 * u, Colors.White, HorizontalAlignment.Center, vp.X, Mathf.RoundToInt(2 * u));
+            // sum the PARTIAL fills, not just the lit count — solo (1 sigil) the bar would otherwise sit dead at 0 for the whole
+            // 3s and then snap to full, which reads as a broken meter rather than progress
+            float sum = 0f;
+            foreach (var rs in g.RiteSigils) if (rs != null && GodotObject.IsInstanceValid(rs)) sum += rs.Lit ? 1f : Mathf.Clamp(rs.Charge, 0f, 1f);
+            frac = tot > 0 ? sum / tot : 0f; bar = col;
+        }
+        float bw = 260 * u, bh = 8 * u, bx = vp.X / 2f - bw / 2f, by = y + 56 * u;
+        DrawRect(new Rect2(bx - 1.5f * u, by - 1.5f * u, bw + 3 * u, bh + 3 * u), new Color(0, 0, 0, 0.55f));
+        DrawRect(new Rect2(bx, by, bw * frac, bh), bar);
+        // per-sigil pips under the bar, so "which one still needs somebody" is countable at a glance
+        if (!g.SpawnStalled && !g.RiteDrawing && g.RiteTotal > 1)
+        {
+            float pw = 22 * u, gap = 6 * u, tot2 = g.RiteTotal * pw + (g.RiteTotal - 1) * gap;
+            float px0 = vp.X / 2f - tot2 / 2f;
+            int i = 0;
+            foreach (var rs in g.RiteSigils)
+            {
+                if (rs == null || !GodotObject.IsInstanceValid(rs)) { i++; continue; }
+                float f = rs.Lit ? 1f : Mathf.Clamp(rs.Charge, 0f, 1f);
+                var r = new Rect2(px0 + i * (pw + gap), by + 14 * u, pw, 5 * u);
+                DrawRect(r, new Color(0, 0, 0, 0.5f));
+                DrawRect(new Rect2(r.Position.X, r.Position.Y, pw * f, r.Size.Y), rs.Lit ? col : col.Darkened(0.35f));
+                i++;
+            }
+        }
     }
 
     private void DrawRituals(float u)
@@ -1951,8 +2032,40 @@ public partial class Hud : Control
             float x = sp.X - w / 2f, y = sp.Y;
             DrawRect(new Rect2(x - 1 * u, y - 1 * u, w + 2 * u, h + 2 * u), new Color(0, 0, 0, 0.6f));
             var fill = e.IsGoblin ? new Color(1f, 0.84f, 0.3f) : new Color(0.95f, 0.3f, 0.32f).Lerp(new Color(0.45f, 0.9f, 0.4f), frac);
+            // (HOLLOW MOON PHASE 2) UNTOUCHABLE: while he's getting back up or spinning, the bar drains to a pulsing arcane
+            // slab with a padlock. Players MUST be able to tell "my damage is doing nothing" apart from "he's just tanky".
+            if (e.IsBoss && e.BossInvuln)
+            {
+                float pulse = 0.55f + 0.45f * Mathf.Sin((Time.GetTicksMsec() % 700) / 700f * Tau);
+                fill = new Color(0.52f, 0.34f, 0.95f).Lerp(new Color(0.92f, 0.86f, 1f), pulse);
+            }
             DrawRect(new Rect2(x, y, w * frac, h), fill);
             Frame(new Rect2(x, y, w, h), e.Elite ? new Color(1f, 0.86f, 0.25f) : new Color(0, 0, 0, 0.7f), Mathf.Max(1f, 1.4f * u));
+            if (e.IsBoss && e.BossInvuln)
+            {
+                float pulse = 0.55f + 0.45f * Mathf.Sin((Time.GetTicksMsec() % 700) / 700f * Tau);
+                Frame(new Rect2(x - 2f * u, y - 2f * u, w + 4f * u, h + 4f * u), new Color(0.85f, 0.78f, 1f, 0.35f + 0.5f * pulse), Mathf.Max(1f, 1.6f * u));
+                T(_head, new Vector2(x, y + h + 1.5f * u), "\U0001F512 IMMUNE", 10f * u, new Color(0.85f, 0.78f, 1f, 0.6f + 0.4f * pulse), HorizontalAlignment.Center, w, Mathf.RoundToInt(1 * u));
+            }
+            // (DOOM) banked damage IS a slice of this health bar, so draw it as one: the claimed portion sits at the
+            // leading edge of the fill, showing exactly how much of what's left is already spoken for. A number floating
+            // overhead couldn't be read in a crowd; this can. The hairline above is the fuse draining toward detonation,
+            // and the whole thing flips to a fast red pulse the moment the bank covers the rest of the bar — the tell
+            // that says "it's dead already, hit it now or watch it go".
+            if (e.Doomed && frac > 0f)
+            {
+                float dfrac = e.MaxHp > 0f ? Mathf.Clamp(e.DoomShownBank / e.MaxHp, 0f, 1f) : 0f;
+                float claimed = Mathf.Min(dfrac, frac);
+                bool lethal = e.DoomShownLethal;
+                float period = lethal ? 320f : 950f;
+                float dpulse = 0.5f + 0.5f * Mathf.Sin((Time.GetTicksMsec() % (ulong)period) / period * Tau);
+                var dcol = lethal
+                    ? new Color(1f, 0.30f, 0.42f).Lerp(new Color(1f, 0.88f, 0.94f), dpulse)
+                    : new Color(0.58f, 0.26f, 0.82f).Lerp(new Color(0.84f, 0.60f, 1f), 0.35f + 0.3f * dpulse);
+                DrawRect(new Rect2(x + w * (frac - claimed), y, w * claimed, h), dcol);
+                float fz = Mathf.Clamp(e.DoomShownT / Enemy.DoomFuse, 0f, 1f);
+                if (fz > 0f) DrawRect(new Rect2(x, y - 2.8f * u, w * fz, 1.6f * u), new Color(0.78f, 0.55f, 1f, 0.9f));
+            }
             // (REMOVED the frozen blue "bank" bar — no banking now; the ice-block model already shows a foe is frozen/shatter-able)
             if (!e.Frozen && e.FreezeStacks > 0.5f)   // (NEW) freeze-stack indicator ❄ N/threshold
             {
@@ -2261,20 +2374,10 @@ public partial class Hud : Control
             }
             else { DrawArc(pc, 13 * u, 0, Tau, 24, Faint, 2f * u); T(_body, new Vector2(pc.X - 15 * u, pc.Y + 28 * u), i < KL.Length ? KL[i] : "?", 11 * u, new Color(1, 1, 1, 0.25f), HorizontalAlignment.Center, 30 * u); }
         }
-        int armed = 0; foreach (var f in p.Fin) if (f.Armed) armed++;
-        if (armed > 0)
-        {
-            int k = 0;
-            for (int i = 0; i < p.Fin.Count; i++)
-            {
-                var f = p.Fin[i]; if (!f.Armed) continue;
-                var fc = FinCol(p, f.Type);
-                var sc = new Vector2(c.X + (k - (armed - 1) / 2f) * 36 * u, c.Y);
-                DrawCircle(sc, 15 * u, new Color(fc.R, fc.G, fc.B, 0.16f));
-                Arc(sc, 17 * u, f.Window / 3.2f, fc, 2.5f * u);
-                k++;
-            }
-        }
+        // (REMOVED) a SECOND armed-finisher indicator used to draw a ring per armed finisher right at the reticle.
+        // The pip row above already shows readiness AND the keybind, so this was duplicate clutter over the crosshair.
+        // Note: the ring it drew was the only display of `f.Window` (how long the armed finisher stays up) — say the
+        // word if you want that countdown folded into the pip ring instead of the solid "armed" ring it draws now.
     }
 
     // Witching Hour fires the equipped right-click element, so its indicator follows that color

@@ -949,22 +949,22 @@ public partial class Game : Node3D
             }
         }
 
-        // (NERFER) the three Grove shrines — hold E to activate (each kind has its own flow/cost)
+        // (NERFER) the standing Grove shrine — hold E to pay your soul share; the shrine fires once every warden has paid
         for (int i = 0; i < _nerfers.Count; i++)
         {
             var s = _nerfers[i];
-            if (s == null || !GodotObject.IsInstanceValid(s)) continue;
-            bool can = s.Kind == NerfKind.Sanctuary ? (s.State < 2 && !_sanctuaryPaid.Contains(LocalPeer)) : (s.State == 0);
-            if (!can) continue;
+            if (s == null || !GodotObject.IsInstanceValid(s) || s.State != 0 || NerferPaidByMe) continue;
             float dn = (new Vector3(s.GlobalPosition.X, me.Y, s.GlobalPosition.Z) - me).LengthSquared();
             if (dn > NerfShrine.Radius * NerfShrine.Radius || dn >= best) continue;
             best = dn; var sh = s; need = InstantHold; ritualTarget = false;
-            prompt = sh.Kind switch
+            int share = NerferCostEach, paid = NerferPaidCount, needP = Mathf.Max(1, WardenCount);
+            string what = sh.Kind switch
             {
-                NerfKind.Summoner  => "E — begin the Summoning (defend ~45s)",
-                NerfKind.Sacrifice => "E — SACRIFICE: −40% HP + slay the guardians",
-                _                  => $"E — offer {SanctuaryShare} souls to the Sanctuary ({_sanctuaryPaid.Count}/{Mathf.Max(1, WardenCount)})",
+                NerfKind.Summoner  => "the Summoning (then defend the circle 45s)",
+                NerfKind.Sacrifice => "the Sacrifice (−40% HP, slay guardians → the Crimson Rite)",
+                _                  => "the Sanctuary (party regen in the fight)",
             };
+            prompt = needP > 1 ? $"E — pay {share} souls for {what}  [{paid}/{needP}]" : $"E — pay {share} souls for {what}";
             act = () => TryActivateNerfer(sh);
         }
 
@@ -1020,6 +1020,14 @@ public partial class Game : Node3D
     public bool Discovered(Vector3 w)   // outside the overworld there's no fog (maze/sky/expedition show everything)
         => !InOverworld || _discovered.Contains(CellKeyAt(Mathf.FloorToInt(w.X / DiscCell), Mathf.FloorToInt(w.Z / DiscCell)));
     public void ClearDiscovered() => _discovered.Clear();
+    public void DebugRevealAround(Vector3 c, float r)   // (DEV) lift the fog in a disc so map-pin behaviour is testable in a scenario
+    {
+        int cells = Mathf.CeilToInt(r / DiscCell) + 1;
+        int ccx = Mathf.FloorToInt(c.X / DiscCell), ccz = Mathf.FloorToInt(c.Z / DiscCell);
+        for (int cx = ccx - cells; cx <= ccx + cells; cx++)
+            for (int cz = ccz - cells; cz <= ccz + cells; cz++)
+                _discovered.Add(CellKeyAt(cx, cz));
+    }
     public void RevealMinimap()
     {
         if (!InOverworld || Player == null) return;
@@ -1186,6 +1194,10 @@ public partial class Game : Node3D
         InGameOptions = false; LobbyUi?.HideOptionsOverlay();   // (MP) if a client was in the pause options overlay when the host restarted, dismiss it
         s_dynLights = 0;   // reset the transient-light budget for a clean run
         if (CharSelectUi != null) CharSelectUi.Hide();
+        // a fresh run starts from base stats — otherwise last run's perks/routes/affinity cards, which mutate these
+        // fields directly, would still be sitting on the witch (ResetPerks only clears the bookkeeping, not the effects)
+        Player.S = new Stats();
+        Player.ResetWitchScalars();
         ConfigureWitch(s_witch < 0 ? 0 : s_witch);
         Player.ResetPerks();   // (ATTUNE) graph perks: buy nodes with attribute points earned per level (14 cap); hidden routes fire free
         MetaUnlocks.Apply(Player);   // (NEW) permanent cross-witch gold-tree unlocks (+finisher / +mod / +mana slot)
@@ -1701,6 +1713,7 @@ public partial class Game : Node3D
         Player.S = new Stats();
         Player.DamageMul = 1f; Player.NightAffinity = false; Player.Interventions = 0;
         Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = Player.EmberWitch = Player.ArcaneWitch = false;
+        Player.ResetWitchScalars();   // drop the OLD witch's perk/card scalars — S alone doesn't carry them
         ConfigureWitch(i);   // sets the new flag + primary/secondary + witch stats, and RetintHands rebuilds the body model
         Player.Hp = Player.S.MaxHp; Player.Mana = Player.S.ManaMax; Player.DashStock = Player.S.DashCharges;
     }
@@ -3176,9 +3189,12 @@ void fragment() {
         var start = near - dir * 16f + new Vector3((float)GD.RandRange(-7, 7), 0, (float)GD.RandRange(-7, 7));
         for (int i = 0; i < n; i++)
         {
-            var col = (CurBiome == Biome.Rainforest ? new Color(0.35f, 0.62f, 0.28f) : new Color(0.55f, 0.55f, 0.7f)).Lerp(new Color(0.72f, 0.7f, 0.42f), GD.Randf());
-            var leaf = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(0.22f, 0.02f, 0.32f) } };
-            var mm = Emissive(col, 0.35f); mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; mm.AlbedoColor = new Color(col.R, col.G, col.B, 0.7f); mm.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+            // (FIX) warm SATURATED autumn tones (rust-red → amber-gold), not a pale blue-gray that the old 0.35 emission washed to white
+            var col = (CurBiome == Biome.Rainforest ? new Color(0.30f, 0.50f, 0.20f) : new Color(0.62f, 0.18f, 0.05f)).Lerp(CurBiome == Biome.Rainforest ? new Color(0.50f, 0.58f, 0.24f) : new Color(0.80f, 0.46f, 0.09f), GD.Randf());
+            // (LEAVES) use a real authored single-leaf model (random of the 3) instead of a flat card, so the gust tumbles actual leaf shapes
+            string leafName = GD.Randi() % 3 == 0 ? "leaf_a" : GD.Randi() % 2 == 0 ? "leaf_b" : "leaf_c";
+            var leaf = new MeshInstance3D { Mesh = PropGlb.GetMesh(leafName), Scale = Vector3.One * (0.28f + GD.Randf() * 0.14f) };
+            var mm = Emissive(col, 0.10f); mm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; mm.AlbedoColor = new Color(col.R, col.G, col.B, 0.95f); mm.CullMode = BaseMaterial3D.CullModeEnum.Disabled;   // matte leaf, only a faint warm glow (was 0.35 → glowed white)
             leaf.MaterialOverride = mm; AddChild(leaf);
             var p0 = start + new Vector3((float)GD.RandRange(-3, 3), (float)GD.RandRange(0.6, 4.5), (float)GD.RandRange(-3, 3));
             leaf.GlobalPosition = p0; leaf.Rotation = new Vector3(GD.Randf() * 6f, GD.Randf() * 6f, GD.Randf() * 6f);
@@ -3698,12 +3714,7 @@ void sky(){
         var e = SpawnBossAt("boss", _bossLair.GlobalPosition + new Vector3(0, 0, 5f));   // emerges just in front of the gate; scales to the CURRENT wave (SpawnBossAt configs with Wave)
         if (e != null && BossNerfStacks > 0) e.ScaleBossPower(Mathf.Clamp(1f - 0.12f * BossNerfStacks, 0.4f, 1f));   // (FUTURE) the 3 nerfers weaken it
         _boss = e; _bossAddT = 5f; _bossWaveT = 22f;
-        if (_sacrificeArmed && e != null)   // (NERFER Sacrifice) drop the crimson drain sigil under the boss — drains up to 10% of his max while he stands in it
-        {
-            var sig = new BossDrainSigil(); AddChild(sig);
-            sig.GlobalPosition = new Vector3(e.GlobalPosition.X, 0.05f, e.GlobalPosition.Z);
-            NetMgr?.BroadcastDrainSigil(sig.GlobalPosition);
-        }
+        if (_sacrificeArmed && e != null) SpawnRiteSigils(e.GlobalPosition);   // (NERFER Sacrifice) the CRIMSON RITE opens — one sigil per warden, ringed around the arena
         _bossAddPool = new System.Collections.Generic.List<string> { "shade", "swarmer", "caster", "flyer", "brute", "diver", "hexer" };
         _bossAddGroup = 4 + WardenCount * 2; _bossDpsInit = false; _bossDmgAccum = 0f; _bossPrevDps = 0f; BossRecentDps = 0f;
         Hud?.Banner("THE LAIR AWAKENS — the boss emerges! the waves press on…"); Sfx?.Thunder();
@@ -3716,56 +3727,112 @@ void sky(){
         if (_bossLair != null && GodotObject.IsInstanceValid(_bossLair)) { _bossLair.SetState(2); NetMgr?.BroadcastBossLairState(2); }
         _sanctuaryArmed = false;   // (NERFER) sanctuary regen ends when the boss is fully defeated
         if (Player != null) Player.Sanctuary = false;
+        ClearRiteSigils(); _riteFired = false; _riteDrawT = 0f;   // (CRIMSON RITE) unlit sigils go out with him; the stall keeps running
+        NetMgr?.BroadcastRiteSigils(new int[0], new float[0], new float[0]);
         Hud?.Banner("THE LAIR FALLS SILENT — the way onward opens");
         SpawnLevelPortal();
+        ReseedBossCycle();         // stay in this world? a new lair AND a fresh random nerfer re-seed elsewhere
     }
 
-    // ===== NERFER SHRINES (Grove): three hidden shrines that each weaken the coming boss fight =====
+    // (BOSS CYCLE) the boss is down but the portal is optional — if the party stays in this world, both objectives come back
+    // somewhere new: a fresh lair to challenge, and ONE new randomly-rolled nerfer whose soul toll has doubled.
+    private void ReseedBossCycle()
+    {
+        if (!IsAuthority || !InOverworld) return;
+        SpawnBossLair();           // frees the old lair, clears WorldBossDown, places a new one far out (and broadcasts)
+        SpawnNerfers();            // one new random shrine, dormant, at the escalated toll
+        var ns = CurrentNerfer;
+        Hud?.Banner(ns != null
+            ? $"a new lair rises — {NerfShrine.KindName(ns.Kind)} shrine · {NerferCostEach} souls ea."
+            : "a new lair rises somewhere in this land");
+    }
+
+    // ===== NERFER SHRINE (Grove): ONE boss-weakening shrine stands in the world at a time, rolled at random from the three
+    // kinds. It's single-use: pay the soul toll (every warden pays an equal share), run its challenge, and it's spent. When the
+    // world boss falls, the lair AND a fresh random nerfer re-seed elsewhere in the same world — and the toll DOUBLES each use.
     public Enemy WorldBoss => _boss;   // for the drain sigil + the arcane unicorn
     private readonly System.Collections.Generic.List<NerfShrine> _nerfers = new();
     public System.Collections.Generic.List<NerfShrine> Nerfers => _nerfers;
-    public int ShrinesDone { get { int n = 0; foreach (var s in _nerfers) if (s != null && s.State == 2) n++; return n; } }
-    public const int ShrinesTotal = 3;
     private bool _sacrificeArmed = false;      // → a crimson drain sigil drops under the boss when he spawns
     public bool SanctuaryArmed => _sanctuaryArmed;
+    public const float SanctuaryRegenFrac = 0.01f;   // (NERFER Sanctuary) 1% of MAX HP per second — scales with the run instead of going stale
     private bool _sanctuaryArmed = false;      // → 2 HP/s party regen while the boss is up
     private readonly System.Collections.Generic.List<Enemy> _sacMinibosses = new();      // slay them all to arm the drain
-    private readonly System.Collections.Generic.HashSet<long> _sanctuaryPaid = new();    // peers who've paid their soul share
+    private readonly System.Collections.Generic.HashSet<long> _nerferPaid = new();       // peers who've paid their soul share for the CURRENT shrine
     private float _summonerT = 0f;             // the Summoner ward-defend countdown (State 1)
     private NerfShrine _summonerShrine;        // the shrine running the ward-defend
     public bool SummonerActive => _summonerShrine != null && GodotObject.IsInstanceValid(_summonerShrine) && _summonerT > 0f;   // for the HUD defend-timer
     public float SummonerTimeLeft => Mathf.Max(0f, _summonerT);
+    public bool SummonerHeld = false;          // (FIX) is a living warden actually standing in the circle? the countdown only runs while true
     public Vector3 SummonerPos => _summonerShrine != null && GodotObject.IsInstanceValid(_summonerShrine) ? _summonerShrine.GlobalPosition : Vector3.Zero;
-    public const int SanctuaryShare = 40;      // souls each warden contributes (tunable)
-    public int SanctuaryPaidCount => _sanctuaryPaid.Count;
+    public const float SummonerDur = 45f;
+
+    // ---- the escalating soul toll: 100 souls PER WARDEN the first time, doubling with every shrine spent this run ----
+    public const int NerferBaseCost = 100;
+    private int _nerferUses = 0;               // how many nerfers have been spent this run (drives the doubling)
+    public int NerferUses => _nerferUses;
+    public int NerferCostEach => NerferBaseCost << Mathf.Min(_nerferUses, 8);   // 100 · 200 · 400 · 800 … (capped so it can't overflow)
+    public int NerferCostTotal => NerferCostEach * Mathf.Max(1, WardenCount);
+    private int _nerferPaidRemote = 0; private bool _nerferPaidMe = false;   // client mirror (the host owns _nerferPaid)
+    public int NerferPaidCount => IsAuthority ? _nerferPaid.Count : _nerferPaidRemote;
+    public bool NerferPaidByMe => IsAuthority ? _nerferPaid.Contains(LocalPeer) : _nerferPaidMe;
+    private int _lastNerfKind = -1;            // avoid rolling the same kind twice in a row when we re-seed
+
+    // the current standing shrine (null once it's spent / before one exists)
+    public NerfShrine CurrentNerfer { get { foreach (var s in _nerfers) if (s != null && GodotObject.IsInstanceValid(s)) return s; return null; } }
+    public string NerferHudLine()
+    {
+        var s = CurrentNerfer;
+        if (s == null || s.State == 2) return _nerferUses > 0 ? $"{_nerferUses} SHRINE{(_nerferUses == 1 ? "" : "S")} SPENT" : "NO SHRINE";
+        string kn = NerfShrine.KindName(s.Kind).ToUpper();
+        return s.State == 1 ? $"{kn} · IN PROGRESS" : $"{kn} · {NerferCostEach} SOULS EA.";
+    }
 
     public void SpawnNerfers()
     {
         if (!IsAuthority) return;
         foreach (var s in _nerfers.ToArray()) if (GodotObject.IsInstanceValid(s)) s.QueueFree();
         _nerfers.Clear();
-        _sacrificeArmed = false; _sanctuaryArmed = false; _sacMinibosses.Clear(); _sanctuaryPaid.Clear();
-        _summonerT = 0f; _summonerShrine = null;
+        _sacrificeArmed = false; _sanctuaryArmed = false; _sacMinibosses.Clear();
+        _nerferPaid.Clear(); _nerferPaidRemote = 0; _nerferPaidMe = false;
+        _summonerT = 0f; _summonerShrine = null; SummonerHeld = false;
         if (!InOverworld || CurBiome != Biome.Grove) return;   // Grove-specific set for now — the Jungle gets its own flavours later
-        for (int k = 0; k < 3; k++)
-        {
-            var pos = SpreadPointInWorld(_mapOccupied, 90f);
-            var sh = new NerfShrine { Kind = (NerfKind)k, NetId = NextPickupId() };
-            AddChild(sh); sh.GlobalPosition = pos; _nerfers.Add(sh); _mapOccupied.Add(pos);
-        }
-        NetMgr?.BroadcastNerfers(_nerfers);
+        // ONE shrine, rolled at random from the three — never the same kind twice running, so each boss cycle feels different
+        int k = _rng.RandiRange(0, 2);
+        if (k == _lastNerfKind) k = (k + 1 + _rng.RandiRange(0, 1)) % 3;
+        _lastNerfKind = k;
+        var pos = SpreadPointInWorld(_mapOccupied, 90f);
+        var sh = new NerfShrine { Kind = (NerfKind)k, NetId = NextPickupId() };
+        AddChild(sh); sh.GlobalPosition = pos; _nerfers.Add(sh); _mapOccupied.Add(pos);
+        NetMgr?.BroadcastNerfers(_nerfers, _nerferUses);
     }
-    public void SetRemoteNerfers(int[] kinds, int[] ids, float[] px, float[] py, float[] pz)
+    public void SetRemoteNerfers(int[] kinds, int[] ids, float[] px, float[] py, float[] pz, int uses)
     {
+        // this also fires on a mere reposition (NudgeOutOfStructures) — only wipe the client's paid/armed state when the shrine
+        // ITSELF changed, or a nudge mid-payment would silently reset everyone's "2/3 paid" tally
+        bool fresh = ids.Length != _nerfers.Count;
+        if (!fresh) for (int i = 0; i < ids.Length; i++) if (_nerfers[i] == null || _nerfers[i].NetId != ids[i]) { fresh = true; break; }
         foreach (var s in _nerfers.ToArray()) if (GodotObject.IsInstanceValid(s)) s.QueueFree();
         _nerfers.Clear();
-        _sanctuaryArmed = false; _sanctuaryBossSeen = false; _sanctuaryPaid.Clear(); if (Player != null) Player.Sanctuary = false;   // fresh world → reset client nerfer state
+        _nerferUses = uses;
+        if (fresh)
+        {
+            _sanctuaryArmed = false; _sanctuaryBossSeen = false; _nerferPaid.Clear(); _nerferPaidRemote = 0; _nerferPaidMe = false;
+            if (Player != null) Player.Sanctuary = false;   // fresh shrine → reset client nerfer state
+            _summonerT = 0f; _summonerShrine = null; SummonerHeld = false;
+        }
+        int wasSummonerId = (!fresh && _summonerShrine != null) ? _summonerShrine.NetId : -1;
+        _summonerShrine = null;
         for (int i = 0; i < ids.Length; i++)
         {
             var sh = new NerfShrine { Kind = (NerfKind)kinds[i], NetId = ids[i], Remote = true };
             AddChild(sh); sh.GlobalPosition = new Vector3(px[i], py[i], pz[i]); _nerfers.Add(sh);
+            if (ids[i] == wasSummonerId) { sh.SetState(1); _summonerShrine = sh; }   // a reposition rebuilt the node — re-link the running defend
         }
     }
+    // (MP HUD) the host streams how many wardens have paid the current toll so everyone sees "2/3 paid"
+    public void SetRemoteNerferPaid(int paid, int uses) { _nerferPaidRemote = paid; _nerferUses = uses; }
+    public void SetRemoteSummonerTick(float timeLeft, bool held) { _summonerT = timeLeft; SummonerHeld = held; }
     public void SetRemoteNerferState(int netId, int state)
     {
         foreach (var s in _nerfers) if (s != null && GodotObject.IsInstanceValid(s) && s.NetId == netId)
@@ -3773,44 +3840,60 @@ void sky(){
             s.SetState(state);
             if (s.Kind == NerfKind.Summoner)   // (client HUD) mirror the defend-timer locally so the countdown shows for allies too
             {
-                if (state == 1) { _summonerShrine = s; _summonerT = 45f; }
-                else if (_summonerShrine == s) { _summonerShrine = null; _summonerT = 0f; }
+                if (state == 1) { _summonerShrine = s; _summonerT = SummonerDur; SummonerHeld = false; }   // the host's tick stream corrects this immediately
+                else if (_summonerShrine == s) { _summonerShrine = null; _summonerT = 0f; SummonerHeld = false; }
             }
             break;
         }
     }
 
-    // hold-E dispatch — each kind has its own flow
+    // hold-E: EVERY kind now costs the same escalating soul toll, paid in equal shares by every warden. Once the last
+    // share lands the shrine fires its own flow (defend / sacrifice / sanctuary). One shrine, one use, per boss cycle.
     private void TryActivateNerfer(NerfShrine s)
     {
-        if (s == null || !GodotObject.IsInstanceValid(s) || s.State == 2) return;
+        if (s == null || !GodotObject.IsInstanceValid(s) || s.State != 0) return;
+        long me = LocalPeer;
+        if (NerferPaidByMe) { Hud?.Banner("you've paid your share — await the others"); return; }
+        int cost = NerferCostEach;
+        if (Souls < cost) { Sfx?.Denied(); Hud?.Banner($"the shrine demands {cost} souls from you (you have {Souls})"); return; }
+        Souls -= cost;
+        Sfx?.RiteWin();
+        if (NetMgr != null && NetMgr.Active && !IsAuthority) { NetMgr.RequestNerferPay(s.NetId); _nerferPaidMe = true; _nerferPaidRemote++; return; }
+        HostNerferPaid(s.NetId, me);
+    }
+    // a warden's share landed — host tallies it and fires the shrine once everyone has paid
+    public void HostNerferPaid(int netId, long peer)
+    {
+        if (!IsAuthority) return;
+        NerfShrine s = null; foreach (var n in _nerfers) if (n != null && GodotObject.IsInstanceValid(n) && n.NetId == netId) { s = n; break; }
+        if (s == null || s.State != 0) return;
+        _nerferPaid.Add(peer);
+        int need = Mathf.Max(1, WardenCount);
+        NetMgr?.BroadcastNerferPaid(_nerferPaid.Count, _nerferUses);
+        if (_nerferPaid.Count < need) { Hud?.Banner($"{NerfShrine.KindName(s.Kind)} — {_nerferPaid.Count}/{need} shares paid"); return; }
+        _nerferUses++;                                   // (TOLL) the NEXT shrine this run costs double
+        NetMgr?.BroadcastNerferPaid(_nerferPaid.Count, _nerferUses);
         switch (s.Kind)
         {
-            case NerfKind.Summoner:
-                if (s.State != 0) return;
-                if (NetMgr != null && NetMgr.Active && !IsAuthority) { NetMgr.RequestNerfer(s.NetId); return; }
-                HostStartSummoner(s);
-                break;
-            case NerfKind.Sacrifice:
-                if (s.State != 0) return;
-                if (NetMgr != null && NetMgr.Active && !IsAuthority) { NetMgr.RequestNerfer(s.NetId); return; }
-                HostBeginSacrifice(s);
-                break;
-            case NerfKind.Sanctuary:
-                TrySanctuaryContribute(s);
-                break;
+            case NerfKind.Summoner:  HostStartSummoner(s); break;
+            case NerfKind.Sacrifice: HostBeginSacrifice(s); break;
+            default:                 HostArmSanctuary(s); break;
         }
     }
     public void HostStartSummoner(NerfShrine s)
     {
         if (!IsAuthority || s == null || s.State != 0) return;
         s.SetState(1); NetMgr?.BroadcastNerferState(s.NetId, 1);
-        _summonerShrine = s; _summonerT = 45f;
-        Hud?.Banner("the Summoning has begun — DEFEND the glowing circle for 45s!"); Sfx?.RiteWin();
+        _summonerShrine = s; _summonerT = SummonerDur; SummonerHeld = false;
+        Hud?.Banner("the Summoning begins — HOLD the circle for 45s!"); Sfx?.RiteWin();   // (keep banners short — long ones clip off-screen)
     }
-    public void SetRemoteDrainSigil(Vector3 pos)   // client: visual-only ghost of the crimson sigil (host drives the actual drain)
+    public void HostArmSanctuary(NerfShrine s)
     {
-        var sig = new BossDrainSigil(); AddChild(sig); sig.GlobalPosition = pos;
+        if (!IsAuthority || s == null || s.State == 2) return;
+        _sanctuaryArmed = true; s.SetState(2);
+        NetMgr?.BroadcastNerferState(s.NetId, 2); NetMgr?.BroadcastSanctuaryArmed();
+        if (Player != null) Player.Sanctuary = true;
+        Hud?.Banner("the sanctuary awakens — a blessing of mending will guard you in the fight");
     }
     public void HostBeginSacrifice(NerfShrine s)
     {
@@ -3834,37 +3917,8 @@ void sky(){
         {
             _sacrificeArmed = true;
             foreach (var s in _nerfers) if (s != null && s.Kind == NerfKind.Sacrifice) { s.SetState(2); NetMgr?.BroadcastNerferState(s.NetId, 2); }
-            Hud?.Banner("the sacrifice is complete — a draining sigil will curse the boss's ground");
-            if (_bossFightActive && _boss != null && GodotObject.IsInstanceValid(_boss))   // boss already up → drop the sigil right now
-            {
-                var sig = new BossDrainSigil(); AddChild(sig);
-                sig.GlobalPosition = new Vector3(_boss.GlobalPosition.X, 0.05f, _boss.GlobalPosition.Z);
-                NetMgr?.BroadcastDrainSigil(sig.GlobalPosition);
-            }
-        }
-    }
-    private void TrySanctuaryContribute(NerfShrine s)
-    {
-        if (s.State == 2) return;
-        long me = LocalPeer;
-        if (_sanctuaryPaid.Contains(me)) { Hud?.Banner("you've paid your share — await the others"); return; }
-        if (Souls < SanctuaryShare) { Sfx?.Denied(); Hud?.Banner($"the sanctuary needs {SanctuaryShare} souls from you"); return; }
-        Souls -= SanctuaryShare;
-        if (NetMgr != null && NetMgr.Active && !IsAuthority) { NetMgr.RequestSanctuaryPay(s.NetId); _sanctuaryPaid.Add(me); return; }
-        HostSanctuaryPaid(s.NetId, me);
-    }
-    public void HostSanctuaryPaid(int netId, long peer)
-    {
-        if (!IsAuthority) return;
-        _sanctuaryPaid.Add(peer);
-        NerfShrine s = null; foreach (var n in _nerfers) if (n != null && n.NetId == netId) { s = n; break; }
-        if (s == null || s.State == 2) return;
-        if (_sanctuaryPaid.Count >= Mathf.Max(1, WardenCount))
-        {
-            _sanctuaryArmed = true; s.SetState(2);
-            NetMgr?.BroadcastNerferState(s.NetId, 2); NetMgr?.BroadcastSanctuaryArmed();
-            if (Player != null) Player.Sanctuary = true;
-            Hud?.Banner("the sanctuary awakens — a blessing of mending will guard you in the fight");
+            Hud?.Banner("the sacrifice is done — the Crimson Rite awaits the boss");
+            if (_bossFightActive && _boss != null && GodotObject.IsInstanceValid(_boss)) SpawnRiteSigils(_boss.GlobalPosition);   // boss already up → open the rite right now
         }
     }
     public void ClientSanctuaryArmed() { _sanctuaryArmed = true; if (Player != null) Player.Sanctuary = true; }
@@ -3872,23 +3926,31 @@ void sky(){
     // per-frame nerfer upkeep: the Summoner ward countdown + the Sanctuary regen during the fight
     private void UpdateNerfers(float dt)
     {
-        if (_summonerT > 0f)
+        // (FIX) the Summoning is a HOLD-THE-GROUND objective: the countdown only runs while at least one living warden stands
+        // inside the ward circle. It used to tick down on its own, so you could walk away and still get the unicorn. The HOST
+        // owns the clock now (presence is host-authoritative) and streams it to clients — they no longer decrement locally.
+        if (_summonerT > 0f && IsAuthority && (_summonerShrine == null || !GodotObject.IsInstanceValid(_summonerShrine)))
+        { _summonerT = 0f; _summonerShrine = null; SummonerHeld = false; NetMgr?.BroadcastSummonerTick(0f, false); }   // the shrine vanished (re-seed / level change) → don't strand the clock
+        if (_summonerT > 0f && IsAuthority)
         {
-            _summonerT -= dt;   // count down on EVERY machine so the HUD defend-timer reads right for host + clients
-            if (IsAuthority)
+            SummonerHeld = AnyWardenInWard();
+            if (SummonerHeld) _summonerT -= dt;
+            _summonerNetT -= dt;
+            if (_summonerNetT <= 0f) { _summonerNetT = 0.15f; NetMgr?.BroadcastSummonerTick(Mathf.Max(0f, _summonerT), SummonerHeld); }
+            if (_summonerT <= 0f && _summonerShrine != null && GodotObject.IsInstanceValid(_summonerShrine))
             {
-                if (_summonerT <= 0f && _summonerShrine != null && GodotObject.IsInstanceValid(_summonerShrine))
-                {
-                    _summonerShrine.SetState(2); NetMgr?.BroadcastNerferState(_summonerShrine.NetId, 2);
-                    SpawnArcaneUnicorn(_summonerShrine.GlobalPosition);
-                    Hud?.Banner("an ARCANE SPECTRE answers — it will follow you until the boss awakens");
-                    _summonerShrine = null;
-                }
-                else if (_summonerT > 0f) { _summonerSpawnT -= dt; if (_summonerSpawnT <= 0f) { _summonerSpawnT = 1.6f; for (int i = 0; i < WardenCount; i++) SpawnAdd(); } }   // waves of adds attack the circle
+                _summonerT = 0f;
+                NetMgr?.BroadcastSummonerTick(0f, true);
+                _summonerShrine.SetState(2); NetMgr?.BroadcastNerferState(_summonerShrine.NetId, 2);
+                SpawnArcaneUnicorn(_summonerShrine.GlobalPosition);
+                Hud?.Banner("an ARCANE SPECTRE answers — it will follow you until the boss awakens");
+                _summonerShrine = null;
+                Sfx?.WardComplete(); _summonerSounding = false;
             }
-            else if (_summonerT <= 0f) _summonerShrine = null;   // client cleanup (the State 2 sync also handles the shrine)
-            if (_summonerT <= 0f) { Sfx?.WardComplete(); _summonerSounding = false; }   // (SFX) same witchy relief ding as a rite completing — every machine
+            else if (SummonerHeld) { _summonerSpawnT -= dt; if (_summonerSpawnT <= 0f) { _summonerSpawnT = 1.6f; for (int i = 0; i < WardenCount; i++) SpawnAdd(); } }   // waves of adds attack the circle — only while it's actually being held
         }
+        else if (_summonerT <= 0f && !IsAuthority && _summonerShrine != null && _summonerShrine.State == 2)
+        { _summonerShrine = null; Sfx?.WardComplete(); _summonerSounding = false; }   // client: the host's State-2 sync ended it
         UpdateSummonerSound();   // (SFX) the warding ritual's rising charge-drone while you defend the Summoning
         // (NERFER Summoner) stream the unicorn's position to clients so they see it follow/charge (~10Hz)
         if (IsAuthority && _unicorn != null && GodotObject.IsInstanceValid(_unicorn) && NetMgr != null && NetMgr.Active)
@@ -3900,9 +3962,199 @@ void sky(){
         {
             bool bossUp = false;
             foreach (var e in Enemies) if (e != null && GodotObject.IsInstanceValid(e) && e.IsBoss && !e.Dead) { bossUp = true; break; }
-            if (bossUp) { _sanctuaryBossSeen = true; if (!Player.Downed) Player.Heal(2f * dt); }
+            // (TUNE) regen is a PERCENTAGE of max HP now, not a flat 2 HP/s — a flat trickle was worthless by the 2nd/3rd boss
+            // of a run once HP pools had grown. Floored at the old 2 HP/s so it's never a downgrade on a low-HP build.
+            if (bossUp) { _sanctuaryBossSeen = true; if (!Player.Downed) Player.Heal(Mathf.Max(2f, Player.S.MaxHp * SanctuaryRegenFrac) * dt); }
             else if (_sanctuaryBossSeen) { _sanctuaryArmed = false; _sanctuaryBossSeen = false; Player.Sanctuary = false; }   // the boss we buffed against is gone → sanctuary spent (covers clients, who don't run OnWorldBossDefeated)
         }
+    }
+    // ===== (NERFER Sacrifice) THE CRIMSON RITE =====
+    // When the boss is summoned with the Sacrifice armed, one blood-sigil per warden rings the arena. ANY warden can charge
+    // ANY sigil by standing in it 3s (so a downed ally can't deadlock the set — the survivors just have to sprint). Light them
+    // all and a pentagram draws itself over the boss, then dispels: every non-boss foe on the field is cut down where it
+    // stands, and the world stops sending more for 20s per warden (capped at 50s). Once per boss fight.
+    public readonly System.Collections.Generic.List<RiteSigil> RiteSigils = new();
+    private CrimsonPentagram _pentagram;
+    private float _riteDrawT = 0f;        // >0 while the pentagram is drawing itself
+    private Vector3 _riteCenter;
+    private bool _riteFired = false;      // once per boss fight
+    public bool RiteOpen => RiteSigils.Count > 0 && !_riteFired;
+    public int RiteLit { get { int n = 0; foreach (var s in RiteSigils) if (s != null && GodotObject.IsInstanceValid(s) && s.Lit) n++; return n; } }
+    public int RiteTotal => RiteSigils.Count;
+    public bool RiteDrawing => _riteDrawT > 0f;
+    public float RiteDrawProgress => _riteDrawT > 0f ? Mathf.Clamp(1f - _riteDrawT / CrimsonPentagram.DrawDur, 0f, 1f) : 0f;
+    public const float RiteStallPerWarden = 20f, RiteStallCap = 50f;
+
+    // (RITE) the world holds its breath — every spawn director is gated on this; it ticks down on every machine for the HUD
+    public float SpawnStallT = 0f;
+    public bool SpawnStalled => SpawnStallT > 0f;
+
+    public void SpawnRiteSigils(Vector3 arenaCenter)
+    {
+        if (!IsAuthority) return;
+        ClearRiteSigils();
+        _riteFired = false; _riteDrawT = 0f;
+        int n = Mathf.Max(1, WardenCount);
+        float a0 = _rng.Randf() * Mathf.Tau;
+        var ids = new int[n]; var px = new float[n]; var pz = new float[n];
+        for (int i = 0; i < n; i++)
+        {
+            float a = a0 + i / (float)n * Mathf.Tau;
+            float r = 24f + _rng.Randf() * 10f;
+            var p = ClampToWorld(arenaCenter + new Vector3(Mathf.Cos(a) * r, 0, Mathf.Sin(a) * r), 8f);
+            var sg = new RiteSigil { NetId = NextPickupId() };
+            AddChild(sg); sg.GlobalPosition = new Vector3(p.X, SurfaceHeight(p, 1e9f) + 0.02f, p.Z);
+            RiteSigils.Add(sg);
+            ids[i] = sg.NetId; px[i] = sg.GlobalPosition.X; pz[i] = sg.GlobalPosition.Z;
+        }
+        NetMgr?.BroadcastRiteSigils(ids, px, pz);
+        Hud?.Banner(n > 1 ? $"THE CRIMSON RITE — light all {n} sigils" : "THE CRIMSON RITE — light the sigil");
+        Sfx?.Thunder();
+    }
+    public void SetRemoteRiteSigils(int[] ids, float[] px, float[] pz)
+    {
+        ClearRiteSigils();
+        _riteFired = false; _riteDrawT = 0f;
+        for (int i = 0; i < ids.Length; i++)
+        {
+            var sg = new RiteSigil { NetId = ids[i], Remote = true };
+            AddChild(sg); sg.GlobalPosition = new Vector3(px[i], SurfaceHeight(new Vector3(px[i], 0, pz[i]), 1e9f) + 0.02f, pz[i]);
+            RiteSigils.Add(sg);
+        }
+        if (ids.Length > 0) { Hud?.Banner(ids.Length > 1 ? $"THE CRIMSON RITE — light all {ids.Length} sigils" : "THE CRIMSON RITE — light the sigil"); Sfx?.Thunder(); }
+    }
+    public void SetRemoteRiteCharge(int netId, float charge, bool lit)
+    {
+        foreach (var s in RiteSigils) if (s != null && GodotObject.IsInstanceValid(s) && s.NetId == netId)
+        { s.Charge = charge; if (lit && !s.Lit) { s.SetLit(true); Sfx?.RiteWin(); } break; }
+    }
+    public void ClearRiteSigils()
+    {
+        foreach (var s in RiteSigils.ToArray()) if (GodotObject.IsInstanceValid(s)) s.QueueFree();
+        RiteSigils.Clear();
+    }
+
+    private float _riteNetT = 0f;
+    private void UpdateCrimsonRite(float dt)
+    {
+        if (SpawnStallT > 0f) SpawnStallT -= dt;   // ticks everywhere so the HUD countdown reads on clients too
+
+        // the drawing pentagram: the HOST owns the clock and detonates at the end, so the kills land with the flash
+        if (_riteDrawT > 0f && IsAuthority)
+        {
+            _riteDrawT -= dt;
+            if (_riteDrawT <= 0f) { _riteDrawT = 0f; RiteDetonate(); }
+        }
+        DrainRiteKillQueue(dt);
+
+        if (!IsAuthority || RiteSigils.Count == 0 || _riteFired) return;
+        // the boss died (or fled the field) before the rite completed → the sigils go out with him
+        if (_boss == null || !GodotObject.IsInstanceValid(_boss) || _boss.Dead) { ClearRiteSigils(); return; }
+
+        bool changed = false;
+        foreach (var s in RiteSigils)
+        {
+            if (s == null || !GodotObject.IsInstanceValid(s) || s.Lit) continue;
+            if (!AnyWardenInSigil(s)) continue;                       // progress HOLDS when you step out — no decay
+            s.Charge = Mathf.Min(1f, s.Charge + dt / RiteSigil.FillTime);
+            changed = true;
+            if (s.Charge >= 1f)
+            {
+                s.SetLit(true);
+                NetMgr?.BroadcastRiteCharge(s.NetId, 1f, true);
+                Sfx?.RiteWin();
+                int lit = RiteLit, tot = RiteTotal;
+                Hud?.Banner(lit >= tot ? "THE RITE IS COMPLETE" : $"sigil lit — {lit}/{tot}");
+            }
+        }
+        _riteNetT -= dt;
+        if (changed && _riteNetT <= 0f)   // stream the partial fills at ~8Hz so ally rings move on every machine
+        {
+            _riteNetT = 0.12f;
+            foreach (var s in RiteSigils) if (s != null && GodotObject.IsInstanceValid(s) && !s.Lit && s.Charge > 0f) NetMgr?.BroadcastRiteCharge(s.NetId, s.Charge, false);
+        }
+
+        if (RiteLit >= RiteTotal && RiteTotal > 0) BeginRiteDraw();
+    }
+    private bool AnyWardenInSigil(RiteSigil s)
+    {
+        var c = s.GlobalPosition; float r2 = RiteSigil.Radius * RiteSigil.Radius;
+        bool In(Vector3 p) { float dx = p.X - c.X, dz = p.Z - c.Z; return dx * dx + dz * dz <= r2; }
+        if (Player != null && !Player.Downed && In(Player.GlobalPosition)) return true;
+        if (NetMgr != null && NetMgr.Active) foreach (var (peer, pos) in NetMgr.AliveAllyPositions()) if (In(pos)) return true;
+        return false;
+    }
+    private void BeginRiteDraw()
+    {
+        if (!IsAuthority || _riteFired || _riteDrawT > 0f) return;
+        _riteFired = true;                                    // once per boss fight, locked in the moment the last sigil lights
+        _riteCenter = _boss != null && GodotObject.IsInstanceValid(_boss) ? _boss.GlobalPosition : Player.GlobalPosition;
+        _riteCenter.Y = SurfaceHeight(_riteCenter, 1e9f);
+        _riteDrawT = CrimsonPentagram.DrawDur;
+        _pentagram = new CrimsonPentagram(); _pentagram.Init(26f, false);   // host: Game fires Burst() so it lands with the kills
+        AddChild(_pentagram); _pentagram.GlobalPosition = _riteCenter;
+        ClearRiteSigils();
+        NetMgr?.BroadcastRiteFire(_riteCenter);
+        Hud?.Banner("THE RITE IS COMPLETE — blood answers");
+    }
+    public void SetRemoteRiteFire(Vector3 center)   // client: draw the same figure; it self-bursts at DrawDur
+    {
+        ClearRiteSigils();
+        _riteFired = true;
+        if (_pentagram != null && GodotObject.IsInstanceValid(_pentagram)) _pentagram.QueueFree();
+        _pentagram = new CrimsonPentagram(); _pentagram.Init(26f, true);
+        AddChild(_pentagram); _pentagram.GlobalPosition = center;
+        Hud?.Banner("THE RITE IS COMPLETE — blood answers");
+    }
+
+    // ---- the detonation: cut down every non-boss foe, then stall the world ----
+    private readonly System.Collections.Generic.List<Enemy> _riteKillQueue = new();
+    private void RiteDetonate()
+    {
+        if (!IsAuthority) return;
+        if (_pentagram != null && GodotObject.IsInstanceValid(_pentagram)) _pentagram.Burst();
+        // EVERY foe on the field except boss-tier (the world boss and minibosses both carry IsBoss) — Takers and Warded
+        // Phalanxes DO fall. Queued, not killed in one frame: an uncapped 90-foe death cascade is exactly the thing that
+        // froze MP before (see DEV_HANDOFF gotchas), so DrainRiteKillQueue meters it over the next few frames.
+        _riteKillQueue.Clear();
+        foreach (var e in Enemies)
+            if (e != null && GodotObject.IsInstanceValid(e) && !e.Dead && !e.IsBoss) _riteKillQueue.Add(e);
+        int stalled = Mathf.RoundToInt(Mathf.Min(RiteStallCap, RiteStallPerWarden * Mathf.Max(1, WardenCount)));
+        SpawnStallT = stalled;
+        NetMgr?.BroadcastRiteDetonate(_riteCenter, stalled);
+        Hud?.Banner($"THE HORDE IS CUT DOWN — {stalled}s of silence");
+    }
+    public void ClientRiteDetonate(Vector3 center, int stallSeconds)
+    {
+        SpawnStallT = stallSeconds;
+        Hud?.Banner($"THE HORDE IS CUT DOWN — {stallSeconds}s of silence");
+    }
+    private void DrainRiteKillQueue(float dt)
+    {
+        if (_riteKillQueue.Count == 0) return;
+        int budget = 8;   // per-frame kill budget — keeps the slash VFX + death fan-out inside the frame budget
+        while (_riteKillQueue.Count > 0 && budget-- > 0)
+        {
+            int last = _riteKillQueue.Count - 1;
+            var e = _riteKillQueue[last]; _riteKillQueue.RemoveAt(last);
+            if (e == null || !GodotObject.IsInstanceValid(e) || e.Dead) continue;
+            e.RiteSlash();                                        // crimson gashes flick across it…
+            // fromCombo:true so each kill throws its own blood onomatopoeia — the wall of GUSH!/VISCERA! IS the payoff
+            e.Hurt(e.MaxHp + 9999f, DamageType.Blood, true);      // …and it falls
+        }
+    }
+
+    private float _summonerNetT = 0f;   // host→client clock stream cadence
+    // (FIX) host-authoritative presence test for the Summoning ward: any LIVING warden inside the circle holds the ground.
+    // Slightly forgiving radius so standing on the rim still counts.
+    private bool AnyWardenInWard()
+    {
+        if (_summonerShrine == null || !GodotObject.IsInstanceValid(_summonerShrine)) return false;
+        var c = _summonerShrine.GlobalPosition; float r = NerfShrine.WardRadius * 1.1f; float r2 = r * r;
+        bool In(Vector3 p) { float dx = p.X - c.X, dz = p.Z - c.Z; return dx * dx + dz * dz <= r2; }
+        if (Player != null && !Player.Downed && In(Player.GlobalPosition)) return true;
+        if (NetMgr != null && NetMgr.Active) foreach (var (peer, pos) in NetMgr.AliveAllyPositions()) if (In(pos)) return true;
+        return false;
     }
     // (SFX) mirror the warding ritual's charge drone for the Summoning defend: rising hum while you're near + the fill climbs, relief ding at 100%
     private bool _summonerSounding = false;
@@ -3911,7 +4163,8 @@ void sky(){
         var pl = Player;
         bool near = SummonerActive && pl != null
                     && new Vector2(SummonerPos.X - pl.GlobalPosition.X, SummonerPos.Z - pl.GlobalPosition.Z).Length() <= NerfShrine.WardRadius * 1.25f;
-        if (near) { Sfx?.WardCharge(Mathf.Clamp(1f - _summonerT / 45f, 0f, 1f)); _summonerSounding = true; }
+        if (_summonerShrine != null && GodotObject.IsInstanceValid(_summonerShrine)) _summonerShrine.Stalled = SummonerActive && !SummonerHeld;   // circle dims + stops turning when nobody holds it
+        if (near && SummonerHeld) { Sfx?.WardCharge(Mathf.Clamp(1f - _summonerT / SummonerDur, 0f, 1f)); _summonerSounding = true; }
         else if (_summonerSounding) { _summonerSounding = false; Sfx?.WardChargeStop(); }
     }
     private bool _sanctuaryBossSeen = false;
@@ -5350,6 +5603,22 @@ void fragment() {
         return m;
     }
 
+    // The boss's boulder — real rock, not a grey sphere. Reuses the cliff textures already shipped for the terrain
+    // (rock_face_03 diff + normal); cached, since every rock throw and the held wind-up boulder share one material.
+    private static StandardMaterial3D _rockMat;
+    public static StandardMaterial3D RockMat()
+    {
+        if (_rockMat != null) return _rockMat;
+        var m = Toon(new Color(0.72f, 0.68f, 0.63f), 0.95f, 0.18f, 0f);
+        const string diff = "res://assets/textures/terrain/rock_face_03_diff_4k.jpg";
+        const string nor = "res://assets/textures/terrain/rock_face_03_nor_4k.png";
+        if (ResourceLoader.Exists(diff)) m.AlbedoTexture = ResourceLoader.Load<Texture2D>(diff);
+        if (ResourceLoader.Exists(nor)) { m.NormalEnabled = true; m.NormalTexture = ResourceLoader.Load<Texture2D>(nor); m.NormalScale = 1.4f; }
+        m.Uv1Scale = new Vector3(2.2f, 2.2f, 2.2f);   // a boulder is ~1m across — tile the 4k cliff map down to boulder-sized grain
+        _rockMat = m;
+        return m;
+    }
+
     // Cel-shaded glowing surface (magic, characters): toon base + emission + outline.
     public static StandardMaterial3D ToonEmissive(Color c, float energy, float outline = 0.03f)
     {
@@ -5659,6 +5928,7 @@ void fragment() {
         e.GlobalPosition = new Vector3(pos.X, e.Radius, pos.Z);
         Enemies.Add(e);
         SpawnPoof(e.GlobalPosition);
+        if (type == "taker") Sfx?.TakerSpawnCue();   // (L4D CUE) maze taker announces itself too
         return e;
     }
 
@@ -5758,6 +6028,7 @@ void fragment() {
         e.WakeSilent();   // (NEW) wave-spawned swarmers hunt immediately (idle only applies inside the maze)
         Enemies.Add(e);
         if (!boss) SpawnPoof(e.GlobalPosition);   // (NEW) purple materialization poof (boss gets a dramatic entrance, no poof)
+        if (type == "taker") Sfx?.TakerSpawnCue();   // (L4D CUE) a special is here — distinct ominous sting
         if (type == "boss") { _boss = e; _bossAddT = 5f; }
     }
 
@@ -5784,6 +6055,7 @@ void fragment() {
         lead.WakeSilent();
         Enemies.Add(lead);
         SpawnPoof(lead.GlobalPosition);
+        Sfx?.PhalanxSpawnCue();   // (L4D CUE) a warded phalanx forms up — distinct martial fanfare
 
         // the rank forms up behind the bearer, on the side away from the party
         Vector3 back = center - pc; back.Y = 0f;
@@ -5890,6 +6162,7 @@ void fragment() {
         HauntCenter = c;
         _hauntGoal = 26 + DiffStage() * 6 + (WardenCount - 1) * 8;   // scales with difficulty + party
         _hauntKills = 0; HauntActive = true;
+        ResetHauntBolts();
         _haunt = new Haunt(); AddChild(_haunt); _haunt.Init(c, HauntRadius);
         NetMgr?.BroadcastHaunt(c, HauntRadius);
         Hud?.Banner("a HAUNT stirs — fight there to break it");
@@ -5963,6 +6236,80 @@ void fragment() {
         if (_haunt != null && GodotObject.IsInstanceValid(_haunt)) _haunt.SetFill(HauntFrac);
         _hauntFillNetT -= dt;
         if (_hauntFillNetT <= 0f) { _hauntFillNetT = 0.25f; NetMgr?.BroadcastHauntFill(HauntFrac); }
+        UpdateHauntBolts(dt);
+    }
+
+    // ===== (HAUNT STORM) lightning strikes inside the zone =====================================================
+    // The storm overhead actually hits things now. A pool of INDEPENDENT emitters each run their own countdown
+    // (2-10s, re-rolled after every strike), so the rhythm is ragged rather than a metronome. How many run at once
+    // scales with difficulty: 2 in the early game, up to 8 at the top. Each drops a telegraphed bolt at a random
+    // point in the disc that hurts + stuns whatever is standing there — foes and wardens both.
+    private const int MaxHauntBolts = 8;
+    private const float BoltCadenceMin = 2f, BoltCadenceMax = 10f;
+    private readonly float[] _boltT = new float[MaxHauntBolts];
+    // stage 0 (CALM) → 2 concurrent; stage 8 → the full 8. DiffStage() spans 0..8.
+    public int HauntBoltCount => Mathf.Clamp(2 + (DiffStage() * 6) / 8, 2, MaxHauntBolts);
+
+    private void ResetHauntBolts()   // fresh, staggered countdowns so a new Haunt doesn't open with a simultaneous salvo
+    { for (int i = 0; i < MaxHauntBolts; i++) _boltT[i] = _rng.RandfRange(BoltCadenceMin, BoltCadenceMax); }
+
+    public bool NoHauntBolts = false;   // (HARNESS) silence the director so a scenario can place strikes deterministically
+
+    private void UpdateHauntBolts(float dt)
+    {
+        if (!IsAuthority || !HauntActive || NoHauntBolts) return;
+        // nobody near enough to see it? don't burn the frames — the strikes exist to pressure a fight, not an empty field
+        if (!AnyWardenNearHaunt(HauntRadius * 1.6f)) return;
+        int n = HauntBoltCount;
+        for (int i = 0; i < n; i++)
+        {
+            _boltT[i] -= dt;
+            if (_boltT[i] > 0f) continue;
+            _boltT[i] = _rng.RandfRange(BoltCadenceMin, BoltCadenceMax);   // every emitter re-rolls its own cadence
+            SpawnHauntBolt(RandomPointInHaunt());
+        }
+    }
+
+    private Vector3 RandomPointInHaunt()
+    {
+        float a = _rng.Randf() * Mathf.Tau, r = HauntRadius * Mathf.Sqrt(_rng.Randf());   // sqrt → uniform over the disc
+        return new Vector3(HauntCenter.X + Mathf.Cos(a) * r, 0f, HauntCenter.Z + Mathf.Sin(a) * r);
+    }
+
+    public bool AnyWardenNearHaunt(float pad)
+    {
+        if (!HauntActive) return false;
+        float rr = (HauntRadius + pad) * (HauntRadius + pad);
+        bool Near(Vector3 p) => new Vector2(p.X - HauntCenter.X, p.Z - HauntCenter.Z).LengthSquared() < rr;
+        if (Player != null && Near(Player.GlobalPosition)) return true;
+        if (NetMgr != null && NetMgr.Active)
+            foreach (var ap in NetMgr.AllyPositions()) if (Near(ap)) return true;
+        return false;
+    }
+
+    // host: place the strike, then tell every client to render the same one (damage stays host-side)
+    private void SpawnHauntBolt(Vector3 at)
+    {
+        float t = _tier;
+        var b = new HauntBolt {
+            PlayerDmg = 12f + t * 1.1f,      // fully avoidable, so it's allowed to sting; the stun is the real cost
+            EnemyDmg  = 24f + t * 6f,        // scales with the foes it's hitting — the storm stays relevant late
+        };
+        AddChild(b);
+        b.Init(at, HauntBoltRadius);
+        HauntBoltsFired++;
+        NetMgr?.BroadcastHauntBolt(at, HauntBoltRadius);
+    }
+    public const float HauntBoltRadius = 5.5f;
+    public int HauntBoltsFired { get; private set; }              // (HARNESS) lifetime strike count — the scenario reads cadence off this
+    public void DebugHauntBolt(Vector3 at) => SpawnHauntBolt(at);  // (HARNESS) place one on demand so a capture can be framed exactly
+
+    // client: a visual-only copy of a strike the host just placed
+    public void SpawnRemoteHauntBolt(Vector3 at, float radius)
+    {
+        var b = new HauntBolt { Remote = true };
+        AddChild(b);
+        b.Init(at, radius);
     }
     // arriving in a Haunt: a brief lull (reset the spawn ramp low) so the fresh fight builds up punchily instead of
     // dragging the same blob in with you — the "fresh area = fresh escalation" beat.
@@ -6158,7 +6505,7 @@ void fragment() {
 
         bool nerfMoved = false;
         foreach (var s in _nerfers) if (s != null && GodotObject.IsInstanceValid(s) && Near(s.GlobalPosition)) { var p = s.GlobalPosition; if (NudgeOutOfStructures(ref p, NerfShrine.Radius * 0.6f)) { s.GlobalPosition = p; nerfMoved = true; } }
-        if (nerfMoved && NetMgr != null && NetMgr.Active) NetMgr.BroadcastNerfers(_nerfers);
+        if (nerfMoved && NetMgr != null && NetMgr.Active) NetMgr.BroadcastNerfers(_nerfers, _nerferUses);
 
         if (_bossLair != null && GodotObject.IsInstanceValid(_bossLair) && Near(_bossLair.GlobalPosition)) { var p = _bossLair.GlobalPosition; if (NudgeOutOfStructures(ref p, BossLair.Radius + 1f)) { _bossLair.GlobalPosition = p; NetMgr?.BroadcastBossLair(p, _bossLair.NetId); } }
     }
@@ -6551,10 +6898,13 @@ void fragment() {
     private void BuildScrollOffer()
     {
         ScrollFins.Clear(); ScrollMods.Clear();
+        // (FIX) gate on AbilityUpg, not a hand-kept exclusion list. An ability with no upgrade tree can never be offered an
+        // upgrade card, so selling one hands the player a permanently un-upgradable slot-eater — which is exactly what
+        // Witch's Hollow (HexField) was doing here. This also auto-excludes Crescendo/Fullmod and anything added later.
         foreach (FinType t in System.Enum.GetValues(typeof(FinType)))
-            if (t != FinType.Crescendo && t != FinType.Fullmod && !Player.OwnsFinisher(t)) ScrollFins.Add(t);
+            if (AbilityUpg.IsFin(t) && !Player.OwnsFinisher(t)) ScrollFins.Add(t);
         foreach (ModType t in System.Enum.GetValues(typeof(ModType)))
-            if (!Player.OwnsModifier(t)) ScrollMods.Add(t);
+            if (AbilityUpg.IsMod(t) && !Player.OwnsModifier(t)) ScrollMods.Add(t);
         while (ScrollFins.Count > 4) ScrollFins.RemoveAt(_rng.RandiRange(0, ScrollFins.Count - 1));
         while (ScrollMods.Count > 4) ScrollMods.RemoveAt(_rng.RandiRange(0, ScrollMods.Count - 1));
     }
@@ -7022,9 +7372,15 @@ void fragment() {
             var p = SpreadPointInWorld(_mapOccupied, 95f); _mapOccupied.Add(p);
             var ped = new Pedestal { NetId = NextPickupId() }; AddChild(ped); ped.GlobalPosition = p; Pedestals.Add(ped);
             float daisR = Pedestal.DaisR;
-            PersistentDecks.Add(new Deck { Center = new Vector3(p.X, 0, p.Z), Half = new Vector2(daisR, daisR), TopY = p.Y + Pedestal.TopH, LowPad = true });   // (FIX) deck covers the WHOLE dais footprint; LowPad → step up from any side (no ramp needed)
+            // (AUTHORED) use the hand-placed "platform" collider template; else the old hardcoded LowPad deck + rune-block rim
+            int deckStart = PersistentDecks.Count;
+            if (!ColliderTemplates.Emit("platform", new Vector3(p.X, 0, p.Z), p.Y, Pedestal.DaisScale, 0f, PedestalRimBlockers, PersistentDecks, PersistentRamps))
+            {
+                PersistentDecks.Add(new Deck { Center = new Vector3(p.X, 0, p.Z), Half = new Vector2(daisR, daisR), TopY = p.Y + Pedestal.TopH, LowPad = true });   // deck covers the WHOLE dais footprint; LowPad → step up from any side
+                AddPedestalRim(p, daisR);
+            }
+            for (int di = deckStart; di < PersistentDecks.Count; di++) { var d = PersistentDecks[di]; if (!d.Solid) { d.LowPad = true; PersistentDecks[di] = d; } }   // walkable dais decks: step up from any side (red walls stay solid)
             _pedestalTops.Add(new Vector3(p.X, p.Y + Pedestal.TopH - 0.15f, p.Z));   // effigy sits ON the dais surface
-            AddPedestalRim(p, daisR);
             ids[i] = ped.NetId; px[i] = p.X; pz[i] = p.Z;
         }
         _world?.MarkBlockersDirty();   // flush the new pedestal decks into Decks so they're solid + walkable right away
@@ -7059,8 +7415,13 @@ void fragment() {
             float y = SurfaceHeight(new Vector3(px[i], 0, pz[i]), 1e9f);
             var ped = new Pedestal { NetId = ids[i], Remote = true }; AddChild(ped); ped.GlobalPosition = new Vector3(px[i], y, pz[i]); Pedestals.Add(ped);
             float daisR = Pedestal.DaisR;
-            PersistentDecks.Add(new Deck { Center = new Vector3(px[i], 0, pz[i]), Half = new Vector2(daisR, daisR), TopY = y + Pedestal.TopH, LowPad = true });
-            AddPedestalRim(new Vector3(px[i], y, pz[i]), daisR);
+            int deckStart = PersistentDecks.Count;
+            if (!ColliderTemplates.Emit("platform", new Vector3(px[i], 0, pz[i]), y, Pedestal.DaisScale, 0f, PedestalRimBlockers, PersistentDecks, PersistentRamps))
+            {
+                PersistentDecks.Add(new Deck { Center = new Vector3(px[i], 0, pz[i]), Half = new Vector2(daisR, daisR), TopY = y + Pedestal.TopH, LowPad = true });
+                AddPedestalRim(new Vector3(px[i], y, pz[i]), daisR);
+            }
+            for (int di = deckStart; di < PersistentDecks.Count; di++) { var d = PersistentDecks[di]; if (!d.Solid) { d.LowPad = true; PersistentDecks[di] = d; } }
         }
         _world?.MarkBlockersDirty();
     }
@@ -7119,13 +7480,17 @@ void fragment() {
     private Vector3 SpreadPointInWorld(List<Vector3> placed, float minSep) => SpreadPointInWorld(placed, minSep, 40f, World.WorldRadius - 45f);
     private Vector3 SpreadPointInWorld(List<Vector3> placed, float minSep, float minR, float maxR)
     {
-        Vector3 best = GroundedDrySpawn(Vector3.Zero, minR, maxR); float bestSep = -1f;
-        for (int t = 0; t < 20; t++)
+        // Score each candidate by min separation from already-placed features; heavily penalize spots sitting on a solid
+        // structure (keep/house/etc) so map features never land ON a building — StructureClearance<~5 means we're on/inside one.
+        Vector3 best = GroundedDrySpawn(Vector3.Zero, minR, maxR); float bestScore = -1f;
+        for (int t = 0; t < 24; t++)
         {
             var cand = GroundedDrySpawn(Vector3.Zero, minR, maxR);
             float sep = 1e9f; foreach (var q in placed) sep = Mathf.Min(sep, cand.DistanceTo(q));
-            if (sep > bestSep) { bestSep = sep; best = cand; }
-            if (bestSep > minSep) break;
+            float clr = StructureClearance(cand.X, cand.Z);
+            float score = sep - (clr < 5f ? 1000f : 0f);   // on a structure → disqualified unless nothing better exists
+            if (score > bestScore) { bestScore = score; best = cand; }
+            if (bestScore > minSep) break;
         }
         return best;
     }
@@ -7567,7 +7932,7 @@ void fragment() {
         UpdateWardArmors(dt);   // (NEW) ward-plating pickups, per-warden drop cooldown
         UpdateHaunt(dt);        // (HAUNT) the roaming hot-zone: membership, fill meter, break + respawn    // (MAGNET DROP) host detects a warden stepping onto a dropped lodestone
         DeOverlapInteractables(dt);   // (DE-OVERLAP) shove any on-load interactable that streamed inside a structure back to clear ground
-        if (State == GameState.Playing) { MaybeSpawnGardenPortals(); MaybeSpawnEffigies(); RevealMinimap(); UpdateNerfers(dt); }
+        if (State == GameState.Playing) { MaybeSpawnGardenPortals(); MaybeSpawnEffigies(); RevealMinimap(); UpdateNerfers(dt); UpdateCrimsonRite(dt); }
         if (State == GameState.Playing) MaybeSpawnSkyWhirl();   // (NEW) jungle sky-islands whirlwind, 5 waves into the jungle
         if (InSky) TickSky(dt);                                 // (NEW) sky ritual director + heat + fall-out check
         if (GoldFlash > 0f) GoldFlash -= dt;
@@ -7922,7 +8287,7 @@ void fragment() {
         }
 
         if (_poofSndT > 0f) _poofSndT -= dt;
-        if (_boss != null && GodotObject.IsInstanceValid(_boss) && !_boss.Dead)
+        if (_boss != null && GodotObject.IsInstanceValid(_boss) && !_boss.Dead && SpawnStallT <= 0f)   // (CRIMSON RITE) the boss's own add sections stop too — the clock freezes, it doesn't bank
         {
             _bossAddT -= dt;
             if (_bossAddT <= 0f)
@@ -7979,6 +8344,12 @@ void fragment() {
     private float _heatNudgeT = 12f;   // situational Heat re-evaluation cadence
     private float _mutatorT = 0f;      // active-mutator lifetime
     public float Difficulty => _tier;  // for the HUD difficulty meter
+    // (ULT COST RAMP) the ult's "cost" is its charge meter — as difficulty climbs, every source of charge is divided by this,
+    // so a late-game ult takes up to 2.5x the work to earn. Clients mirror _tier via ApplyWaveState, so this reads right for them too.
+    public float UltCostMul => Mathf.Clamp(1f + (_tier - 1f) * 0.035f, 1f, 2.5f);
+    public float UltGainMul => 1f / UltCostMul;
+    public const float BossDiffRate = 1.5f;   // (BOSS PRESSURE) the difficulty clock runs 1.5x while the world boss is up, then reverts
+    public bool BossFightActive => _bossFightActive;
     // difficulty STAGE = which escalation band we're in (mirrors Hud.DiffBands thresholds): CALM,STIRRING,RESTLESS,MENACING,FRENZIED,RUINOUS,CATACLYSMIC,APOCALYPSE,OBLIVION
     private static readonly float[] StageTiers = { 0f, 3f, 6f, 10f, 15f, 22f, 30f, 45f, 70f };
     public int DiffStage() { int s = 0; for (int i = StageTiers.Length - 1; i >= 0; i--) if (_tier >= StageTiers[i]) { s = i; break; } return s; }
@@ -8001,7 +8372,9 @@ void fragment() {
     {
         if (!IsAuthority) return;   // host/solo drives the clock + stream; clients receive Wave/tier via BroadcastWaveState
         if (!SimActive || InMaze || InExpedition || InSky) return;   // those modes run their own pacing/spawners; in MP the stream keeps flowing while someone's in a menu
-        _diffTime += dt * (1f + 0.04f * (WardenCount - 1));   // (SLOWED) MP clock barely faster now — was ×1.1-1.3, which made co-op ramp to "ultra fast" enemies well before the intended timeline
+        // (SLOWED) MP clock barely faster now — was ×1.1-1.3, which made co-op ramp to "ultra fast" enemies well before the intended timeline.
+        // (BOSS PRESSURE) while the world boss is up the clock runs ×1.5 — the fight itself escalates the world; it reverts the instant he falls.
+        _diffTime += dt * (1f + 0.04f * (WardenCount - 1)) * (_bossFightActive ? BossDiffRate : 1f);
         if (Player != null)   // (#4) track the local player's smoothed velocity so the stream can spawn foes ahead of your run
         {
             Vector3 pv = (_ppInit && dt > 0.0001f) ? (Player.GlobalPosition - _lastPlayerPos) / dt : Vector3.Zero; pv.Y = 0f;
@@ -8027,9 +8400,9 @@ void fragment() {
         ShopSpawnCheck();
         if (tier % 10 == 0) SpawnRoulette();
         if (Player != null && Player.DivineWitch && tier > 1 && tier % 10 == 1) Player.Interventions = Mathf.Min(2, Player.Interventions + 1);
-        if (tier % 5 == 0) SpawnEnemy("miniboss");
+        if (tier % 5 == 0 && SpawnStallT <= 0f) SpawnEnemy("miniboss");   // (CRIMSON RITE) nothing new arrives during the silence
         // (the Warded Phalanx is NOT on a tier cadence — it's a SPECIAL, spawned by the desire director below)
-        if (Goblin == null && _rng.Randf() < (ActiveMutator == WaveMutator.BloodMoon ? 0.25f : 0.06f)) SpawnGoblin();
+        if (Goblin == null && SpawnStallT <= 0f && _rng.Randf() < (ActiveMutator == WaveMutator.BloodMoon ? 0.25f : 0.06f)) SpawnGoblin();
         if (tier >= 3 && tier % 5 != 0 && ActiveMutator == WaveMutator.None && _rng.Randf() < 0.28f)   // a named mutator flares up for ~50s, then rewards on clear
         { ActiveMutator = (WaveMutator)_rng.RandiRange(1, 5); _mutatorT = 50f; MutatorBanner(); }   // synced to clients via BroadcastWaveState's mutator field
     }
@@ -8053,6 +8426,7 @@ void fragment() {
     private void RunStreamDirector(float dt)
     {
         if (!IsAuthority) return;
+        if (SpawnStallT > 0f) return;   // (CRIMSON RITE) the world stopped sending foes — bank nothing, spawn nothing
         float playerFactor = 1f + 0.45f * (WardenCount - 1);
         float openGrace = Mathf.Clamp(_diffTime / 20f, 0.4f, 1f);   // brief ~20s ease-in on the spawn RATE only (so t=0 isn't a burst) — NOT the concurrent cap
         // (HAUNT) fighting inside the hot-zone spawns a DENSER fight — more credits banked, a higher concurrent cap.
@@ -8095,6 +8469,7 @@ void fragment() {
     private float _takerDesire = 0f, _takerCd = 0f;
     private void UpdateSpecialDirector(float dt)
     {
+        if (SpawnStallT > 0f) return;   // (CRIMSON RITE) no Takers / Phalanxes during the silence either
         if (!IsAuthority || !SimActive || InMaze || InExpedition || InSky) return;
         RunPhalanxDirector(dt);   // (NEW) the Warded Phalanx is a special too — but unlike the Taker it works solo
         if (NetMgr == null || !NetMgr.Active || WardenCount < 2) return;   // the TAKER is a co-op pressure tool (0 in solo — it kidnaps you, so someone has to rescue)
@@ -8304,7 +8679,10 @@ void fragment() {
     public float ParticleScale => GfxQuality == 0 ? 0.4f : GfxQuality == 1 ? 0.7f : 1f;   // thinner particle trails on lower presets
 
     // (NEW) screen / resolution settings (Options → Screen tab)
-    public static readonly Vector2I[] ResChoices = { new Vector2I(1280, 720), new Vector2I(1600, 900), new Vector2I(1920, 1080), new Vector2I(2560, 1440) };
+    // APPEND ONLY — ResIndex is persisted as an index into this array, so inserting in the middle would silently
+    // change what every existing save means. (2560x1440 was the old ceiling: windowed mode simply had no 4K entry.
+    // Fullscreen was never affected — it uses the screen's own resolution and greys the dropdown out.)
+    public static readonly Vector2I[] ResChoices = { new Vector2I(1280, 720), new Vector2I(1600, 900), new Vector2I(1920, 1080), new Vector2I(2560, 1440), new Vector2I(3440, 1440), new Vector2I(3840, 2160) };
     public int WindowMode = 0;   // 0 windowed, 1 borderless fullscreen
     public int ResIndex = 2;     // index into ResChoices (default 1920×1080)
     public bool VSync = true;
@@ -8314,13 +8692,74 @@ void fragment() {
     public int MaxFps = 60;       // (NEW) explicit frame cap (30/60/90/120/144). Persisted. Independent of V-Sync + the Painterly quality.
     public static readonly int[] FpsChoices = { 30, 60, 90, 120, 144 };
     public void SetMaxFps(int fps) { MaxFps = fps; Engine.MaxFps = Mathf.Max(0, fps); }
+    // (PERF) 3D RENDER SCALE — renders the 3D world at a fraction of the window resolution and upscales, while the UI stays crisp
+    // at full res. The single biggest lever at high resolutions (the game is fill-rate bound at 4K: 0.75 ≈ +12%, 0.5 ≈ +50% fps).
+    public float RenderScale = 1f;
+    public static readonly float[] RenderScaleChoices = { 0.5f, 0.6f, 0.75f, 0.85f, 1f };
+    public void SetRenderScale(float s) { RenderScale = Mathf.Clamp(s, 0.4f, 1f); ApplyRenderScale(); }
+    // (UPSCALER) how the reduced 3D image is scaled back up. 0 Bilinear (cheapest, softest), 1 FSR 1.0 (spatial, sharper),
+    // 2 FSR 2.2 (TEMPORAL — near-native quality, the DLSS-equivalent Godot ships; slightly higher cost than bilinear).
+    public int UpscaleMode = 0;
+    public void SetUpscaleMode(int m) { UpscaleMode = Mathf.Clamp(m, 0, 2); ApplyRenderScale(); }
+    public void ApplyRenderScale()
+    {
+        var vp = GetViewport();
+        if (vp == null) return;
+        // at native scale, force plain Bilinear passthrough (FSR modes add cost for no upscaling benefit at 1.0)
+        vp.Scaling3DMode = RenderScale >= 0.999f ? Viewport.Scaling3DModeEnum.Bilinear
+                         : UpscaleMode == 2 ? Viewport.Scaling3DModeEnum.Fsr2
+                         : UpscaleMode == 1 ? Viewport.Scaling3DModeEnum.Fsr
+                         : Viewport.Scaling3DModeEnum.Bilinear;
+        vp.Scaling3DScale = RenderScale;
+    }
     public int FarRing => ViewDist <= 0 ? 3 : ViewDist == 1 ? 4 : 5;
     public void SetViewDist(int v) { ViewDist = Mathf.Clamp(v, 0, 2); _world?.RefreshStreaming(); }
+    // (DEV) nerf_shrine scenario hooks — place a chosen shrine kind at a chosen spot, and pay a share, without hunting the map
+    public NerfShrine DebugPlaceNerfer(NerfKind kind, Vector3 pos, int uses)
+    {
+        foreach (var s in _nerfers.ToArray()) if (GodotObject.IsInstanceValid(s)) s.QueueFree();
+        _nerfers.Clear(); _nerferPaid.Clear(); _nerferPaidRemote = 0; _nerferPaidMe = false;
+        _summonerT = 0f; _summonerShrine = null; SummonerHeld = false;
+        _sacrificeArmed = false; _sanctuaryArmed = false; _sacMinibosses.Clear();
+        _nerferUses = uses;
+        var sh = new NerfShrine { Kind = kind, NetId = NextPickupId() };
+        AddChild(sh); sh.GlobalPosition = new Vector3(pos.X, SurfaceHeight(pos, 1e9f), pos.Z); _nerfers.Add(sh);
+        return sh;
+    }
+    public void DebugPayNerfer() { var s = CurrentNerfer; if (s != null) { Souls += NerferCostEach; TryActivateNerfer(s); } }
+    // (DEV) crimson_rite scenario: stand up a real boss fight — world boss + a miniboss + a mixed horde (incl. a special) —
+    // and open the rite over it, so the detonation's include/exclude rules are actually testable.
+    public Enemy DebugArmCrimsonRite(Vector3 bossAt, int adds)
+    {
+        bossAt = new Vector3(bossAt.X, SurfaceHeight(bossAt, 1e9f), bossAt.Z);
+        var b = SpawnBossAt("boss", bossAt);
+        _boss = b; _bossFightActive = true;   // SpawnBossAt alone doesn't claim the world-boss slot — HostSummonBoss does that, so mirror it here
+        SpawnBossAt("miniboss", bossAt + new Vector3(9f, 0, 4f));                       // boss-tier → must SURVIVE the rite
+        string[] mix = { "shade", "swarmer", "caster", "brute", "flyer", "zapper" };
+        for (int i = 0; i < adds; i++)
+        {
+            float a = i * 2.399963f, r = 7f + (i % 6) * 3.5f;
+            var p = bossAt + new Vector3(Mathf.Cos(a) * r, 0, Mathf.Sin(a) * r);
+            var e = SpawnEnemyForTest(mix[i % mix.Length], new Vector3(p.X, SurfaceHeight(p, 1e9f), p.Z));
+            if (e != null) e.WakeSilent();
+        }
+        SpawnEnemyForTest("taker", bossAt + new Vector3(-11f, 0, 6f));                   // a SPECIAL → must FALL to the rite
+        SpawnRiteSigils(bossAt);
+        return b;
+    }
+    public int DebugAliveCount(bool bossTier)   // (DEV) count survivors by tier so the rite's exclusion rule is assertable
+    {
+        int n = 0;
+        foreach (var e in Enemies) if (e != null && GodotObject.IsInstanceValid(e) && !e.Dead && e.IsBoss == bossTier) n++;
+        return n;
+    }
+    public RiteSigil DebugFirstUnlitSigil() { foreach (var s in RiteSigils) if (s != null && GodotObject.IsInstanceValid(s) && !s.Lit) return s; return null; }
     public void DebugGrovePatch(Vector3 c) => _world?.DebugGrovePatch(c);   // (DEV) in-world prop/structure validation patch (grove_showcase scenario)
     public Vector3 DebugSpawnClimbableKeep(Vector3 c) => _world != null ? _world.DebugSpawnClimbableKeep(c) : new Vector3(c.Y, c.X, c.Z);   // (DEV) → (roofY, xStairWorld, stairFarZ)
     public Godot.Collections.Array<Vector3> DebugStructureAudit(Vector3 c) => _world != null ? _world.DebugStructureAudit(c) : new Godot.Collections.Array<Vector3>();
     public void ApplyWindow()
     {
+        ApplyRenderScale();   // (PERF) re-assert the 3D render scale (viewport exists by boot; harmless if not)
         Engine.MaxFps = Mathf.Max(0, MaxFps);   // (NEW) explicit frame cap (applies whether V-Sync is on or off)
         DisplayServer.WindowSetVsyncMode(VSync ? DisplayServer.VSyncMode.Enabled : DisplayServer.VSyncMode.Disabled);
         if (WindowMode == 1) { DisplayServer.WindowSetMode(DisplayServer.WindowMode.Fullscreen); return; }
@@ -8355,11 +8794,11 @@ void fragment() {
     }
     public void SetGfxQuality(int q)
     {
-        GfxQuality = Mathf.Clamp(q, 0, 2);
+        GfxQuality = Mathf.Clamp(q, 0, 3);   // 0 Low / 1 Med / 2 High / 3 Ultra
         GfxBloom = GfxQuality >= 1;   // preset defaults; each toggle can still be flipped individually
-        GfxSsao = GfxQuality >= 2;
-        GfxSsil = GfxQuality >= 2;
-        ShadowQuality = GfxQuality;   // (NEW) the master preset sets a matching shadow level; the separate Shadows control below overrides it
+        GfxSsao = GfxQuality >= 2;    // High+
+        GfxSsil = GfxQuality >= 3;    // (PERF) SSIL / fake-GI is the priciest post-effect → ULTRA only, not High
+        ShadowQuality = Mathf.Min(GfxQuality, 2);   // shadows top out at High's 4-split (Ultra doesn't add a 5th)
         ApplyGraphics();
     }
     public void SetShadowQuality(int q) { ShadowQuality = Mathf.Clamp(q, 0, 2); ApplyShadowQuality(); }   // (NEW) independent shadow control
@@ -8383,6 +8822,8 @@ void fragment() {
         cfg.SetValue("options", "shadowquality", ShadowQuality);
         cfg.SetValue("options", "maxfps", MaxFps);
         cfg.SetValue("options", "texquality", TextureQuality);
+        cfg.SetValue("options", "renderscale", RenderScale);
+        cfg.SetValue("options", "upscale", UpscaleMode);
         Perks.Save(cfg);   // (NEW) persist the coven perk trees (owned + equipped per witch)
         MetaUnlocks.Save(cfg);   // (NEW) persist the general gold meta-tree (+fin / +mod / +mana)
         cfg.Save("user://grove_save.cfg");
@@ -8402,8 +8843,8 @@ void fragment() {
             DmgNumbers = cfg.GetValue("options", "dmgnumbers", false).AsBool();
             GfxQuality = cfg.GetValue("options", "gfxquality", 2).AsInt32();
             GfxBloom = cfg.GetValue("options", "gfxbloom", true).AsBool();
-            GfxSsao = cfg.GetValue("options", "gfxssao", true).AsBool();
-            GfxSsil = cfg.GetValue("options", "gfxssil", true).AsBool();
+            GfxSsao = GfxQuality >= 2;    // (MIGRATION) SSAO/SSIL are preset-driven now — derive from the preset so old High-SSIL
+            GfxSsil = GfxQuality >= 3;    // saves pick up the new "SSIL = Ultra only" perf default instead of the stale saved flag
             WindowMode = cfg.GetValue("options", "windowmode", 0).AsInt32();
             ResIndex = cfg.GetValue("options", "resindex", 2).AsInt32();
             VSync = cfg.GetValue("options", "vsync", true).AsBool();
@@ -8411,8 +8852,10 @@ void fragment() {
             ShadowQuality = cfg.GetValue("options", "shadowquality", 1).AsInt32();
             MaxFps = cfg.GetValue("options", "maxfps", 60).AsInt32();          // default 60
             TextureQuality = cfg.GetValue("options", "texquality", 2).AsInt32();   // default High
+            RenderScale = (float)cfg.GetValue("options", "renderscale", 1f).AsDouble();   // (PERF) 3D render scale (1.0 = native)
+            UpscaleMode = cfg.GetValue("options", "upscale", 0).AsInt32();                // 0 Bilinear / 1 FSR1 / 2 FSR2
             ApplyGraphics();   // no-op if the environment isn't built yet; BuildWorld re-applies
-            ApplyWindow();
+            ApplyWindow();     // …also applies the render scale
             Perks.Load(cfg);   // (NEW) restore the coven perk trees
             MetaUnlocks.Load(cfg);   // (NEW) restore the general gold meta-tree
         }
@@ -8466,6 +8909,10 @@ void fragment() {
         foreach (var c in Chests.ToArray()) if (GodotObject.IsInstanceValid(c)) c.QueueFree(); Chests.Clear();
         if (_bossLair != null && GodotObject.IsInstanceValid(_bossLair)) { _bossLair.QueueFree(); _bossLair = null; }   // (BOSS-LAIR) reset
         _bossFightActive = false; WorldBossDown = false;
+        _nerferUses = 0; _lastNerfKind = -1; _nerferPaid.Clear(); _nerferPaidRemote = 0; _nerferPaidMe = false;   // (NERFER) fresh run → the soul toll resets to 100 each
+        _summonerT = 0f; _summonerShrine = null; SummonerHeld = false;
+        ClearRiteSigils(); _riteFired = false; _riteDrawT = 0f; _riteKillQueue.Clear(); SpawnStallT = 0f;   // (CRIMSON RITE) reset
+        if (_pentagram != null && GodotObject.IsInstanceValid(_pentagram)) { _pentagram.QueueFree(); _pentagram = null; }
         ClearDiscovered();   // (NEW) reset the fog of war
         Wave = 0; Heat = 1f; Score = 0; _waveTimer = 0f; _magnetT = 0f; ActiveMutator = WaveMutator.None; ResetDifficulty();
         _started = false; _ultOffered = false; ReadyCount = 0; NetMgr?.ResetReady();
@@ -8473,6 +8920,8 @@ void fragment() {
         {
             Player.Fin.Clear(); Player.Mods.Clear(); Player.Minors.Clear();
             Player.S = new Stats();
+            Player.ResetWitchScalars();   // (MP retry) the ~50 witch scalars perks/cards mutate directly; Stats alone isn't the whole warden
+            Player.ResetPerks();          // and drop the lit perk nodes + fired hidden routes from the dead run
             Player.DamageMul = 1f; Player.NightAffinity = false; Player.Interventions = 0;
             Player.DivineWitch = Player.CrimsonWitch = Player.VerdantWitch = Player.GaleWitch = Player.FrostWitch = Player.ForsakenWitch = Player.EmberWitch = Player.ArcaneWitch = false;
             Player.Level = 1; Player.Xp = 0f; Player.XpNext = 26f; Player.Combo = 0; Player.BestCombo = 0;

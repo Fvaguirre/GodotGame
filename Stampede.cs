@@ -24,13 +24,18 @@ public partial class Stampede : Node3D
     private MultiMesh _mm;
     private static Mesh _critMesh;
 
-    private struct Crit { public bool Active; public float Lane, Dist, Speed, Phase, GY, GYT, Scale; }
+    private struct Crit { public bool Active; public float Lane, Dist, Speed, Phase, GY, GYT, Scale, Yaw; }
     private readonly Crit[] _crits = new Crit[Cap];
     private readonly Stack<int> _free = new();
     private int _liveCount = 0;
     private float _minDist = 1e9f, _maxDist = -1e9f;   // the occupied lane band (for the analytic trample)
 
     private readonly Dictionary<ulong, float> _hitCd = new();
+
+    // --- dev/ai hooks (the wild_swarm scenario asserts on these) ---
+    public int DebugSurfaces => _mm?.Mesh is ArrayMesh am ? am.GetSurfaceCount() : 0;   // 1 = the old single-material pill
+    public int DebugLive => _liveCount;
+    public float DebugLead => _maxDist;      // how far the front of the herd has run down the lane
 
     private static readonly string[] Lines = {
         "WEEEE!", "I get the eyeballs!", "CHAAARGE!", "for the grove!", "outta my way!",
@@ -48,21 +53,70 @@ public partial class Stampede : Node3D
         Game.I.Sfx?.Rustle();
     }
 
-    // one shared low-poly brown ent body baked to a single Mesh so every critter is one MultiMesh instance
+    // The critters are her ACTUAL tree-ents, not brown pills: build one low-poly `Thornling.BuildEntBody`, freeze it in a
+    // mid-stride run pose, and BAKE the whole node tree down to a single multi-surface mesh (one surface per material) so
+    // the swarm still draws as a handful of instanced calls. Built once and cached for the process.
+    // (An earlier perf pass replaced the body with a bare CapsuleMesh — that's what made the stampede render as pills.)
     private static Mesh CritMesh()
     {
         if (_critMesh != null) return _critMesh;
-        _critMesh = new CapsuleMesh { Radius = 0.42f, Height = 1.25f, RadialSegments = 6, Rings = 3 };
+        var root = new Node3D();
+        Thornling.BuildEntBody(root, out var footL, out var footR, out var armL, out var armR, out var tuft, out _, out _, out _, detailed: true, segs: 6);
+        // frozen run pose — the per-instance hop/lean below does the rest of the motion
+        footL.Position += new Vector3(0f, 0.12f, 0.12f);
+        footR.Position += new Vector3(0f, 0f, -0.12f);
+        armL.Rotation = new Vector3(-1.0f, 0f, 0.3f);
+        armR.Rotation = new Vector3(-1.0f, 0f, -0.3f);
+        tuft.Rotation = new Vector3(-0.2f, 0f, 0f);
+        _critMesh = Bake(root);
+        root.Free();   // never entered the tree; the baked geometry is all we keep
         return _critMesh;
+    }
+
+    // flatten a node tree of MeshInstance3Ds into one ArrayMesh, grouping by material so each distinct ent part
+    // (bark, leaf, eye glow, …) becomes one surface that keeps its own material under instancing
+    private static Mesh Bake(Node3D root)
+    {
+        var tools = new Dictionary<Material, SurfaceTool>();
+        var order = new List<Material>();
+        void Walk(Node n, Transform3D xf)
+        {
+            foreach (var child in n.GetChildren())
+            {
+                if (child is not Node3D n3) continue;
+                var t = xf * n3.Transform;
+                if (n3 is MeshInstance3D mi && mi.Mesh != null)
+                {
+                    var mat = mi.MaterialOverride ?? mi.Mesh.SurfaceGetMaterial(0);
+                    if (mat != null)
+                    {
+                        if (!tools.TryGetValue(mat, out var st))
+                        {
+                            st = new SurfaceTool();
+                            st.Begin(Mesh.PrimitiveType.Triangles);
+                            tools[mat] = st; order.Add(mat);
+                        }
+                        for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++) st.AppendFrom(mi.Mesh, s, t);
+                    }
+                }
+                Walk(n3, t);
+            }
+        }
+        Walk(root, Transform3D.Identity);
+        ArrayMesh am = null;
+        foreach (var mat in order)
+        {
+            am = tools[mat].Commit(am);
+            am.SurfaceSetMaterial(am.GetSurfaceCount() - 1, mat);
+        }
+        return am;
     }
 
     private void BuildMultiMesh()
     {
         _mm = new MultiMesh { TransformFormat = MultiMesh.TransformFormatEnum.Transform3D, Mesh = CritMesh(), InstanceCount = Cap };
         _mmi = new MultiMeshInstance3D { Multimesh = _mm, CastShadow = GeometryInstance3D.ShadowCastingSetting.Off };
-        var mat = Game.ToonEmissive(new Color(0.42f, 0.30f, 0.16f), 0.35f, 0.02f);   // brown-bark, faintly lit
-        _mmi.MaterialOverride = mat;
-        AddChild(_mmi);
+        AddChild(_mmi);   // no MaterialOverride — the baked mesh carries the ent's own per-part materials
     }
 
     private void HideInstance(int i) => _mm.SetInstanceTransform(i, new Transform3D(Basis.Identity.Scaled(Vector3.Zero), new Vector3(0, -9999f, 0)));
@@ -79,6 +133,7 @@ public partial class Stampede : Node3D
             Speed = _speed * (float)GD.RandRange(0.92, 1.12),
             Phase = (float)GD.RandRange(0.0, 6.28),
             GY = 0f, GYT = 0f, Scale = (float)GD.RandRange(0.6, 0.95),
+            Yaw = (float)GD.RandRange(-0.35, 0.35),   // the herd fans out a little instead of marching in lockstep
         };
         _liveCount++;
     }
@@ -114,8 +169,8 @@ public partial class Stampede : Node3D
             if (c.GYT <= 0f) { c.GY = Game.I.SurfaceHeight(new Vector3(bp.X, 0f, bp.Z), 1e9f); c.GYT = 0.18f + GD.Randf() * 0.1f; }
             float hop = Mathf.Abs(Mathf.Sin(c.Phase)) * 0.3f;
             float lean = Mathf.Sin(c.Phase) * 0.18f;
-            var basis = (new Basis(Vector3.Up, yaw) * new Basis(Vector3.Right, lean)).Scaled(Vector3.One * c.Scale);
-            _mm.SetInstanceTransform(i, new Transform3D(basis, new Vector3(bp.X, c.GY + hop + 0.62f * c.Scale, bp.Z)));
+            var basis = (new Basis(Vector3.Up, yaw + c.Yaw) * new Basis(Vector3.Right, lean)).Scaled(Vector3.One * c.Scale);
+            _mm.SetInstanceTransform(i, new Transform3D(basis, new Vector3(bp.X, c.GY + hop, bp.Z)));   // the ent body's origin is its feet
 
             if (c.Dist < _minDist) _minDist = c.Dist;
             if (c.Dist > _maxDist) _maxDist = c.Dist;

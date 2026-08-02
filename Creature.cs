@@ -5,7 +5,7 @@ using System.Collections.Generic;
 // maps each enemy type string to a kind (e.g. brute/boss -> Orc, flyer/diver -> Mosquito). Add a new
 // kind here only if a new enemy needs a distinct body; otherwise reuse an existing one. Handles the
 // mesh build + walk/attack animation for the enemy.
-public enum CreatureKind { Goblin, Orc, Spider, Mosquito, Bomber, Zapper, Zombie, HollowBoss, Crocodile, Troll, Pigmy, Pterodactyl, Bat, Snake }   // Crocodile + jungle set (NEW)
+public enum CreatureKind { Goblin, Orc, Spider, Mosquito, Bomber, Zapper, Zombie, HollowBoss, Crocodile, Troll, Pigmy, Pterodactyl, Bat, Snake, Taker, Withered }   // Crocodile + jungle set (NEW); Taker = authored kidnapper w/ full action-clip set (NEW); Withered = authored spellcaster (caster/stunner/healer/empowerer) (NEW)
 
 // Procedurally-built, procedurally-animated enemy models (primitive-based, but layered limbs with a
 // walk/flap cycle and knee-bend so they read as creatures). Each instance is randomly varied so no
@@ -39,10 +39,22 @@ public partial class Creature : Node3D
     // ---- authored goblin (GLB mesh + baked walk anim + procedural slash) ----
     private bool _gobAuthored;
     private AnimationPlayer _gobAp; private string _gobWalkKey;
-    private Skeleton3D _gobSkel; private GoblinSlashMod _gobSlash;
+    private Skeleton3D _gobSkel; private GoblinSlashMod _gobSlash, _gobSlash2;   // _gobSlash2 = the second arm for the two-hand zombie chop
     private int _gobArmL = -1, _gobArmR = -1, _gobForeL = -1, _gobForeR = -1;
-    private bool _gobSlashLeft;   // which arm the CURRENT strike uses (randomized per Strike)
-    private MeshInstance3D _slashVfx; private float _slashVfxT; private const float SlashVfxDur = 0.32f;
+    private bool _gobSlashLeft;   // which arm the CURRENT strike uses (randomized per Strike, single-arm goblin)
+    private bool _gobBothArms;    // (NEW) zombie: chop with BOTH arms at once (no random pick), doubled hit
+    private MeshInstance3D _slashVfx, _slashVfx2; private float _slashVfxT; private const float SlashVfxDur = 0.32f;
+    // ---- biped action-clip state machine (authored goblin/zombie/ogre/taker share the SAME rig, so one clip library drives all) ----
+    private readonly System.Collections.Generic.Dictionary<string, string> _bClip = new();   // canonical name → playable AnimationPlayer key
+    private ZombieReachMod _reachMod; private float _bReach, _bReachTarget;   // taker grab-arms telegraph (0..1)
+    private WinceMod _winceMod; private float _wince; private int _winceVar;   // procedural hurt flinch on a direct hit (impulse → decays)
+    private enum BState { Loco, Climb, Airborne, WallDown, StandUp, Attack }   // Attack = the boss's one-shot attack/death clips
+    private BState _bState = BState.Loco;
+    private bool _bRun;                 // Loco uses the run clip (taker dash) instead of walk
+    private string _bPlaying = "";      // canonical key currently playing (so we only Play() on a change)
+    private string _bStandKey = "standup4";   // which get-up clip the pending StandUp will use
+    private int _bAirPhase = 0;         // Airborne: 0 = climb-slip lead-in (climbfall), 1 = free-fall loop (fall1)
+    private bool _bOneShotDone;         // a WallDown/StandUp one-shot has reached its end
     private float _scream;                          // (NEW) zombie shriek-to-sky overlay (arms up, lean back)
     public void Scream() { _scream = 1f; }
     public int IdlePose = 0;                        // (NEW) 0 stand, 1 lie on floor, 2 slump, 3 snicker (idle swarmers)
@@ -79,36 +91,73 @@ public partial class Creature : Node3D
     public void Strike()
     {
         _strike = 1f;
-        if (_gobAuthored && _gobSlash != null)   // pick + mirror + RANDOMIZE which arm chops this strike
+        if (_gobAuthored && _gobSlash != null)
         {
-            _gobSlashLeft = R(0f, 1f) < 0.5f;
-            _gobSlash.Arm = _gobSlashLeft ? _gobArmL : _gobArmR;
-            _gobSlash.Fore = _gobSlashLeft ? _gobForeL : _gobForeR;
-            _gobSlash.Side = _gobSlashLeft ? -1f : 1f;
-            _slashVfxT = SlashVfxDur;   // fire the crescent arc
+            if (_gobBothArms)   // (ZOMBIE) chop with BOTH arms simultaneously — left on mod 1, right on mod 2
+            {
+                _gobSlash.Arm = _gobArmL; _gobSlash.Fore = _gobForeL; _gobSlash.Side = -1f;
+                if (_gobSlash2 != null) { _gobSlash2.Arm = _gobArmR; _gobSlash2.Fore = _gobForeR; _gobSlash2.Side = 1f; }
+            }
+            else   // (GOBLIN) pick + mirror + RANDOMIZE which single arm chops this strike
+            {
+                _gobSlashLeft = R(0f, 1f) < 0.5f;
+                _gobSlash.Arm = _gobSlashLeft ? _gobArmL : _gobArmR;
+                _gobSlash.Fore = _gobSlashLeft ? _gobForeL : _gobForeR;
+                _gobSlash.Side = _gobSlashLeft ? -1f : 1f;
+            }
+            _slashVfxT = SlashVfxDur;   // fire the crescent arc(s)
         }
     }
 
     public bool IsAuthoredGoblin => _gobAuthored;
-    // (harness) deterministically chop with a chosen arm so a scenario can capture each side.
+    // (harness) deterministically chop so a scenario can capture it: the zombie fires BOTH arms, the goblin the chosen side.
     public void DebugSlash(bool left)
     {
         if (!_gobAuthored || _gobSlash == null) return;
-        _gobSlashLeft = left;
-        _gobSlash.Arm = left ? _gobArmL : _gobArmR;
-        _gobSlash.Fore = left ? _gobForeL : _gobForeR;
-        _gobSlash.Side = left ? -1f : 1f;
+        if (_gobBothArms)
+        {
+            _gobSlash.Arm = _gobArmL; _gobSlash.Fore = _gobForeL; _gobSlash.Side = -1f;
+            if (_gobSlash2 != null) { _gobSlash2.Arm = _gobArmR; _gobSlash2.Fore = _gobForeR; _gobSlash2.Side = 1f; }
+        }
+        else
+        {
+            _gobSlashLeft = left;
+            _gobSlash.Arm = left ? _gobArmL : _gobArmR;
+            _gobSlash.Fore = left ? _gobForeL : _gobForeR;
+            _gobSlash.Side = left ? -1f : 1f;
+        }
         _slashVfxT = SlashVfxDur;
         _strike = 1f; _swing = 0f; _swingTarget = 0f;
     }
 
     private const string GoblinGlb = "res://assets/models/enemies/goblin.glb";
-    // Load the authored goblin GLB (mesh + baked walk), scale to match the old silhouette, play the walk, and set up the
-    // procedural-slash modifier. Returns false (→ procedural fallback) if the asset/skeleton/anim is missing.
-    private bool AuthoredGoblin(float s, Material accent)
+    private const string ZombieGlb = "res://assets/models/enemies/zombie.glb";   // (NEW) the rigged zombie-goblin (same Meshy biped skeleton as the goblin)
+    private const string OgreGlb = "res://assets/models/enemies/ogre.glb";        // (NEW) the rigged buffoon ogre (same Meshy biped skeleton) — replaces the big procedural Orc
+    private const string TakerGlb = "res://assets/models/enemies/taker.glb";      // (NEW) the kidnapper taker — ALSO the shared source of run/fall/climb/stand-up action clips for every biped
+    private const string HollowGlb = "res://assets/models/enemies/hollow_man.glb";   // (NEW) THE HOLLOW MOON — same Meshy biped rig, 13 clips merged into one GLB (walk/cast1/cast6/gripthrow/stomp/charge/death/…)
+    private const string WitheredGlb = "res://assets/models/enemies/withered_king.glb";   // (NEW) THE WITHERED KING — the grove's spellcaster body; ALSO the shared source of the mage cast clips
+    private bool AuthoredGoblin(float s, Material accent) => AuthoredBiped(GoblinGlb, s, accent, false);
+    private bool AuthoredZombie(float s, Material accent) => AuthoredBiped(ZombieGlb, s, accent, true);
+    // The ogre carries the mini-boss and the sieger, both of which throw projectiles — graft the withered king's mage cast
+    // so their bolts have a real wind-up animation instead of firing out of a walk cycle.
+    private bool AuthoredOgre(float s, Material accent) => AuthoredBiped(OgreGlb, s, accent, false, graftCast: true);   // single-arm slash, like the plain goblin
+    private bool AuthoredTaker(float s, Material accent) => AuthoredBiped(TakerGlb, s, accent, false);  // single-arm punch + the full action set (run/fall/climb/stand-up)
+    // The caster family (caster/stunner/healer/empowerer): slighter than a goblin and never size-varied into a giant, and it
+    // ships its own cast clips so there's nothing to graft.
+    private bool AuthoredWithered(float s, Material accent) => AuthoredBiped(WitheredGlb, s, accent, false, heightMul: 3.0f);
+    // The boss: taller than his hitbox radius implies (his head must clear the Radius*1.9 crit band), never size-varied, and he
+    // ships his OWN full clip set — so don't pay to load + retarget the taker's shared library mid-fight.
+    private bool AuthoredHollow(float s, Material accent) => AuthoredBiped(HollowGlb, s, accent, false, heightMul: 3.6f, vary: false, graftShared: false, hollow: true);
+
+    // Load an authored Meshy-biped GLB (mesh + baked walk), scale to match the old silhouette, play the walk, and set up the
+    // procedural-slash modifier(s). bothArms = the zombie's two-hand chop (two slash mods). Returns false (→ procedural fallback)
+    // if the asset/skeleton/anim is missing. Reused by both the goblin and the zombie (identical bone names: LeftArm/RightArm/…).
+    private bool AuthoredBiped(string glbPath, float s, Material accent, bool bothArms,
+                               float heightMul = 2.8f, bool vary = true, bool graftShared = true, bool hollow = false,
+                               bool graftCast = false)
     {
-        if (!ResourceLoader.Exists(GoblinGlb)) return false;
-        var model = ResourceLoader.Load<PackedScene>(GoblinGlb)?.Instantiate<Node3D>();
+        if (!ResourceLoader.Exists(glbPath)) return false;
+        var model = ResourceLoader.Load<PackedScene>(glbPath)?.Instantiate<Node3D>();
         if (model == null) return false;
         AddChild(model);
         ModelAssets.Painterlify(model);   // opaque + matte (Meshy imports translucent/glossy)
@@ -116,14 +165,17 @@ public partial class Creature : Node3D
         _gobAp = ModelAssets.FindAnimPlayer(model);
         if (_gobSkel == null || _gobAp == null) { model.QueueFree(); return false; }
         _gobAuthored = true;
+        _gobBothArms = bothArms;
+        _hollow = hollow;
 
         // Scale by the mesh's OWN (skin-space) AABB height — NOT the node-hierarchy one. This rig's Armature carries a 0.01
         // node scale that the SKINNED mesh ignores (bones compensate), so FitHeight (which measures through the node scale)
         // would size the goblin ~100× too big. The mesh resource AABB is in true skin space. Target ≈ the intended enemy visual
         // height (feet at −Radius, head ~Radius*1.9 up ⇒ ~Radius*2.9 tall) so the model fills its hitbox/ground-ring.
-        float target = s * 2.8f * R(0.92f, 1.1f);
+        float target = s * heightMul * (vary ? R(0.92f, 1.1f) : 1f);
         float nativeH = 1.7f;
         var meshInst = FindMesh(model);
+        _gobMesh = meshInst;   // kept so phase 2 can clone it into a body-shaped aura shell
         if (meshInst?.Mesh != null) { float h = meshInst.Mesh.GetAabb().Size.Y; if (h > 0.05f) nativeH = h; }
         model.Scale = Vector3.One * (target / nativeH);
         // facing: the model's +Z (Meshy walk-forward) already aligns with the Creature's +Z (which Enemy yaws toward the target),
@@ -140,23 +192,27 @@ public partial class Creature : Node3D
             model.Position = new Vector3(0, -s - footLocal, 0);
         }
 
-        ModelAssets.StripHorizontalDrift(_gobAp);                  // freeze the walk clip's forward root drift → walk in place
-        foreach (StringName lib in _gobAp.GetAnimationLibraryList())
-        {
-            var l = _gobAp.GetAnimationLibrary(lib);
-            foreach (StringName a in l.GetAnimationList())
-            {
-                l.GetAnimation(a).LoopMode = Animation.LoopModeEnum.Linear;
-                _gobWalkKey ??= ((string)lib).Length == 0 ? (string)a : $"{(string)lib}/{(string)a}";
-            }
-        }
-        if (_gobWalkKey != null) _gobAp.Play(_gobWalkKey);
+        RegisterBipedClips(graftShared, graftCast);   // map this model's own clips + graft the SHARED action library (run/fall/climb/stand-up) so EVERY biped can play them
+        if (_bClip.TryGetValue("walk", out var walkKey)) { _gobWalkKey = walkKey; _gobAp.Play(walkKey); }
 
         _gobArmL = _gobSkel.FindBone("LeftArm"); _gobForeL = _gobSkel.FindBone("LeftForeArm");
         _gobArmR = _gobSkel.FindBone("RightArm"); _gobForeR = _gobSkel.FindBone("RightForeArm");
         int spine = _gobSkel.FindBone("Spine01"); if (spine < 0) spine = _gobSkel.FindBone("Spine");
         _gobSlash = new GoblinSlashMod { Spine = spine };
         _gobSkel.AddChild(_gobSlash);
+        if (bothArms)   // (ZOMBIE) a second modifier for the other arm; Spine=-1 so the torso lean isn't applied twice
+        {
+            _gobSlash2 = new GoblinSlashMod { Spine = -1 };
+            _gobSkel.AddChild(_gobSlash2);
+        }
+        // (TAKER) both-arms-forward grab telegraph — a no-op at Reach 0, so it's harmless on the goblin/zombie/ogre that never grab
+        _reachMod = new ZombieReachMod { ArmL = _gobArmL, ForeL = _gobForeL, ArmR = _gobArmR, ForeR = _gobForeR };
+        _gobSkel.AddChild(_reachMod);
+        // procedural hurt flinch (all bipeds) — recoils the torso/head on a direct hit; no-op at Wince 0
+        int chest = _gobSkel.FindBone("Spine02"); if (chest < 0) chest = _gobSkel.FindBone("Spine01");
+        int head = _gobSkel.FindBone("Head"); if (head < 0) head = _gobSkel.FindBone("neck");
+        _winceMod = new WinceMod { Spine = spine, Chest = chest, Head = head };
+        _gobSkel.AddChild(_winceMod);
 
         // slash-arc VFX: a crescent blade in the Creature's OWN frame (broad face toward the player, who the goblin faces), swept
         // across the front by the strike. Creature-local placement is predictable (unlike an unknown hand-bone axis).
@@ -169,25 +225,471 @@ public partial class Creature : Node3D
             Visible = false,
         };
         AddChild(_slashVfx);
+        if (bothArms)   // second crescent for the other hand
+        {
+            _slashVfx2 = new MeshInstance3D
+            {
+                Mesh = Game.CrescentBladeMesh(),
+                MaterialOverride = Game.CrescentBladeMat(tint),
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+                Visible = false,
+            };
+            AddChild(_slashVfx2);
+        }
+        if (_hollow) BuildHollowExtras();
         return true;
     }
+
+    // ---- THE HOLLOW MOON extras: procedural gesture mod, the held boulder, and the arcane hand glow --------------------------
+    private bool _hollow;
+    private BossGestureMod _gest;
+    private MeshInstance3D _heldRock;
+    private readonly List<MeshInstance3D> _handGlow = new();
+    private readonly List<ShaderMaterial> _handGlowMats = new();
+    private int _handL = -1, _handR = -1;
+    private float _glow, _glowTarget;
+    private string _bAtkClip; private float _bAtkSpeed = 1f;
+    private string _locoWalk = "walk";        // his default locomotion clip — phase 2 swaps it to the unsteady walk
+    private MeshInstance3D _gobMesh;   // the authored model's skinned mesh — cloned into the phase-2 aura shell
+    private Node3D _p2Aura; private readonly List<MeshInstance3D> _p2Flames = new();
+    private readonly List<ShaderMaterial> _p2AuraMats = new();
+    private float _p2Phase, _p2AuraScale = 1f; private bool _p2Spin;
+    public bool IsAuthoredHollow => _hollow;
+
+    // PHASE 2: a roaring column of arcane energy wrapped around him, plus the lurching unsteady walk. The aura is the
+    // at-a-glance "this is not the same fight" read, so it's built big and always on — not a per-attack tell.
+    public void SetPhase2()
+    {
+        if (!_hollow || _p2Aura != null) return;
+        _locoWalk = _bClip.ContainsKey("walkunsteady") ? "walkunsteady" : "walk";
+        _bPlaying = "";
+        _p2Aura = new Node3D();
+        AddChild(_p2Aura);
+        var arc = new Color(0.42f, 0.20f, 0.95f);
+        var hot = new Color(0.86f, 0.78f, 1f);
+
+        // The corona is HIS OWN SKINNED MESH, cloned and inflated along its normals by the aura shader — so it has his
+        // exact silhouette (horns, ribcage, coat) and deforms with every animation. Two shells at different inflations
+        // give it depth. A primitive capsule was tried first and read exactly like what it was: a capsule.
+        var sh = ResourceLoader.Load<Shader>("res://shaders/arcane_aura.gdshader");
+        float meshH = _gobMesh?.Mesh != null ? _gobMesh.Mesh.GetAabb().Size.Y : 1.7f;
+        ShaderMaterial AuraMat(float grow, float speed, float density, float wisp, float intensity, float opacity)
+        {
+            var m = new ShaderMaterial { Shader = sh };
+            m.SetShaderParameter("tint", new Vector3(arc.R, arc.G, arc.B));
+            m.SetShaderParameter("hot", new Vector3(hot.R, hot.G, hot.B));
+            m.SetShaderParameter("amount", 1f);
+            m.SetShaderParameter("grow", grow);
+            m.SetShaderParameter("speed", speed);
+            m.SetShaderParameter("density", density);
+            m.SetShaderParameter("wisp", wisp);
+            m.SetShaderParameter("intensity", intensity);
+            m.SetShaderParameter("opacity", opacity);
+            _p2AuraMats.Add(m);
+            return m;
+        }
+        if (sh != null && _gobMesh?.Mesh != null && _gobMesh.GetParent() is Node3D meshParent)
+        {
+            // grow is in MESH-LOCAL units (the model node carries the ~8x scale up to gameplay size)
+            (float grow, float speed, float density, float wisp, float intensity, float opacity)[] shells =
+            {
+                (meshH * 0.014f, 1.15f, 1.8f, 0.30f, 0.50f, 0.42f),   // tight, brighter — the licking edge on his skin
+                (meshH * 0.048f, 0.75f, 1.0f, 0.70f, 0.30f, 0.22f),   // a looser outer flare, much fainter
+            };
+            foreach (var s in shells)
+            {
+                var dup = new MeshInstance3D
+                {
+                    Mesh = _gobMesh.Mesh,
+                    Skin = _gobMesh.Skin,
+                    CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+                    MaterialOverride = AuraMat(s.grow, s.speed, s.density, s.wisp, s.intensity, s.opacity),
+                };
+                meshParent.AddChild(dup);
+                dup.Transform = _gobMesh.Transform;
+                if (_gobSkel != null) dup.Skeleton = dup.GetPathTo(_gobSkel);   // ride the SAME skeleton → deforms with him
+                _p2Flames.Add(dup);
+            }
+        }
+        else if (sh != null)   // fallback only if the authored mesh is missing
+        {
+            var cap = new MeshInstance3D
+            {
+                Mesh = new CapsuleMesh { Radius = 0.95f * _scale, Height = 3.6f * _scale, RadialSegments = 24, Rings = 10 },
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+                MaterialOverride = AuraMat(0f, 1.15f, 1.2f, 0.4f, 0.6f, 0.5f),
+            };
+            cap.Position = new Vector3(0, 0.8f * _scale, 0);
+            _p2Aura.AddChild(cap);
+            _p2Flames.Add(cap);
+        }
+        _p2Aura.AddChild(new OmniLight3D { Position = new Vector3(0, 0.9f * _scale, 0), OmniRange = 5.5f * _scale, LightColor = arc, LightEnergy = 1.5f });
+    }
+
+    // While he SPINS, the model whips fast enough that the missing spin animation can't be read, and the aura tightens
+    // into a solid opaque sheath so his silhouette is largely swallowed anyway.
+    public void SetSpinning(bool on)
+    {
+        if (!_hollow) return;
+        _p2Spin = on;
+        for (int i = 0; i < _p2AuraMats.Count; i++)
+        {
+            _p2AuraMats[i].SetShaderParameter("speed", on ? 4.5f : (i == 0 ? 1.15f : 0.75f));
+            _p2AuraMats[i].SetShaderParameter("opacity", on ? (i == 0 ? 0.9f : 0.7f) : (i == 0 ? 0.42f : 0.22f));   // opaque up only while he's hiding a missing spin pose
+        }
+    }
+
+    // The shells ride his skeleton now, so there's nothing to animate here beyond easing the spin-up: SetSpinning
+    // retargets the shader params and this just keeps the fallback capsule (if any) turning.
+    private void UpdatePhase2Aura(float dt)
+    {
+        if (_p2Aura == null) return;
+        _p2Phase += dt;
+        if (_p2Aura.GetChildCount() > 1) _p2Aura.RotateY(dt * (_p2Spin ? 9f : 1.6f));
+    }
+
+    private void BuildHollowExtras()
+    {
+        int spine = _gobSkel.FindBone("Spine01"); if (spine < 0) spine = _gobSkel.FindBone("Spine");
+        _gest = new BossGestureMod { ArmL = _gobArmL, ForeL = _gobForeL, ArmR = _gobArmR, ForeR = _gobForeR, Spine = spine };
+        _gobSkel.AddChild(_gest);
+        _handL = _gobSkel.FindBone("LeftHand"); _handR = _gobSkel.FindBone("RightHand");
+
+        // The boulder he tears up during the rock-throw wind-up. It hangs in front of him at chest height and is flung on
+        // the grip-and-throw clip's release — Creature-local, so it reads the same from any angle.
+        _heldRock = new MeshInstance3D
+        {
+            Mesh = new SphereMesh { Radius = 0.42f * _scale, Height = 0.84f * _scale, RadialSegments = 7, Rings = 5 },
+            MaterialOverride = Game.RockMat(),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Visible = false,
+        };
+        AddChild(_heldRock);
+        _heldRock.Position = new Vector3(0f, 1.15f * _scale, 1.25f * _scale);
+
+        // Arcane energy swallowing both hands — the universal attack telegraph (fades in on wind-up, holds through the attack).
+        // Sized off the HAND, not the hitbox: it must reach past the FINGERTIPS to actually obscure the hand (a wrist-sized
+        // orb just looks like a bracelet), but stay well under the two floating beach-balls the first pass produced.
+        var sh = ResourceLoader.Load<Shader>("res://shaders/arcane_hands.gdshader");
+        for (int i = 0; i < 2; i++)
+        {
+            var mat = sh != null ? new ShaderMaterial { Shader = sh } : null;
+            var mi = new MeshInstance3D
+            {
+                Mesh = new SphereMesh { Radius = 0.235f * _scale, Height = 0.47f * _scale, RadialSegments = 12, Rings = 8 },
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+                Visible = false,
+            };
+            if (mat != null) { mat.SetShaderParameter("amount", 0f); mi.MaterialOverride = mat; _handGlowMats.Add(mat); }
+            else mi.MaterialOverride = Game.Emissive(new Color(0.62f, 0.36f, 1f), 2.4f);
+            AddChild(mi);
+            _handGlow.Add(mi);
+        }
+        _gest.GlowL = _handGlow[0]; _gest.GlowR = _handGlow[1];
+        _gest.HandL = _handL; _gest.HandR = _handR;
+        // Half a hand-length past the wrist bone: the orb then spans wrist→fingertips. Pushing a FULL hand-length out
+        // (the first attempt) parked it beyond the fingers, where it read as a ball he was holding, not a burning hand.
+        _gest.PalmOffset = 0.11f * _scale;
+    }
+
+    // Enemy drives these: an attack clip overrides locomotion until BossEndClip(); the gesture + glow amounts are ramped
+    // by the wind-up so both read as part of the telegraph.
+    // (WIDENED) any authored biped can drive a one-shot clip over its locomotion, not just the boss — the withered casters
+    // ride this same channel for their cast animations, and so do the ogre-bodied bolt throwers via the grafted mage cast.
+    public void BossPlay(string canon, float speed = 1f)
+    {
+        if (!_gobAuthored || !_bClip.ContainsKey(canon)) return;
+        _bAtkClip = canon; _bAtkSpeed = speed; _bState = BState.Attack; _bPlaying = ""; _bOneShotDone = false;
+    }
+    public void BossEndClip() { if (!_gobAuthored) return; _bAtkClip = null; _bState = BState.Loco; _bPlaying = ""; }
+    // Readable aliases at the caster call sites — same one-shot channel, different fiction.
+    public void CastPlay(string canon, float speed = 1f) => BossPlay(canon, speed);
+    public void CastEnd() => BossEndClip();
+    public float CastLength(string canon) => BossClipLength(canon);
+    public bool Casting => _bAtkClip != null;
+    // (HARNESS) what the biped is actually playing right now, and how fast — proves an attack clip really drove the pose
+    // rather than the model sitting in its walk while only the VFX fired.
+    // (HARNESS) how far the posed model's lowest foot sits from where the feet belong (Creature-local −Radius), in world
+    // units. ~0 means grounded. A GRAFTED clip that wasn't retargeted properly shows up here as a constant offset — the
+    // source rig's hip translations lifting or sinking a differently-proportioned body.
+    public float DebugFootGap
+    {
+        get
+        {
+            if (_gobSkel == null) return 0f;
+            int fl = _gobSkel.FindBone("LeftFoot"), fr = _gobSkel.FindBone("RightFoot");
+            if (fl < 0 || fr < 0) return 0f;
+            var g = _gobSkel.GlobalTransform;
+            float foot = Mathf.Min((g * _gobSkel.GetBoneGlobalPose(fl).Origin).Y, (g * _gobSkel.GetBoneGlobalPose(fr).Origin).Y);
+            return foot - (GlobalPosition.Y - _scale);
+        }
+    }
+    public string DebugPlayingClip => _bPlaying;
+    public float DebugPlaySpeed => _gobAp != null ? (float)_gobAp.SpeedScale : 0f;
+    public bool DebugApPlaying => _gobAp != null && _gobAp.IsPlaying();
+
+    // Clip length in seconds (0 if this model doesn't have it) — Enemy uses it to stretch each attack clip across its wind-up.
+    public float BossClipLength(string canon)
+    {
+        if (_gobAp == null || !_bClip.TryGetValue(canon, out var key)) return 0f;
+        var a = _gobAp.GetAnimation(key);
+        return a != null ? (float)a.Length : 0f;
+    }
+    // Death plays the fall-forward clip directly — Enemy stops ticking Animate() once it's dead, so waiting for the next
+    // frame's clip selection would leave him frozen upright.
+    public void BossDie()
+    {
+        if (!_hollow || !_bClip.ContainsKey("death")) return;
+        _bAtkClip = "death"; _bAtkSpeed = 1f; _bState = BState.Attack; _bPlaying = "";
+        SetHandGlow(0f); ShowHeldRock(false); SetGesture(0f, 0f);
+        _glow = 0f;
+        foreach (var g in _handGlow) g.Visible = false;
+        AnimSuspended = false;
+        PlayBiped("death", 1f);
+    }
+    public void SetHandGlow(float t) { _glowTarget = Mathf.Clamp(t, 0f, 1f); }
+    public void SetGesture(float pointUp, float pointFwd)   // the mine-toss signal: arm up, then chopped flat to the front
+    {
+        if (_gest == null) return;
+        _gest.PointUp = pointUp; _gest.PointFwd = pointFwd;
+    }
+    public void ShowHeldRock(bool on, float grow = 1f)
+    {
+        if (_heldRock == null) return;
+        _heldRock.Visible = on;
+        if (on) _heldRock.Scale = Vector3.One * Mathf.Max(0.02f, grow);
+    }
+
+    // Per-frame: ride the hand glow toward its target. The ORBS' POSITIONS are set by BossGestureMod (the last skeleton
+    // modifier), because only there are the bone poses final — reading them from here gives the pre-modifier pose and the
+    // orbs hang motionless at his chest while the arms move.
+    private void UpdateHandGlow(float dt)
+    {
+        if (_handGlow.Count == 0) return;
+        _glow = Mathf.MoveToward(_glow, _glowTarget, dt * (_glowTarget > _glow ? 3.2f : 2.2f));
+        bool on = _glow > 0.01f;
+        for (int i = 0; i < _handGlow.Count; i++)
+        {
+            var mi = _handGlow[i];
+            if (mi.Visible != on) mi.Visible = on;
+            if (!on) continue;
+            mi.Scale = Vector3.One * (0.85f + 0.15f * _glow);   // barely shrinks on fade-in — it must always cover the fingers
+            if (i < _handGlowMats.Count) _handGlowMats[i].SetShaderParameter("amount", _glow);
+        }
+    }
+
+    // ---- biped action clips ------------------------------------------------------------------------------------------------
+    // Every authored biped (goblin/zombie/ogre/taker) rides the SAME Meshy rig, so ONE action library (run/fall/climb/stand-up,
+    // authored on the taker) drives them all. Models that only ship a walk get the rest grafted in; the taker already has them.
+    // A grafted clip travels with the REST POSE of the rig it was authored on: the bipeds share bone NAMES but not
+    // proportions, so RetargetGraftedPositions needs the SOURCE rest to rebase every translation. Each library therefore
+    // carries its own (the action set comes off the big taker, the cast set off the slighter withered king).
+    private struct GraftSrc
+    {
+        public Animation Anim;
+        public System.Collections.Generic.Dictionary<string, Vector3> Rest;
+        public float HipsY;
+    }
+    private static System.Collections.Generic.Dictionary<string, GraftSrc> _sharedClips;   // taker: run/fall/climb/stand-up
+    private static System.Collections.Generic.Dictionary<string, GraftSrc> _castClips;     // withered king: the mage casts
+
+    // Clips that are already named canonically in the source GLB (the hollow-man / withered-king merges write these names
+    // directly, so no substring guessing is needed). Anything not in here falls through to the Meshy-name heuristics below.
+    private static readonly System.Collections.Generic.HashSet<string> PreCanon = new()
+    {
+        "walk", "run", "cast1", "cast6", "gripthrow", "stomp", "charge", "death",
+        "standup", "walkslow", "walkspear", "walkunsteady", "walkplain",
+        "cast", "cast4", "castcharge",   // (NEW) withered king: empower/heal, projectile, stun telegraph
+    };
+
+    private static string CanonName(string animName)   // Meshy clip name → our canonical key (order matters: check the longer names first)
+    {
+        string s = animName.ToLower();
+        if (PreCanon.Contains(s)) return s;            // already canonical (merged hollow-man GLB)
+        if (s.Contains("walking")) return "walk";
+        if (s.Contains("running")) return "run";
+        if (s.Contains("climbing_up")) return "climb";
+        if (s.Contains("climb_attempt_and_fall_4")) return "climbfall4";
+        if (s.Contains("climb_attempt_and_fall")) return "climbfall";
+        if (s.Contains("falling_down")) return "falldown";
+        if (s.Contains("fall1")) return "fall1";
+        if (s.Contains("fall3")) return "fall3";
+        if (s.Contains("stand_up2")) return "standup2";
+        if (s.Contains("stand_up4")) return "standup4";
+        return null;
+    }
+
+    private static void SetLoopAndDrift(Animation anim, string canon)
+    {
+        bool loop = canon == "walk" || canon == "run" || canon == "climb" || canon == "fall1";   // continuous states loop; the rest are one-shots
+        anim.LoopMode = loop ? Animation.LoopModeEnum.Linear : Animation.LoopModeEnum.None;
+        for (int i = 0; i < anim.GetTrackCount(); i++)   // freeze Hips horizontal drift — we drive world position ourselves (keep Y so falls/get-ups still move vertically)
+        {
+            if (anim.TrackGetType(i) != Animation.TrackType.Position3D) continue;
+            if (!anim.TrackGetPath(i).ToString().Contains("Hips")) continue;
+            int kc = anim.TrackGetKeyCount(i); if (kc == 0) continue;
+            var first = (Vector3)anim.TrackGetKeyValue(i, 0);
+            for (int k = 0; k < kc; k++) { var v = (Vector3)anim.TrackGetKeyValue(i, k); v.X = first.X; v.Z = first.Z; anim.TrackSetKeyValue(i, k, v); }
+        }
+    }
+
+    // Load a source GLB ONCE and cache the clips `want` accepts, together with that rig's rest pose, as a graft library.
+    private static System.Collections.Generic.Dictionary<string, GraftSrc> LoadGraftLib(string glb, System.Func<string, bool> want)
+    {
+        var lib = new System.Collections.Generic.Dictionary<string, GraftSrc>();
+        if (!ResourceLoader.Exists(glb)) return lib;
+        var sc = ResourceLoader.Load<PackedScene>(glb)?.Instantiate<Node3D>();
+        if (sc == null) return lib;
+        var ap = ModelAssets.FindAnimPlayer(sc);
+        var srcSkel = ModelAssets.FindSkeleton(sc);
+        var rest = new System.Collections.Generic.Dictionary<string, Vector3>();
+        float hipsY = 1f;
+        if (srcSkel != null)   // capture the SOURCE rig's REST bone positions — grafted clips carry its translations, which must be retargeted onto each playing rig
+        {
+            for (int b = 0; b < srcSkel.GetBoneCount(); b++) rest[srcSkel.GetBoneName(b)] = srcSkel.GetBoneRest(b).Origin;
+            if (rest.TryGetValue("Hips", out var sh) && Mathf.Abs(sh.Y) > 0.01f) hipsY = sh.Y;
+        }
+        if (ap != null)
+            foreach (StringName l0 in ap.GetAnimationLibraryList())
+            {
+                var l = ap.GetAnimationLibrary(l0);
+                foreach (StringName a in l.GetAnimationList())
+                {
+                    string canon = CanonName((string)a);
+                    if (canon == null || !want(canon)) continue;
+                    var anim = (Animation)l.GetAnimation(a).Duplicate(true);
+                    for (int i = anim.GetTrackCount() - 1; i >= 0; i--)   // drop SCALE tracks — they carry the source rig's baked bone scales and would squash a different rig
+                        if (anim.TrackGetType(i) == Animation.TrackType.Scale3D) anim.RemoveTrack(i);
+                    SetLoopAndDrift(anim, canon);
+                    lib[canon] = new GraftSrc { Anim = anim, Rest = rest, HipsY = hipsY };
+                }
+            }
+        sc.QueueFree();
+        return lib;
+    }
+
+    // The taker's non-walk clips (run/fall/climb/stand-up) — every biped gets these (walk stays per-model).
+    private static System.Collections.Generic.Dictionary<string, GraftSrc> SharedActionClips()
+        => _sharedClips ??= LoadGraftLib(TakerGlb, c => c != "walk");
+
+    // The withered king's mage casts — grafted only onto models that need them (the ogre-bodied bolt throwers).
+    private static System.Collections.Generic.Dictionary<string, GraftSrc> SharedCastClips()
+        => _castClips ??= LoadGraftLib(WitheredGlb, c => c == "cast" || c == "cast4" || c == "castcharge");
+
+    // Retarget a grafted clip's per-bone TRANSLATION tracks from the taker rig onto THIS rig. The four Meshy bipeds share bone
+    // NAMES but were re-rigged at different proportions (Hips rest 82 goblin vs 97 taker; leg offsets differ), so the taker's
+    // absolute bone positions would yank a smaller rig's bones out of place → mesh deform. We remap each translated bone's motion
+    // as (target rest) + (anim − source rest)·ratio: rigid bones (anim==source rest) snap to the TARGET rest (correct lengths),
+    // and the animating root (Hips) keeps its excursion scaled to this rig's height. Rotations transfer untouched (they define the pose).
+    private void RetargetGraftedPositions(Animation anim, System.Collections.Generic.Dictionary<string, Vector3> srcRest, float srcHipsY)
+    {
+        if (_gobSkel == null || srcRest == null) return;
+        int hb = _gobSkel.FindBone("Hips");
+        float tgtHipsY = hb >= 0 ? _gobSkel.GetBoneRest(hb).Origin.Y : srcHipsY;
+        float ratio = Mathf.Abs(srcHipsY) > 0.01f ? tgtHipsY / srcHipsY : 1f;
+        for (int i = 0; i < anim.GetTrackCount(); i++)
+        {
+            if (anim.TrackGetType(i) != Animation.TrackType.Position3D) continue;
+            string p = anim.TrackGetPath(i).ToString(); int ci = p.IndexOf(':');
+            string bone = ci >= 0 ? p.Substring(ci + 1) : p;
+            int tb = _gobSkel.FindBone(bone); if (tb < 0) continue;
+            Vector3 tRest = _gobSkel.GetBoneRest(tb).Origin;
+            Vector3 sRest = srcRest.TryGetValue(bone, out var sr) ? sr : tRest;
+            int kc = anim.TrackGetKeyCount(i);
+            for (int k = 0; k < kc; k++)
+            {
+                var v = (Vector3)anim.TrackGetKeyValue(i, k);
+                anim.TrackSetKeyValue(i, k, tRest + (v - sRest) * ratio);
+            }
+        }
+    }
+
+    // Map this model's OWN clips to canonical keys, then graft in any action clips it's missing (the goblin/zombie/ogre only ship a walk).
+    private void RegisterBipedClips(bool graftShared = true, bool graftCast = false)
+    {
+        _bClip.Clear();
+        foreach (StringName lib in _gobAp.GetAnimationLibraryList())
+        {
+            var l = _gobAp.GetAnimationLibrary(lib);
+            foreach (StringName a in l.GetAnimationList())
+            {
+                string key = ((string)lib).Length == 0 ? (string)a : $"{(string)lib}/{(string)a}";
+                string canon = CanonName((string)a) ?? "walk";   // a lone unrecognized clip (goblin's baked walk) IS the walk
+                SetLoopAndDrift(l.GetAnimation(a), canon);
+                if (!_bClip.ContainsKey(canon)) _bClip[canon] = key;
+            }
+        }
+        if (graftShared) Graft(SharedActionClips());
+        if (graftCast) Graft(SharedCastClips());
+    }
+
+    // Copy a graft library's clips into this model's own AnimationPlayer, each retargeted to THIS rig's proportions.
+    private void Graft(System.Collections.Generic.Dictionary<string, GraftSrc> src)
+    {
+        if (src.Count == 0) return;
+        AnimationLibrary act = _gobAp.HasAnimationLibrary("act") ? _gobAp.GetAnimationLibrary("act") : new AnimationLibrary();
+        if (!_gobAp.HasAnimationLibrary("act")) _gobAp.AddAnimationLibrary("act", act);
+        foreach (var kv in src)
+        {
+            if (_bClip.ContainsKey(kv.Key)) continue;   // this model authored its own version → keep it
+            if (!act.HasAnimation(kv.Key))
+            {
+                var copy = (Animation)kv.Value.Anim.Duplicate(true);   // per-model copy so the retarget is fitted to THIS rig's proportions
+                RetargetGraftedPositions(copy, kv.Value.Rest, kv.Value.HipsY);
+                act.AddAnimation(kv.Key, copy);
+            }
+            _bClip[kv.Key] = $"act/{kv.Key}";
+        }
+    }
+
+    // Debug/count hook for the harness: how many canonical action clips this biped resolved (10 = full set merged correctly).
+    public int BipedClipCount => _bClip.Count;
+    public bool HasBipedClip(string canon) => _bClip.ContainsKey(canon);
+
+    // ---- biped state intents (called by Enemy at transitions / per-frame) ----
+    // NOTE: the per-frame locomotion drivers (Enemy.AnimStep, the client-proxy path) call this EVERY frame. While the boss
+    // is playing an attack/death clip that call must not reset him to walking — it silently ate every attack animation
+    // until this guard existed. The attack state is cleared only by BossEndClip().
+    public void BipedLoco(bool run) { if (_bAtkClip != null) { _bRun = run; return; } _bState = BState.Loco; _bRun = run; }
+    public void BipedClimb() { _bState = BState.Climb; }
+    public void BipedAirborne(bool fromClimb) { _bState = BState.Airborne; _bAirPhase = fromClimb && _bClip.ContainsKey("climbfall") ? 0 : 1; _bOneShotDone = false; _bPlaying = ""; }
+    public void BipedWallSlam() { _bState = BState.WallDown; _bOneShotDone = false; _bPlaying = ""; }
+    public void BipedGetUp(int which = -1)   // which: 2/4 forces that stand-up, else random
+    {
+        _bStandKey = which == 2 ? "standup2" : which == 4 ? "standup4" : (R(0f, 1f) < 0.5f ? "standup2" : "standup4");
+        if (!_bClip.ContainsKey(_bStandKey)) _bStandKey = _bClip.ContainsKey("standup4") ? "standup4" : "standup2";
+        _bState = BState.StandUp; _bOneShotDone = false; _bPlaying = "";
+    }
+    public void BipedReset() { _bState = BState.Loco; _bRun = false; _bReach = 0f; _bReachTarget = 0f; _bOneShotDone = false; }
+    public void BipedReach(float target) { _bReachTarget = Mathf.Clamp(target, 0f, 1f); }
+    public void Wince(int variant) { _wince = 1f; _winceVar = variant; }   // direct-hit flinch; the Enemy picks the (random) variant + rate-limits
+    public bool BipedOneShotDone => _bOneShotDone;   // Enemy polls this to know a WallDown/StandUp clip finished
 
     // Sweep the crescent across the goblin's front over the strike, then fade + hide. Creature-local: +Z faces the player, so
     // the crescent's broad face reads; it arcs from up-back to down-forward on the slashing side, growing then fading.
     private void UpdateSlashVfx(float dt)
     {
         if (_slashVfx == null) return;
-        if (_slashVfxT <= 0f) { if (_slashVfx.Visible) _slashVfx.Visible = false; return; }
+        if (_slashVfxT <= 0f)
+        {
+            if (_slashVfx.Visible) _slashVfx.Visible = false;
+            if (_slashVfx2 != null && _slashVfx2.Visible) _slashVfx2.Visible = false;
+            return;
+        }
         _slashVfxT -= dt;
         float k = Mathf.Clamp(_slashVfxT / SlashVfxDur, 0f, 1f);   // 1 → 0 over the strike
-        float side = _gobSlashLeft ? -1f : 1f;
-        _slashVfx.Visible = true;
-        _slashVfx.Position = new Vector3(side * 0.18f * _scale, 0.55f * _scale, 0.7f * _scale);   // by the slashing arm, in front
-        // roll the crescent through the arc (up-back → down-forward); its XY plane already faces the player (+Z)
-        float roll = Mathf.Lerp(-70f, 60f, 1f - k) * side;        // 1−k = progress 0→1
-        _slashVfx.RotationDegrees = new Vector3(0f, 0f, roll);
-        _slashVfx.Scale = Vector3.One * (_scale * (1.0f + (1f - k) * 0.35f));   // grows through the swing
-        _slashVfx.Transparency = Mathf.Clamp(1f - k * 1.6f, 0f, 1f);           // bright early, fades out
+        void Sweep(MeshInstance3D vfx, float side)
+        {
+            if (vfx == null) return;
+            vfx.Visible = true;
+            vfx.Position = new Vector3(side * 0.18f * _scale, 0.55f * _scale, 0.7f * _scale);   // by the slashing arm, in front
+            // roll the crescent through the arc (up-back → down-forward); its XY plane already faces the player (+Z)
+            vfx.RotationDegrees = new Vector3(0f, 0f, Mathf.Lerp(-70f, 60f, 1f - k) * side);    // 1−k = progress 0→1
+            vfx.Scale = Vector3.One * (_scale * (1.0f + (1f - k) * 0.35f));   // grows through the swing
+            vfx.Transparency = Mathf.Clamp(1f - k * 1.6f, 0f, 1f);           // bright early, fades out
+        }
+        if (_gobBothArms) { Sweep(_slashVfx, -1f); Sweep(_slashVfx2, 1f); }   // (ZOMBIE) both hands
+        else Sweep(_slashVfx, _gobSlashLeft ? -1f : 1f);
     }
 
     private static MeshInstance3D FindMesh(Node n)
@@ -200,20 +702,62 @@ public partial class Creature : Node3D
     private float _gobForceMove = -1f;   // (harness) ≥0 overrides the movement-derived walk speed so a pinned goblin still strides
     public void DebugWalkSpeed(float m) { _gobForceMove = m; }
 
-    // authored-goblin per-frame: walk playback scaled by movement + the wind-up/strike arm swing (fed to the slash modifier).
+    // authored biped per-frame: pick the right action clip for the current state, layer the melee swing + grab reach, sweep the VFX.
     private void AnimateGoblin(float dt, float move)
     {
         if (_gobForceMove >= 0f) move = _gobForceMove;
-        if (_gobAp != null) _gobAp.SpeedScale = AnimSuspended ? 0f : (0.35f + move * 1.4f);   // shuffle idle → faster stride; freeze if culled
-        if (AnimSuspended) return;
+        if (AnimSuspended) { if (_gobAp != null) _gobAp.SpeedScale = 0f; return; }   // culled → freeze the pose
+
+        // --- which clip + how fast, from the state machine ---
+        string canon; float speed;
+        switch (_bState)
+        {
+            case BState.Climb:    canon = "climb";    speed = 1f; break;
+            case BState.Airborne: canon = _bAirPhase == 0 ? "climbfall" : "fall1"; speed = 1f; break;
+            case BState.WallDown: canon = "falldown"; speed = 1.5f; break;   // slam down a touch snappier so the get-up fits the stun window
+            case BState.StandUp:  canon = _bStandKey; speed = 1.3f; break;
+            case BState.Attack:   canon = _bAtkClip ?? _locoWalk; speed = _bAtkSpeed; break;   // (BOSS) attack/death clip owns the whole body
+            default:              canon = _bRun ? "run" : _locoWalk; speed = _bRun ? 1.25f : (0.35f + move * 1.4f); break;
+        }
+        PlayBiped(canon, speed);
+        if (_hollow) { UpdateHandGlow(dt); UpdatePhase2Aura(dt); }
+
+        // one-shot completion: climb-slip lead-in → free-fall loop; wall-slam/stand-up → flag Enemy that it's done
+        if (_gobAp != null && !_gobAp.IsPlaying())   // the current one-shot reached its end
+        {
+            if (_bState == BState.Airborne && _bAirPhase == 0) { _bAirPhase = 1; PlayBiped("fall1", 1f); }
+            else if (_bState == BState.WallDown || _bState == BState.StandUp || _bState == BState.Attack) _bOneShotDone = true;
+        }
+
+        // --- grab-arms telegraph (taker): ease toward the target so it reads as a wind-up, not a snap ---
+        _bReach = Mathf.MoveToward(_bReach, _bReachTarget, dt * 2.6f);
+        if (_reachMod != null) _reachMod.Reach = _bReach;
+
+        // --- hurt flinch: sharp impulse then a quick decay (~0.25s) so it reads as an "ouch" without stalling anything ---
+        if (_wince > 0f) _wince = Mathf.MoveToward(_wince, 0f, dt * 4.2f);
+        if (_winceMod != null) { _winceMod.Wince = _wince; _winceMod.Variant = _winceVar; }
+
+        // --- melee swing (only while on the ground locomoting — no arm-chop mid-fall/climb/get-up) ---
         _swing = Mathf.MoveToward(_swing, _swingTarget, dt * 3.5f);
-        _strike = Mathf.MoveToward(_strike, 0f, dt * 3.2f);   // SLOWER decay → the chop lasts ~0.3s so it READS as a slash
+        _strike = Mathf.MoveToward(_strike, 0f, dt * 3.2f);
+        bool canSlash = _bState == BState.Loco;
         if (_gobSlash != null)
         {
-            _gobSlash.SwingRad = Mathf.DegToRad(_swing * 40f - _strike * 115f);   // + rear back (wind-up), − big chop down/forward
-            _gobSlash.SpineLean = Mathf.DegToRad(_strike * 32f);                  // whole body commits into the swing
+            _gobSlash.SwingRad = canSlash ? Mathf.DegToRad(_swing * 40f - _strike * 115f) : 0f;   // + rear back (wind-up), − big chop down/forward
+            _gobSlash.SpineLean = canSlash ? Mathf.DegToRad(_strike * 32f) : 0f;
+            if (_gobSlash2 != null) _gobSlash2.SwingRad = _gobSlash.SwingRad;   // (ZOMBIE) other arm swings identically
         }
         UpdateSlashVfx(dt);
+    }
+
+    // Play a canonical clip (resolving its real AnimationPlayer key) only when it changes, at the given speed. One-shots restart
+    // when re-selected after finishing (so a repeated stand-up/wall-slam plays again).
+    private void PlayBiped(string canon, float speed)
+    {
+        if (_gobAp == null) return;
+        if (!_bClip.TryGetValue(canon, out var key)) { canon = _locoWalk; if (!_bClip.TryGetValue(canon, out key)) return; }
+        if (_bPlaying != canon) { _gobAp.Play(key); _bPlaying = canon; }   // one-shots play once and HOLD their last pose (loops keep looping via LoopMode)
+        _gobAp.SpeedScale = speed;
     }
 
     private static Mesh Cone(float r, float h) => new CylinderMesh { TopRadius = 0.001f, BottomRadius = r, Height = h };
@@ -272,9 +816,11 @@ public partial class Creature : Node3D
         {
             case CreatureKind.Goblin: if (!AuthoredGoblin(radius, accent)) Goblin(radius, body, limb, accent, false); break;   // authored GLB when present, else procedural
             case CreatureKind.Bomber: Goblin(radius, body, limb, accent, true); break;
-            case CreatureKind.Zombie: Goblin(radius, body, limb, accent, false); break;   // humanoid skeleton, zombie shamble in Animate
-            case CreatureKind.Orc: Orc(radius, body, limb, accent); break;
-            case CreatureKind.HollowBoss: HollowBoss(radius, body, limb, accent); break;
+            case CreatureKind.Zombie: if (!AuthoredZombie(radius, accent)) Goblin(radius, body, limb, accent, false); break;   // authored two-arm zombie GLB, else procedural shamble
+            case CreatureKind.Taker: if (!AuthoredTaker(radius, accent)) Goblin(radius, body, limb, accent, false); break;    // authored taker GLB (full action set), else procedural shamble
+            case CreatureKind.Orc: if (!AuthoredOgre(radius, accent)) Orc(radius, body, limb, accent); break;   // authored ogre GLB when present, else procedural orc
+            case CreatureKind.HollowBoss: if (!AuthoredHollow(radius, accent)) HollowBoss(radius, body, limb, accent); break;   // authored GLB w/ his own attack clips, else the old procedural half-orc
+            case CreatureKind.Withered: if (!AuthoredWithered(radius, accent)) Spider(radius, body, limb, accent); break;   // authored spellcaster GLB (caster/stunner/healer/empowerer), else the old neon spider
             case CreatureKind.Spider: Spider(radius, body, limb, accent); break;
             case CreatureKind.Mosquito: Mosquito(radius, body, limb, accent); break;
             case CreatureKind.Zapper: Zapper(radius, body, limb, accent); break;
@@ -704,22 +1250,97 @@ public partial class Creature : Node3D
     }
 
     // ---- mosquito ----
+    // ---- insect wing membrane: a translucent, veined, iridescent plane (replaces the old solid box wings) ----
+    private static Shader _wingShader;
+    private const string WingCode = @"
+shader_type spatial;
+render_mode cull_disabled, depth_draw_opaque, diffuse_lambert, specular_disabled;   // LIT + matte → reads painterly like the world
+uniform vec3 tint : source_color = vec3(0.34, 0.30, 0.26);   // muted membrane
+uniform vec3 vein_col : source_color = vec3(0.14, 0.11, 0.09);
+varying vec2 uvw;
+varying vec3 wp;
+float hash13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 p){ vec3 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);
+    float n=mix(mix(mix(hash13(i),hash13(i+vec3(1,0,0)),f.x),mix(hash13(i+vec3(0,1,0)),hash13(i+vec3(1,1,0)),f.x),f.y),
+                mix(mix(hash13(i+vec3(0,0,1)),hash13(i+vec3(1,0,1)),f.x),mix(hash13(i+vec3(0,1,1)),hash13(i+vec3(1,1,1)),f.x),f.y),f.z); return n; }
+float fbm(vec3 p){ float a=0.0,m=0.5; a+=m*vnoise(p); p*=2.02; m*=0.5; a+=m*vnoise(p); p*=2.03; m*=0.5; a+=m*vnoise(p); return a; }
+float wing_mask(vec2 uv){ float root=smoothstep(0.0,0.10,uv.x); float tip=1.0-smoothstep(0.86,1.0,uv.x); float hw=root*tip*0.5; return 1.0-smoothstep(hw-0.06,hw,abs(uv.y-0.5)); }
+void vertex(){ uvw=UV; wp=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz; }
+void fragment(){
+    float mask=wing_mask(uvw);
+    if(mask<0.02) discard;
+    float m=fbm(wp*4.0 + vec3(uvw*4.0,0.0));                 // brushy painterly mottle
+    // ORGANIC veins: one soft leading-edge curve + a couple of faint fbm-broken longitudinal hints (NOT hard parallel stripes)
+    float lead=smoothstep(0.08,0.0,abs(uvw.y-(0.5+0.40*sin(uvw.x*1.2))));
+    float longv=smoothstep(0.05,0.0,abs(fract((uvw.y-0.5)*2.0+(m-0.5)*0.8)-0.5))*smoothstep(0.12,0.5,uvw.x)*0.45;
+    float v=max(lead, longv);
+    vec3 col=tint*(1.0+(m-0.5)*2.0*0.32);                    // painterly value drift
+    col=mix(col, vein_col, v*0.7);
+    ALBEDO=clamp(col,vec3(0.0),vec3(1.0));
+    ROUGHNESS=0.99; METALLIC=0.0;                            // dead matte
+    ALPHA=mask*clamp(0.22+v*0.38+(m-0.5)*0.12, 0.08, 0.7);   // more see-through membrane
+}";
+    private static Material WingMat(Color accentCol)
+    {
+        _wingShader ??= new Shader { Code = WingCode };
+        var m = new ShaderMaterial { Shader = _wingShader };
+        // HEAVILY muted + desaturated membrane, only a whisper of the flyer's hue — painterly smoke, not neon glass
+        float lum = accentCol.R * 0.3f + accentCol.G * 0.5f + accentCol.B * 0.2f;
+        Color memb = accentCol.Lerp(new Color(lum, lum, lum), 0.72f).Darkened(0.5f);
+        m.SetShaderParameter("tint", new Vector3(memb.R + 0.14f, memb.G + 0.13f, memb.B + 0.12f));
+        m.SetShaderParameter("vein_col", new Vector3(memb.R * 0.45f, memb.G * 0.45f, memb.B * 0.45f));
+        return m;
+    }
+
     private void Mosquito(float s, Material body, Material limb, Material accent)
     {
         float v = R(0.85f, 1.15f); s *= v;
         _body = Pivot(this, Vector3.Zero);
         _bodyBaseY = 0f;
-        Part(_body, Sph(s * 0.45f), body, new Vector3(0, 0, s * 0.5f), Vector3.Zero, Vector3.One);
-        Part(_body, Sph(s * 0.55f), body, Vector3.Zero, Vector3.Zero, Vector3.One);
-        Part(_body, Cyl(s * 0.28f, s * 1.4f), body, new Vector3(0, 0, -s * 0.9f), new Vector3(90, 0, 0), new Vector3(1, 1, 0.6f));
-        Part(_body, Cone(s * 0.06f, s * 1.2f), accent, new Vector3(0, -s * 0.1f, s * 1.25f), new Vector3(90, 0, 0), Vector3.One);
-        Part(_body, Sph(s * 0.22f), accent, new Vector3(s * 0.25f, s * 0.1f, s * 0.6f), Vector3.Zero, Vector3.One);
-        Part(_body, Sph(s * 0.22f), accent, new Vector3(-s * 0.25f, s * 0.1f, s * 0.6f), Vector3.Zero, Vector3.One);
+        // (REWORK) a DARK chitin carapace (the neon hue, heavily darkened) so the body reads as an insect instead of a bloom-blob;
+        // the neon accent is kept for the EYES, antennae tips, segment-joint bands and an underbelly glow (bioluminescent synth-bug).
+        Color accCol = (accent as StandardMaterial3D)?.AlbedoColor ?? new Color(0.5f, 0.7f, 1f);
+        Color chitCol = new Color(accCol.R * 0.22f + 0.04f, accCol.G * 0.22f + 0.04f, accCol.B * 0.24f + 0.05f);
+        // (PAINTERLY) matte chitin on the painterly master material (world-space macro value/hue drift + fine grain) so the body
+        // reads hand-painted like the rest of the world, not glossy toon; accents use painterly MASKED emission (a soft glow, not a flat neon blob).
+        var carapace = Vis.Painterly(chitCol, rough: 0.85f, roughVar: 0.16f, macroValue: 0.18f, macroHue: 0.06f, macroScale: 0.7f, detailScale: 5.0f, detailValue: 0.14f);
+        var glow = Vis.Painterly(accCol, rough: 0.8f, roughVar: 0.1f, macroValue: 0.12f, macroHue: 0.04f, macroScale: 0.5f, emission: accCol, emissionEnergy: 2.2f, emissionThreshold: 0.3f);
+        Part(_body, Sph(s * 0.45f), carapace, new Vector3(0, 0, s * 0.5f), Vector3.Zero, Vector3.One);          // head
+        Part(_body, Sph(s * 0.55f), carapace, Vector3.Zero, Vector3.Zero, Vector3.One);                        // thorax
+        Part(_body, Cyl(s * 0.26f, s * 1.4f), carapace, new Vector3(0, 0, -s * 0.9f), new Vector3(90, 0, 0), new Vector3(1, 1, 0.6f));   // abdomen
+        Part(_body, Cone(s * 0.05f, s * 1.1f), carapace, new Vector3(0, -s * 0.1f, s * 1.25f), new Vector3(90, 0, 0), Vector3.One);       // proboscis
+        Part(_body, Sph(s * 0.17f), glow, new Vector3(s * 0.24f, s * 0.12f, s * 0.6f), Vector3.Zero, new Vector3(1.1f, 1.1f, 1f));        // glowing compound eyes
+        Part(_body, Sph(s * 0.17f), glow, new Vector3(-s * 0.24f, s * 0.12f, s * 0.6f), Vector3.Zero, new Vector3(1.1f, 1.1f, 1f));
+        // segmented abdomen — matte carapace segments with a soft GLOWING joint band between each (bioluminescent rings)
+        for (int i = 0; i < 3; i++)
+        {
+            float z = -s * (0.55f + i * 0.4f);
+            Part(_body, Sph(s * (0.28f - i * 0.045f)), carapace, new Vector3(0, 0, z), Vector3.Zero, new Vector3(1.16f, 1.12f, 0.5f));
+            Part(_body, Sph(s * (0.24f - i * 0.045f)), glow, new Vector3(0, -s * 0.02f, z + s * 0.2f), Vector3.Zero, new Vector3(1.05f, 0.5f, 0.16f));   // glow ring at the joint
+        }
+        // antennae — thin matte feelers from the head with a glowing tip
+        for (int i = 0; i < 2; i++)
+        {
+            float ax = i == 0 ? 1 : -1;
+            var ant = Pivot(_body, new Vector3(ax * s * 0.12f, s * 0.3f, s * 0.5f), new Vector3(-38f, ax * 12f, 0));
+            Part(ant, Cyl(s * 0.022f, s * 0.9f), carapace, new Vector3(0, s * 0.45f, 0), Vector3.Zero, Vector3.One);
+            Part(ant, Sph(s * 0.055f), glow, new Vector3(0, s * 0.9f, 0), Vector3.Zero, Vector3.One);
+        }
+        // (NEW) translucent VEINED wing membranes (a plane + insect-wing shader) instead of solid boxes — the big "not primitive" win
+        var wingMat = WingMat(accCol);
         for (int i = 0; i < 2; i++)
         {
             float sx = i == 0 ? 1 : -1;
             var w = Pivot(_body, new Vector3(sx * s * 0.2f, s * 0.35f, 0));
-            Part(w, Box(s * 1.5f, s * 0.04f, s * 0.7f), limb, new Vector3(sx * s * 0.75f, 0, -s * 0.1f), Vector3.Zero, Vector3.One);
+            var wm = new MeshInstance3D
+            {
+                Mesh = new PlaneMesh { Size = new Vector2(s * 1.6f, s * 0.78f) },   // XZ plane, normal +Y — matches the old flat wing footprint
+                MaterialOverride = wingMat,
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,           // translucent → no solid shadow
+                Position = new Vector3(sx * s * 0.8f, 0, -s * 0.1f),
+                Scale = new Vector3(sx, 1f, 1f),                                     // mirror the left wing so both fan outward from the root
+            };
+            w.AddChild(wm);
             _wings.Add(w);
         }
         for (int i = 0; i < 6; i++)
@@ -727,7 +1348,7 @@ public partial class Creature : Node3D
             int side = i < 3 ? 1 : -1;
             float along = ((i % 3) - 1) * s * 0.4f;
             var hip = Pivot(_body, new Vector3(side * s * 0.4f, -s * 0.2f, along), new Vector3(0, side * 30f, side * 50f));
-            Part(hip, Cyl(s * 0.04f, s * 1.3f), limb, new Vector3(0, -s * 0.65f, 0), Vector3.Zero, Vector3.One);
+            Part(hip, Cyl(s * 0.035f, s * 1.3f), carapace, new Vector3(0, -s * 0.65f, 0), Vector3.Zero, Vector3.One);   // matte painterly chitin legs (was toon-outlined blue)
             _hips.Add(hip); _knees.Add(null);
             _hipBase.Add(new Vector3(0, side * 30f, side * 50f)); _kneeBase.Add(Vector3.Zero);
         }
@@ -949,3 +1570,4 @@ public partial class Creature : Node3D
         }
     }
 }
+

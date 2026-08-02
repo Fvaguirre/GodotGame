@@ -180,7 +180,7 @@ public partial class Sfx : Node
     public void GasHiss(Vector3 pos, bool net = true)    { At(BuildGasRelease(), pos, -6f, 50f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.GasHiss, pos); }
     public void FireworkLaunch(Vector3 pos) { At(BuildFireworkLaunch(), pos, -5f, 90f); }   // rising whistle (Firework plays locally on each machine)
     public void FireworkBurst(Vector3 pos)  { At(BuildFireworkBurst(), pos, -3f, 100f); }    // crackle boom
-    public void ZombieGroan(Vector3 pos, bool net = true) { At(_zGroan, pos, -7f, 45f, 0.82f + GD.Randf() * 0.32f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieGroan, pos); }   // (PERF) cached WAV + random pitch for variation
+    public void ZombieGroan(Vector3 pos, bool net = true) { At(_zGroan, pos, -14f, 38f, 0.82f + GD.Randf() * 0.32f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieGroan, pos); }   // (QUIETER) swarmer groans were loud + constant — cut volume + range
     public void ZombieDeath(Vector3 pos, bool net = true) { At(_zDeath, pos, -5f, 45f, 0.88f + GD.Randf() * 0.26f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieDeath, pos); }   // (PERF) cached
     private float _zAtkLast = -1f;
     public void ZombieAttack(Vector3 pos, bool net = true)   // bite/lunge
@@ -188,17 +188,20 @@ public partial class Sfx : Node
         float now = Time.GetTicksMsec() / 1000f;
         if (now - _zAtkLast < 0.05f) return;   // (PERF) 150 swarmers biting a stationary player was ~150 fresh-WAV builds/sec (GC storm → 100ms spikes) — cache the WAV + throttle to ~20/sec
         _zAtkLast = now;
-        At(_zAttack, pos, -6f, 45f, 0.82f + GD.Randf() * 0.32f);
+        At(_zAttack, pos, -12f, 38f, 0.82f + GD.Randf() * 0.32f);
         if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieAttack, pos);
     }
-    public void ZombieExcited(Vector3 pos, bool net = true){ At(_zExcited, pos, -6f, 50f, 0.88f + GD.Randf() * 0.26f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieExcited, pos); }   // (PERF) cached
-    public void ZombieScream(Vector3 pos, bool net = true) { At(BuildZombieScream(), pos, -4f, 60f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieScream, pos); }   // shriek on spotting
-    public void ZombieSnicker(Vector3 pos, bool net = true) { At(BuildZombieSnicker(), pos, -8f, 35f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieSnicker, pos); }   // idle chuckle
+    public void ZombieExcited(Vector3 pos, bool net = true){ At(_zExcited, pos, -12f, 42f, 0.88f + GD.Randf() * 0.26f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieExcited, pos); }   // (QUIETER)
+    public void ZombieScream(Vector3 pos, bool net = true) { At(BuildZombieScream(), pos, -10f, 52f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieScream, pos); }   // (QUIETER) shriek on spotting
+    public void ZombieSnicker(Vector3 pos, bool net = true) { At(BuildZombieSnicker(), pos, -14f, 30f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.ZombieSnicker, pos); }   // (QUIETER) idle chuckle
     public void TakerGrowl(Vector3 pos, bool net = true) { At(BuildTakerGrowl(), pos, -2f, 90f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerGrowl, pos); }   // deep spawn announce
     public void TakerGrunt(Vector3 pos, bool net = true) { At(BuildTakerGrunt(), pos, -5f, 60f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerGrunt, pos); }   // navigating grunt
     public void TakerBone(Vector3 pos, bool net = true) { At(BuildTakerBone(), pos, -4f, 55f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerBone, pos); }    // bone-break while squeezing
     public void TakerDeath(Vector3 pos, bool net = true) { At(BuildTakerDeath(), pos, -2f, 80f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerDeath, pos); }   // deep death "ughh"
     public void TakerLaugh(Vector3 pos, bool net = true) { At(BuildTakerLaugh(), pos, -2f, 75f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerLaugh, pos); }   // snarled zombie cackle before the dash
+    // (L4D-STYLE SPAWN CUES) non-spatial stings so every warden clearly hears a special arrive — each unique
+    public void TakerSpawnCue(bool net = true)  { PlayOne(BuildTakerSpawnCue(), -4f);  if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.TakerSpawn, Vector3.Zero); }
+    public void PhalanxSpawnCue(bool net = true){ PlayOne(BuildPhalanxSpawnCue(), -4f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.PhalanxSpawn, Vector3.Zero); }
     public void Thud(Vector3 pos, bool net = true) { At(BuildThud(), pos, -1f, 70f); if (net) Game.I?.NetMgr?.BroadcastSfx((int)Snd.Thud, pos); }   // heavy body slamming a wall
     public void Freeze(Vector3 pos, bool net = true) { At(BuildFreeze(), pos, -5f, 55f); }        // (NEW) enemy encased in ice (crackle)
     public void IceShatter(Vector3 pos, bool net = true) { At(BuildIceShatter(), pos, -3f, 65f); }  // (NEW) ice block shatters
@@ -209,7 +212,7 @@ public partial class Sfx : Node
         p.Stream = BuildHordeScream(); p.VolumeDb = -2f; p.PitchScale = 1f; p.Play();
     }
 
-    public enum Snd { ModFrost, ModBramble, ModEmber, ModBlood, ModSpike, ModCurse, ModChime, ModHoly, ModSmite, ModPour, ModWind, ArcaneBlast, HolyLances, WindRushBy, WindSlash, RootRush, HolyRush, WitchCackle, GasHiss, ZombieGroan, ZombieDeath, ZombieAttack, ZombieExcited, ZombieScream, ZombieSnicker, TakerGrowl, TakerGrunt, TakerBone, TakerDeath, TakerLaugh, Thud }
+    public enum Snd { ModFrost, ModBramble, ModEmber, ModBlood, ModSpike, ModCurse, ModChime, ModHoly, ModSmite, ModPour, ModWind, ArcaneBlast, HolyLances, WindRushBy, WindSlash, RootRush, HolyRush, WitchCackle, GasHiss, ZombieGroan, ZombieDeath, ZombieAttack, ZombieExcited, ZombieScream, ZombieSnicker, TakerGrowl, TakerGrunt, TakerBone, TakerDeath, TakerLaugh, Thud, TakerSpawn, PhalanxSpawn }
 
     // remote replay of an ally's ability sound (net:false → no re-broadcast)
     public void PlayNet(int id, Vector3 pos)
@@ -247,6 +250,8 @@ public partial class Sfx : Node
             case Snd.TakerDeath: TakerDeath(pos, false); break;
             case Snd.TakerLaugh: TakerLaugh(pos, false); break;
             case Snd.Thud: Thud(pos, false); break;
+            case Snd.TakerSpawn: TakerSpawnCue(false); break;
+            case Snd.PhalanxSpawn: PhalanxSpawnCue(false); break;
         }
     }
     private void At(AudioStreamWav w, Vector3 pos, float db, float maxDist, float pitch = 1f)
@@ -1058,6 +1063,42 @@ public partial class Sfx : Node
             float growl = Mathf.Sin(t * Tau * f) * 0.5f + Mathf.Sin(t * Tau * f * 1.5f) * 0.2f;
             float rasp = (float)(rng.NextDouble() * 2 - 1) * 0.3f * (0.5f + 0.5f * Mathf.Sin(t * Tau * 24f));
             s[i] = (growl + rasp) * env * 0.8f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (L4D-STYLE CUE) taker is near — a deep, ominous tolling swell with a dissonant tritone under it, so it reads as "danger
+    // incoming" the instant it plays. Low + tonal (distinct from the taker's noisy growl).
+    private static AudioStreamWav BuildTakerSpawnCue()
+    {
+        int rate = 22050, n = (int)(rate * 1.15f); var s = new float[n];
+        float f1 = 98f, f2 = 138.6f;   // G2 + a tritone above (menace)
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, k = t / 1.15f;
+            float env = Mathf.Min(1f, t / 0.10f) * Mathf.Pow(1f - k, 1.6f);   // soft swell in, long ominous tail
+            float body = Mathf.Sin(t * Tau * f1) * 0.5f + Mathf.Sin(t * Tau * f2) * 0.34f + Mathf.Sin(t * Tau * f1 * 2f) * 0.12f;
+            float wob = 1f + 0.015f * Mathf.Sin(t * Tau * 5.5f);              // slow beat = tension
+            float shimmer = Mathf.Sin(t * Tau * f1 * 4f) * 0.05f * Mathf.Max(0f, 1f - k * 2.2f);
+            s[i] = (body * wob + shimmer) * env * 0.82f;
+        }
+        return Wav(s, rate);
+    }
+
+    // (L4D-STYLE CUE) a phalanx forms up — a MARTIAL brass stab: a rising perfect-fifth fanfare with a metallic ring, so it reads
+    // completely different from the taker's low toll. Sharp attack, short proud decay.
+    private static AudioStreamWav BuildPhalanxSpawnCue()
+    {
+        int rate = 22050, n = (int)(rate * 0.85f); var s = new float[n];
+        float Brass(float t, float f) => Mathf.Sin(t * Tau * f) * 0.5f + Mathf.Sin(t * Tau * f * 2f) * 0.26f + Mathf.Sin(t * Tau * f * 3f) * 0.15f + Mathf.Sin(t * Tau * f * 4f) * 0.08f;
+        for (int i = 0; i < n; i++)
+        {
+            float t = i / (float)rate, k = t / 0.85f;
+            float n1 = Mathf.Max(0f, 1f - Mathf.Abs((t - 0.13f) / 0.20f));   // first note (G3)
+            float n2 = Mathf.Max(0f, 1f - Mathf.Abs((t - 0.48f) / 0.30f));   // rising to a fifth (D4) — a call to arms
+            float env = Mathf.Min(1f, t / 0.015f) * Mathf.Pow(1f - k, 1.1f);
+            float ring = Mathf.Sin(t * Tau * 1174f) * 0.05f * Mathf.Max(0f, 1f - k * 1.6f);   // metallic overtone
+            s[i] = (Brass(t, 196f) * n1 + Brass(t, 294f) * n2 + ring) * env * 0.7f;
         }
         return Wav(s, rate);
     }

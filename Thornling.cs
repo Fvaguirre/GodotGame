@@ -50,8 +50,13 @@ public partial class Thornling : Node3D
     // Shared cute tree-ent visual — built by the live Thornling AND the Wild Swarm stampede critters so they always
     // match. Constructs all meshes under `body`; hands back the sub-nodes that get animated (feet, arms, tuft, eyes,
     // motes). Callers that don't animate can pass discards (out _). A round BARK body so it reads brown, not green.
-    public static void BuildEntBody(Node3D body, out Node3D footL, out Node3D footR, out Node3D armL, out Node3D armR, out Node3D tuft, out Node3D eyeL, out Node3D eyeR, out Node3D motes, bool detailed = true)
+    // `segs` > 0 builds the SAME body at a low tessellation — the stampede bakes 80 of these into one MultiMesh, so
+    // its critters must be cheap; the live ent (segs = 0) keeps Godot's default smooth primitives.
+    public static void BuildEntBody(Node3D body, out Node3D footL, out Node3D footR, out Node3D armL, out Node3D armR, out Node3D tuft, out Node3D eyeL, out Node3D eyeR, out Node3D motes, bool detailed = true, int segs = 0)
     {
+        int rs = segs > 0 ? segs : 64, rg = segs > 0 ? Mathf.Max(2, segs / 2) : 32;   // SphereMesh defaults are 64/32
+        SphereMesh Sp(float r, float h) => new SphereMesh { Radius = r, Height = h, RadialSegments = rs, Rings = rg };
+        CylinderMesh Cy(float top, float bot, float h) => new CylinderMesh { TopRadius = top, BottomRadius = bot, Height = h, RadialSegments = rs };
         var bark = Game.ToonEmissive(new Color(0.44f, 0.30f, 0.17f), 0.28f, 0.03f);   // mid brown bark
         var barkDark = Game.ToonEmissive(new Color(0.30f, 0.20f, 0.11f), 0.22f, 0.03f);   // knots / feet
         var barkWarm = Game.ToonEmissive(new Color(0.57f, 0.41f, 0.24f), 0.30f, 0.03f);   // lighter belly / muzzle
@@ -68,59 +73,59 @@ public partial class Thornling : Node3D
 
         // two stubby root-feet — animated for a little waddle
         footL = new Node3D { Position = new Vector3(-0.2f, 0.14f, 0.02f) }; body.AddChild(footL);
-        Add(footL, new SphereMesh { Radius = 0.17f, Height = 0.3f }, barkDark, Vector3.Zero);
+        Add(footL, Sp(0.17f, 0.3f), barkDark, Vector3.Zero);
         footR = new Node3D { Position = new Vector3(0.2f, 0.14f, 0.02f) }; body.AddChild(footR);
-        Add(footR, new SphereMesh { Radius = 0.17f, Height = 0.3f }, barkDark, Vector3.Zero);
+        Add(footR, Sp(0.17f, 0.3f), barkDark, Vector3.Zero);
 
         // round bark body (torso + head in one lump) — this is the brown mass that fixes "too green"
-        M(body, new SphereMesh { Radius = 0.52f, Height = 1.04f }, bark, new Vector3(0, 0.74f, 0)).Scale = new Vector3(1f, 1.12f, 0.96f);
-        Add(body, new SphereMesh { Radius = 0.34f, Height = 0.6f }, barkWarm, new Vector3(0, 0.6f, 0.3f));      // lighter belly patch (two-tone)
+        M(body, Sp(0.52f, 1.04f), bark, new Vector3(0, 0.74f, 0)).Scale = new Vector3(1f, 1.12f, 0.96f);
+        Add(body, Sp(0.34f, 0.6f), barkWarm, new Vector3(0, 0.6f, 0.3f));      // lighter belly patch (two-tone)
         if (detailed)
         {
-            Add(body, new SphereMesh { Radius = 0.12f, Height = 0.24f }, barkDark, new Vector3(-0.35f, 0.98f, 0.12f));   // bark knots / grain
-            Add(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, barkDark, new Vector3(0.34f, 0.5f, 0.2f));
+            Add(body, Sp(0.12f, 0.24f), barkDark, new Vector3(-0.35f, 0.98f, 0.12f));   // bark knots / grain
+            Add(body, Sp(0.09f, 0.18f), barkDark, new Vector3(0.34f, 0.5f, 0.2f));
         }
 
         // cute face: big eyes (sclera + glowing pupil + highlight), rosy cheeks, a tiny mouth
         eyeL = new Node3D { Position = new Vector3(-0.19f, 0.93f, 0.36f) }; body.AddChild(eyeL);
-        M(eyeL, new SphereMesh { Radius = 0.13f, Height = 0.26f }, white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
-        M(eyeL, new SphereMesh { Radius = 0.08f, Height = 0.16f }, glow, new Vector3(0.01f, -0.01f, 0.08f));
+        M(eyeL, Sp(0.13f, 0.26f), white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
+        M(eyeL, Sp(0.08f, 0.16f), glow, new Vector3(0.01f, -0.01f, 0.08f));
         eyeR = new Node3D { Position = new Vector3(0.19f, 0.93f, 0.36f) }; body.AddChild(eyeR);
-        M(eyeR, new SphereMesh { Radius = 0.13f, Height = 0.26f }, white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
-        M(eyeR, new SphereMesh { Radius = 0.08f, Height = 0.16f }, glow, new Vector3(-0.01f, -0.01f, 0.08f));
+        M(eyeR, Sp(0.13f, 0.26f), white, Vector3.Zero).Scale = new Vector3(1f, 1.15f, 0.7f);
+        M(eyeR, Sp(0.08f, 0.16f), glow, new Vector3(-0.01f, -0.01f, 0.08f));
         if (detailed)
         {
-            M(eyeL, new SphereMesh { Radius = 0.03f, Height = 0.06f }, white, new Vector3(0.045f, 0.05f, 0.13f));       // eye highlights
-            M(eyeR, new SphereMesh { Radius = 0.03f, Height = 0.06f }, white, new Vector3(-0.045f, 0.05f, 0.13f));
-            M(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, cheek, new Vector3(-0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
-            M(body, new SphereMesh { Radius = 0.09f, Height = 0.18f }, cheek, new Vector3(0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
-            M(body, new SphereMesh { Radius = 0.05f, Height = 0.1f }, barkDark, new Vector3(0, 0.75f, 0.44f)).Scale = new Vector3(1.5f, 0.7f, 0.6f);   // mouth
+            M(eyeL, Sp(0.03f, 0.06f), white, new Vector3(0.045f, 0.05f, 0.13f));       // eye highlights
+            M(eyeR, Sp(0.03f, 0.06f), white, new Vector3(-0.045f, 0.05f, 0.13f));
+            M(body, Sp(0.09f, 0.18f), cheek, new Vector3(-0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
+            M(body, Sp(0.09f, 0.18f), cheek, new Vector3(0.34f, 0.8f, 0.32f)).Scale = new Vector3(1f, 0.7f, 0.4f);
+            M(body, Sp(0.05f, 0.1f), barkDark, new Vector3(0, 0.75f, 0.44f)).Scale = new Vector3(1.5f, 0.7f, 0.6f);   // mouth
         }
 
         // leafy tuft "hair" — small so plenty of bark still shows; a sprig + bloom for cuteness
         tuft = new Node3D { Position = new Vector3(0, 1.2f, 0) }; body.AddChild(tuft);
-        Add(tuft, new SphereMesh { Radius = 0.26f, Height = 0.5f }, leaf, new Vector3(0, 0.06f, 0));
-        Add(tuft, new SphereMesh { Radius = 0.2f, Height = 0.4f }, leafDk, new Vector3(0.2f, 0f, 0.06f));
+        Add(tuft, Sp(0.26f, 0.5f), leaf, new Vector3(0, 0.06f, 0));
+        Add(tuft, Sp(0.2f, 0.4f), leafDk, new Vector3(0.2f, 0f, 0.06f));
         if (detailed)
         {
-            Add(tuft, new SphereMesh { Radius = 0.18f, Height = 0.36f }, leaf, new Vector3(-0.19f, 0.02f, -0.05f));
-            Add(tuft, new SphereMesh { Radius = 0.15f, Height = 0.3f }, leafDk, new Vector3(0.02f, 0.14f, -0.14f));
-            Add(tuft, new CylinderMesh { TopRadius = 0.015f, BottomRadius = 0.03f, Height = 0.28f }, barkWarm, new Vector3(0.06f, 0.28f, 0.02f), new Vector3(0, 0, -12));
-            Add(tuft, new SphereMesh { Radius = 0.07f, Height = 0.14f }, flower, new Vector3(0.03f, 0.42f, 0.03f));
+            Add(tuft, Sp(0.18f, 0.36f), leaf, new Vector3(-0.19f, 0.02f, -0.05f));
+            Add(tuft, Sp(0.15f, 0.3f), leafDk, new Vector3(0.02f, 0.14f, -0.14f));
+            Add(tuft, Cy(0.015f, 0.03f, 0.28f), barkWarm, new Vector3(0.06f, 0.28f, 0.02f), new Vector3(0, 0, -12));
+            Add(tuft, Sp(0.07f, 0.14f), flower, new Vector3(0.03f, 0.42f, 0.03f));
         }
 
         // stubby branch arms with little leaf hands
         armL = new Node3D { Position = new Vector3(-0.42f, 0.85f, 0) }; body.AddChild(armL);
-        Add(armL, new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(-0.1f, -0.18f, 0), new Vector3(0, 0, 32));
-        Add(armL, new SphereMesh { Radius = 0.13f, Height = 0.26f }, leaf, new Vector3(-0.22f, -0.36f, 0));
+        Add(armL, Cy(0.05f, 0.08f, 0.5f), bark, new Vector3(-0.1f, -0.18f, 0), new Vector3(0, 0, 32));
+        Add(armL, Sp(0.13f, 0.26f), leaf, new Vector3(-0.22f, -0.36f, 0));
         armR = new Node3D { Position = new Vector3(0.42f, 0.85f, 0) }; body.AddChild(armR);
-        Add(armR, new CylinderMesh { TopRadius = 0.05f, BottomRadius = 0.08f, Height = 0.5f }, bark, new Vector3(0.1f, -0.18f, 0), new Vector3(0, 0, -32));
-        Add(armR, new SphereMesh { Radius = 0.13f, Height = 0.26f }, leaf, new Vector3(0.22f, -0.36f, 0));
+        Add(armR, Cy(0.05f, 0.08f, 0.5f), bark, new Vector3(0.1f, -0.18f, 0), new Vector3(0, 0, -32));
+        Add(armR, Sp(0.13f, 0.26f), leaf, new Vector3(0.22f, -0.36f, 0));
 
         // a few drifting spore motes around its head (detail only)
         motes = new Node3D { Position = new Vector3(0, 1.3f, 0) }; body.AddChild(motes);
         if (detailed)
-            for (int i = 0; i < 3; i++) M(motes, new SphereMesh { Radius = 0.035f, Height = 0.07f }, glow, new Vector3(Mathf.Cos(i * 2.09f) * 0.4f, 0, Mathf.Sin(i * 2.09f) * 0.4f));
+            for (int i = 0; i < 3; i++) M(motes, Sp(0.035f, 0.07f), glow, new Vector3(Mathf.Cos(i * 2.09f) * 0.4f, 0, Mathf.Sin(i * 2.09f) * 0.4f));
     }
 
     public override void _Ready()

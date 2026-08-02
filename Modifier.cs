@@ -5,7 +5,7 @@ using Godot;
 // Player.EquipModifier, and applied in Player.ApplyChargedMods (switch on m.Type, reading magnitude
 // from the equipped Modifier). To add one: extend this enum + ModMeta, handle it in ApplyChargedMods,
 // add a ModCard Def in UpgradePool. Witch-agnostic, like finishers. See DEV_GUIDE.md §6.3.
-public enum ModType { FrostWall, Bramble, Sunder, HexMark, Moonbeam, Consecrate, Smite, Hemorrhage, CrimsonPool, SanguineSpikes, Implosion, Whirlwind, Meteor, Eruption, FrostNova, Spore, Cursefield, Moonfall, ArcaneVortex, ArcStorm }   // FrostWall replaced the old Frost Veil (redundant with FrostNova); ArcaneVortex/ArcStorm = Arcane (NEW)
+public enum ModType { FrostWall, Bramble, Sunder, HexMark, Moonbeam, Consecrate, Smite, Hemorrhage, CrimsonPool, SanguineSpikes, Implosion, Whirlwind, Meteor, Eruption, FrostNova, Spore, Cursefield, Moonfall, ArcaneVortex, ArcStorm, Turncoat, Fray, Effigy }   // FrostWall replaced the old Frost Veil (redundant with FrostNova); ArcaneVortex/ArcStorm = Arcane; Turncoat/Fray/Effigy = the Doom kit (NEW)
 
 public static class ModMeta
 {
@@ -30,11 +30,16 @@ public static class ModMeta
         ModType.Moonfall => "Moonfall",
         ModType.ArcaneVortex => "Arcane Vortex",
         ModType.ArcStorm => "Arc Storm",
+        ModType.Turncoat => "Turncoat",
+        ModType.Fray => "Fray",
+        ModType.Effigy => "Effigy",
         _ => "?" };
 
     // hover-tooltip description for the swap / grimoire screens
     public static string Desc(ModType t) => t switch {
-        ModType.FrostWall => "A full charge raises a wall of frost that blocks enemies. It shatters after a few seconds (longer at higher rarity), damaging nearby foes. You can keep more walls live at once at higher rarity (1 → 4); casting past your limit shatters your oldest wall early.",
+        // (FIX) was written for the old rarity-driven system ("longer at higher rarity", "1 → 4") — abilities are always
+        // Common-framed now and every one of those numbers comes from the Permafrost path in the upgrade tree.
+        ModType.FrostWall => "A full charge raises a wall of frost that blocks enemies. It shatters after a few seconds, damaging nearby foes. Permafrost lengthens it and lets you keep more walls live at once (1 → 5); casting past your limit shatters your oldest wall early.",
         ModType.Bramble => "Charged casts entangle, briefly rooting foes they hit.",
         ModType.Sunder => "Charged casts erupt on impact for bonus Ember splash damage.",
         ModType.HexMark => "Charged casts mark foes; the mark amplifies damage and leaps to nearby enemies.",
@@ -54,6 +59,9 @@ public static class ModMeta
         ModType.Moonfall => "A full charge calls down a shaft of moonlight — a Lunar nova that can crit and briefly slows what it hits.",
         ModType.ArcaneVortex => "A full charge tears open a swirling arcane vortex (~5u, grows with rarity & area) that slows and grinds every foe inside it, wreathed in raw arcane lightning.",
         ModType.ArcStorm => "A full charge looses a bolt of arcane chain-lightning at a random foe in sight — it forks to nearby enemies (2 jumps → 6 at legendary).",
+        ModType.Turncoat => "A full charge turns the foe you hit: it attacks the nearest enemy once with its own attack — a brute runs over and swings, an archer puts its shot into a friend. Dooms both.",
+        ModType.Fray => "A full charge snaps the threads outward: half of the struck foe's Doom is COPIED onto everything nearby. It sets nothing off — it loads a crowd.",
+        ModType.Effigy => "A full charge nails your doll to the foe you hit. For a while, a share of all damage you deal to anything ELSE is banked as Doom on it. One effigy at a time.",
         _ => "" };
 
     public static string Tag(ModType t) => t switch {
@@ -61,9 +69,12 @@ public static class ModMeta
         ModType.HexMark => "HX", ModType.Moonbeam => "MW",
         ModType.Consecrate => "CG", ModType.Smite => "SM",
         ModType.Hemorrhage => "HM", ModType.CrimsonPool => "CP", ModType.SanguineSpikes => "SS",
+        ModType.Implosion => "IP", ModType.Whirlwind => "WW",   // (FIX) both were missing — the HUD mod strip drew them as "?"
         ModType.Meteor => "MT", ModType.Eruption => "ER",
         ModType.FrostNova => "FN", ModType.Spore => "SP", ModType.Cursefield => "CF", ModType.Moonfall => "MF",
-        ModType.ArcaneVortex => "AV", ModType.ArcStorm => "AS", _ => "?" };
+        ModType.ArcaneVortex => "AV", ModType.ArcStorm => "AS",
+        ModType.Turncoat => "TC", ModType.Fray => "FY", ModType.Effigy => "EF",
+        _ => "?" };
 
     public static DamageType DType(ModType t) => t switch {
         ModType.FrostWall => DamageType.Frost,
@@ -86,6 +97,9 @@ public static class ModMeta
         ModType.Moonfall => DamageType.Lunar,
         ModType.ArcaneVortex => DamageType.Arcane,
         ModType.ArcStorm => DamageType.Arcane,
+        ModType.Turncoat => DamageType.Curse,
+        ModType.Fray => DamageType.Curse,
+        ModType.Effigy => DamageType.Curse,
         _ => DamageType.Arcane };
 
     public static Color Col(ModType t) => DamageTypes.Col(DType(t));

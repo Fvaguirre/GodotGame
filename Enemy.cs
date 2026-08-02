@@ -121,6 +121,17 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     public void SetRemoteTarget(Vector3 p) { _remoteTarget = p; if (!_haveRemote) { GlobalPosition = p; _haveRemote = true; } }
     private void HitTarget(float dmg)
     {
+        if (_tgtIsEnemy)   // (PUPPET) its own slash, landing on its own ally — attributed to whoever turned it so the kill still pays out
+        {
+            if (Puppeted)
+            {
+                PuppetTgt.PuppetHurt(_puppetOwner, dmg);
+                // (DANSE MACABRE) the brawl FEEDS the mechanic — but at the deepest generation, so infighting can never
+                // seed a fresh detonation chain on top of the splash one. That's the whole reason this is capped here.
+                if (_puppetFeed > 0f) PuppetTgt.AddDoom(_puppetFeed, _puppetOwner, DoomMaxGen);
+            }
+            return;
+        }
         if (_tgtIsMinion) return;   // the ent takes contact damage on its owner's machine; no player here
         if (_tgtPeer == 0) { var pl = Game.I.Player; if (pl != null) pl.Hurt(dmg, GlobalPosition); }
         else Game.I.NetMgr?.DamagePlayer(_tgtPeer, dmg);
@@ -173,6 +184,9 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private float _bleedBurstMul = 1f;   // (OVERHAUL) Hemorrhage Rupture: scales the on-death blood burst
     private float _rotBubT = 0f;
     private bool _rotShow = false;     // client mirror of the rot state (status bit 32)
+
+    // (CRIMSON RITE) the pentagram's shockwave cuts this foe down — a heavier burst of the same crimson gashes
+    public void RiteSlash() { for (int i = 0; i < 3; i++) SpawnBleedSlash(); }
 
     // (NEW) a couple of short bright-crimson gashes flick across the body — reads as "bleeding" (distinct from rot's rising bubbles)
     private void SpawnBleedSlash()
@@ -294,6 +308,8 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private bool _climbing = false;               // (NEW) hauling itself up a vertical face: half speed, and a crit/knock/fling peels it off
     private Vector3 _climbDir = Vector3.Forward;  // horizontal direction INTO the wall we're scaling
     public bool Climbing => _climbing;
+    private bool _flungFromClimb = false;         // (NEW) the current fling started as a wall-peel → play the climb-slip fall lead-in
+    private bool AuthBiped => _creature != null && _creature.IsAuthoredGoblin;   // (NEW) authored biped (goblin/zombie/ogre/taker) → drive real fall/get-up CLIPS instead of the procedural pitch-topple
 
     // push the enemy away from `from` (negative force pulls toward it)
     public void Knockback(Vector3 from, float force)
@@ -313,6 +329,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     {
         if (Remote || Dead || _thrown || !_climbing) return;
         _climbing = false;
+        _flungFromClimb = true;   // (NEW) the resulting fall opens on the climb-slip clip
         push.Y = 0f;
         if (push.LengthSquared() < 0.01f) push = -_climbDir * 4f;
         Fling(push + Vector3.Up * 2.5f);   // a little pop so it clears the face before gravity takes over
@@ -765,6 +782,8 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         _throwVel = velocity / mass;
         _knock = Vector3.Zero;             // a throw overrides any pending horizontal knockback
         _thrown = true; _thrownT = 0f;
+        if (AuthBiped) _creature.BipedAirborne(_flungFromClimb);   // (NEW) real airborne fall clip (climb-slip lead-in if peeled off a wall)
+        _flungFromClimb = false;
         // ragdoll tumble: random spin on two axes, faster the harder the launch (NEW)
         float spin = Mathf.Clamp(_throwVel.Length() * 0.5f, 4f, 14f);
         _tumbleX = (GD.Randf() * 2f - 1f) * spin;
@@ -797,7 +816,8 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             return;
         }
         GlobalPosition = ClampArena(np);
-        if (_creature != null) { _creature.RotateX(_tumbleX * dt); _creature.RotateZ(_tumbleZ * dt); }   // chaotic ragdoll tumble (NEW)
+        if (AuthBiped) _creature.Animate(dt, 0f);   // (NEW) advance the airborne fall clip; NO ragdoll spin — the clip carries the motion
+        else if (_creature != null) { _creature.RotateX(_tumbleX * dt); _creature.RotateZ(_tumbleZ * dt); }   // procedural foes: chaotic ragdoll tumble
     }
 
     private void EndThrow(float impactSpeed)
@@ -812,9 +832,17 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (!Dead && _behav != EBehav.Boss && impactSpeed > 4f)
         {
             gud = Mathf.Clamp(0.4f + impactSpeed * 0.045f, 0.5f, 1.1f);
-            _getUpDur = gud; _getUpT = gud;
-            if (_creature != null)   // slam into a toppled pose (on its back/side); UpdateGetUp rights it
-                _creature.Rotation = new Vector3(1.45f, _creature.Rotation.Y, GD.Randf() * 0.9f - 0.45f);
+            if (AuthBiped)   // (NEW) authored biped: a real ground-to-standing clip (random stand-up 2/4) drives the get-up — no pitch-topple
+            {
+                _getUpDur = _getUpT = 1.6f;   // hold the AI open long enough for the stand-up clip; UpdateGetUp ends early once it finishes
+                _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0);
+                _creature.BipedGetUp();
+            }
+            else   // procedural foe: slam into a toppled pose (on its back/side); UpdateGetUp rights it
+            {
+                _getUpDur = gud; _getUpT = gud;
+                if (_creature != null) _creature.Rotation = new Vector3(1.45f, _creature.Rotation.Y, GD.Randf() * 0.9f - 0.45f);
+            }
             Game.I.Sfx?.Impact(DamageType.Physical);
         }
         else if (_creature != null) _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0);   // clear the tumble pitch
@@ -826,6 +854,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     {
         if (!Remote) return;
         _rThrown = true; _tumbleX = tumbleX; _tumbleZ = tumbleZ; _getUpT = 0f;
+        if (AuthBiped) _creature.BipedAirborne(false);   // (NEW) proxy plays the airborne fall clip (host doesn't sync climb-origin → plain free-fall)
     }
 
     // CLIENT proxy: host says it landed — topple + rise (dur>0) or just stand back up (dur==0). (NEW)
@@ -835,17 +864,25 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         _rThrown = false;
         if (getUpDur > 0f)
         {
-            _getUpDur = getUpDur; _getUpT = getUpDur;
-            if (_creature != null) _creature.Rotation = new Vector3(1.45f, _creature.Rotation.Y, GD.Randf() * 0.9f - 0.45f);
+            if (AuthBiped) { _getUpDur = _getUpT = 1.6f; _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0); _creature.BipedGetUp(); }   // (NEW) real stand-up clip
+            else { _getUpDur = getUpDur; _getUpT = getUpDur; if (_creature != null) _creature.Rotation = new Vector3(1.45f, _creature.Rotation.Y, GD.Randf() * 0.9f - 0.45f); }
             Game.I.Sfx?.Impact(DamageType.Physical);
         }
-        else { _getUpT = 0f; if (_creature != null) _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0); }
+        else { _getUpT = 0f; if (_creature != null) { _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0); if (AuthBiped) _creature.BipedLoco(false); } }
     }
 
-    // downed-and-rising: lerp the toppled creature back upright over the stagger window; AI stays suppressed (NEW)
+    // downed-and-rising: authored bipeds play the ground→standing CLIP (end as soon as it finishes); procedural foes lerp the
+    // toppled creature back upright over the stagger window. AI stays suppressed either way. (NEW)
     private void UpdateGetUp(float dt)
     {
         _getUpT -= dt;
+        if (AuthBiped)
+        {
+            _creature.Animate(dt, 0f);   // drive the stand-up clip
+            if (_creature.BipedOneShotDone) _getUpT = 0f;   // clip finished → resume AI now (don't wait out the padding window)
+            if (_getUpT <= 0f) { _getUpT = 0f; _creature.BipedLoco(false); }
+            return;
+        }
         if (_creature != null)
         {
             float px = Mathf.LerpAngle(_creature.Rotation.X, 0f, dt * 9f);
@@ -873,6 +910,11 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     public float SlowMul = 0.45f;
     public float RootT = 0f;
     public float MarkT = 0f;
+    // (HAUNT STORM) a generic ELECTRIC stun — held in place AND locked out of every ability, but with none of the
+    // frost machinery (no stacks, no ice block, no shatter). Kept separate from FrozenT so a Haunt bolt can't be
+    // mistaken for a Frost-witch freeze by anything that reads Frozen (Deep Winter, shatter, Taker grab-drop).
+    public float ShockT = 0f;
+    public void Shock(float dur) { if (!Dead) ShockT = Mathf.Max(ShockT, dur); }
     // ===== FROST WITCH: freeze stacks → frozen (ice block) → shatter =====
     public float FreezeStacks = 0f;
     public float FrozenT = 0f;                       // >0 = encased in ice (a stun)
@@ -892,6 +934,90 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     // burst is what froze the game in MP. These caps bound the work per frame (self-reset via the process-frame counter).
     private static ulong _shareFrame; private static int _shareBudget; private static bool _shareWarned;
     private static ulong _cascFrame; private static int _cascBudget; private static bool _cascWarned;
+
+    // ===== (DOOM) the Forsaken's mechanic. ONE accumulating bank of banked damage per foe with a fuse: every application
+    // adds to that same bank and refreshes the fuse (there is never a second stack), the fuse detonates it in a single
+    // burst, and the instant the bank covers the distance to this foe's next FLOOR it fires early instead of waiting.
+    // "Floor" is 0 for anything ordinary — so an execute is simply a kill — and the Hollow Moon's next authored phase
+    // gate for him, so a boss execute punches him to his next stage rather than skipping content you built.
+    // GENERATION is what bounds the chain: a splash applies Doom one generation deeper, and a gen-DoomMaxGen bank still
+    // detonates for damage but no longer splashes. That plus the per-frame budget is what keeps this off the MP-freeze
+    // path the curse-group cascade found (see the _share/_casc budgets above — same pattern, deliberately).
+    public const float DoomFuse = 5f;
+    public const int DoomMaxGen = 2;
+    public const float DoomSplashFrac = 0.25f;
+    public const float DoomSplashRadius = 5f;
+    public float DoomBank = 0f;
+    public float DoomT = 0f;
+    private int _doomGen = 0;
+    private long _doomOwner = 0;                     // peer credited with the detonation's damage, kills and souls
+    private bool _doomGuard = false;                 // a detonation's own damage must never re-enter the detonation
+    private float _doomSpreadMul = 1f;               // (FRAY) how hard this bank's blast carries when it goes off
+    private float _doomSpreadR = DoomSplashRadius;   // …and how far, from the caster's DoomSpreadRadius
+    // (MP) StatusMask is out of bits — stacks hold 22-27, the tether group 28-30, arcane-marked 31 — so Doom rides its
+    // own packed int in the enemy snapshot, alongside the burn-stack array that set the precedent. The host owns the
+    // bank, the fuse and every detonation; a client only ever renders what it's told.
+    private float _remoteDoomBank = 0f, _remoteDoomT = 0f;
+    private bool _remoteDoomLethal = false, _remotePuppeted = false;
+    public bool Doomed => Remote ? _remoteDoomBank > 0.01f : DoomBank > 0.01f;
+    public float DoomShownBank => Remote ? _remoteDoomBank : DoomBank;
+    public float DoomShownT => Remote ? _remoteDoomT : DoomT;
+    public bool DoomShownLethal => Remote ? _remoteDoomLethal : DoomBank >= Hp - DoomFloorHp();
+    public bool PuppetShown => Remote ? _remotePuppeted : Puppeted;
+    public int PackDoom()
+    {
+        if (DoomBank <= 0.01f && !Puppeted) return 0;
+        int bank = Mathf.Clamp(Mathf.RoundToInt(DoomBank), 0, 0xFFFF);
+        int fuse = Mathf.Clamp(Mathf.RoundToInt(DoomT * 10f), 0, 127);
+        int v = bank | (fuse << 16);
+        if (Puppeted) v |= 1 << 23;
+        if (DoomBank > 0.01f && DoomBank >= Hp - DoomFloorHp()) v |= 1 << 24;   // the host resolves the floor; the client just paints it red
+        return v;
+    }
+    public void SetRemoteDoom(int v)
+    {
+        _remoteDoomBank = v & 0xFFFF;
+        _remoteDoomT = ((v >> 16) & 0x7F) / 10f;
+        _remotePuppeted = (v & (1 << 23)) != 0;
+        _remoteDoomLethal = (v & (1 << 24)) != 0;
+    }
+    public float DoomFrac => MaxHp > 0f ? Mathf.Clamp(DoomBank / MaxHp, 0f, 1f) : 0f;
+    private static ulong _doomFrame; private static int _doomBudget; private static bool _doomWarned;
+
+    // ===== (PUPPET) she never moves a body — she makes a body move itself. A puppeted foe keeps its own AI, its own
+    // walk cycle and its own attack; the ONLY thing that changes is what it's pointed at. That's why this needs no new
+    // animation and no new AI: _tgt is a plain Vector3 and HitTarget routes damage by descriptor, exactly the way melee
+    // foes already peel off onto Verdant's tree-ents. This adds the third routing branch that path implies. =====
+    public Enemy PuppetTgt;
+    public float PuppetT = 0f;
+    private long _puppetOwner = 0;
+    private float _puppetFeed = 0f;     // Doom each landed puppet blow banks on its victim (Danse Macabre)
+    private bool _puppetFinale = false; // Leg Grand Finale: when this leash ends, set its own bank off
+    private bool _tgtIsEnemy = false;   // this frame's target is another enemy → HitTarget must not touch a player
+    public bool Puppeted => PuppetT > 0f && PuppetTgt != null && !PuppetTgt.Dead && GodotObject.IsInstanceValid(PuppetTgt);
+
+    // (ROUT) blind panic. Implemented as a TARGET override rather than new movement: point the foe at a spot behind
+    // itself and its own walk/pathing carries it away, so nothing here has to know how any of the 16 behaviours move.
+    public float RoutT = 0f;
+    private Vector3 _routDir = Vector3.Forward;
+
+    // (DOOM WALKER) a foe killed by its own detonation doesn't fall — it gets up and carries what's left of the blast
+    // into the nearest crowd before letting go. Still puppetry: the body walks on its own legs, nothing is thrown.
+    // Capped hard, because a walker is the most expensive thing here — it moves, animates and paths while already dead.
+    public const int DoomWalkerCap = 4;
+    private static int _doomWalkersLive = 0;
+    private bool _doomWalking = false;
+    private float _doomWalkT = 0f;
+    private float _doomWalkPayload = 0f;
+    public void Flee(Vector3 from, float dur, bool total = false)
+    {
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 12, dur, total ? 1f : 0f, 0f); return; }   // a client's Rout — the host owns the panic
+        if (Dead || IsBoss) return;
+        Vector3 away = GlobalPosition - from; away.Y = 0f;
+        _routDir = away.LengthSquared() > 0.01f ? away.Normalized() : Vector3.Forward;
+        RoutT = Mathf.Max(RoutT, dur);
+        if (total) { _alerted = false; _heard = 0f; }   // Leg Scattered: they lose you completely, not just their nerve
+    }
     public float FreezeThreshold => (IsBoss
         ? Mathf.Clamp(1f + MaxHp / 300f, 1f, 18f)     // (NEW) bosses/minibosses: gentler HP→stacks so a tanky target freezes in a few seconds, not ~8
         : Mathf.Clamp(1f + MaxHp / 120f, 1f, 240f)) * _freezeThreshMul;   // (BUFF) dropped the flat ×1.25 tax → every freeze builds ~20% faster; Brittle (best-of) still lowers it
@@ -931,10 +1057,13 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private float _markDoom = 0f;   // (OVERHAUL) Hex Mark Doombrand: on-death curse detonation
     // ---- Arcane witch: Arcane Mark — a PERSISTENT paint (max 4 tracked on the caster, FIFO, cleared on death/eviction) that
     // her charged chain-lightning bounces through. No timer here; the caster's Player owns the mark set & calls SetArcaneMark. ----
-    private bool _arcaneMarked = false;              // host truth
+    private bool _arcaneMarked = false;              // host truth (Arcane witch's own primary/charge marks, managed by her Player)
     private bool _markShow = false;                  // client-proxy mirror
-    public bool ArcaneMarked => Remote ? _markShow : _arcaneMarked;   // HUD pip + client-caster chain targeting
+    public float ConduitT = 0f;                      // (NEW) SELF-EXPIRING conduit state — lets ANY witch's swappable mod/finisher brand a conduit
+    // a foe is "conduit-marked" if the Arcane witch painted it OR a swappable conduit-producer branded it (self-timed, cross-witch)
+    public bool ArcaneMarked => Remote ? _markShow : (_arcaneMarked || ConduitT > 0f);   // HUD pip + chain/torrent targeting
     public void SetArcaneMark(bool on) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 8, on ? 1f : 0f, 0f, 0f); return; } _arcaneMarked = on; }
+    public void MarkConduit(float dur) { if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 9, dur, 0f, 0f); return; } ConduitT = Mathf.Max(ConduitT, dur); }   // (NEW) any conduit producer
 
     private string _type = "shade";
     private EBehav _behav = EBehav.Melee;
@@ -1062,7 +1191,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             case "archer":  MaxHp = 34 * hs;  Speed = 5.2f; Dmg = 6;  Score = 45; Radius = 1.05f; Col = new Color(0.70f, 0.58f, 1.0f); _behav = EBehav.Archer; Label = "PHALANX ARCHER"; break;
             case "miniboss": MaxHp = 680 * bhs; Speed = 3.0f; Dmg = 28; Score = 220; Radius = 3.0f; Col = new Color(0.62f, 0.30f, 0.85f); _behav = EBehav.Boss; IsBoss = true; Label = "MINI-BOSS";
                            _range = 30; _fireEvery = 2.4f; _boltSpeed = 15; _boltDmg = 16; _boltRadius = 0.7f; break;
-            case "boss":   MaxHp = 4200 * bhs; Speed = 2.6f; Dmg = 40; Score = 800; Radius = 4.0f; Col = new Color(0.85f, 0.25f, 0.45f); _behav = EBehav.Boss; IsBoss = true; Label = "THE HOLLOW MOON";
+            case "boss":   MaxHp = 4200 * bhs; Speed = 5.2f; Dmg = 40; Score = 800; Radius = 4.0f; Col = new Color(0.85f, 0.25f, 0.45f); _behav = EBehav.Boss; IsBoss = true; Label = "THE HOLLOW MOON";   // (REWORK) 2.6 -> 5.2: he read as a slow siege piece; now he closes
                            _range = 36; _fireEvery = 2.0f; _boltSpeed = 16; _boltDmg = 22; _boltRadius = 0.9f; break;
             default:       MaxHp = 14 * hs; Speed = 4.0f; Dmg = 10; Score = 10; Radius = 1.3f; Col = new Color(0.54f, 0.47f, 0.84f); _behav = EBehav.Melee; break;
         }
@@ -1227,9 +1356,10 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
 
                 float dd = Speed * 4f * dt;
                 var next = GlobalPosition + _chargeDir * dd;
-                if (Game.I.SightBlocked(GlobalPosition + Vector3.Up, next + Vector3.Up) || Game.I.BlockerAt(next, Radius * 0.6f))   // wall or tree/pillar → stunned 2s
+                if (Game.I.SightBlocked(GlobalPosition + Vector3.Up, next + Vector3.Up) || Game.I.BlockerAt(next, Radius * 0.6f))   // wall or tree/pillar → stunned
                 {
-                    _takerState = 2; _takerT = 2f; _chargeCd = 7f;
+                    _takerState = 2; _takerT = AuthBiped ? 3.0f : 2f; _chargeCd = 7f;   // authored: longer window so falling_down → stand-up-4 both fit
+                    if (AuthBiped) { _creature.BipedWallSlam(); _wallSlamPhase = 0; }   // slam to the dirt, then get up on stand-up 4
                     var impact = GlobalPosition + _chargeDir * Radius;
                     Game.I.Sfx?.Thud(impact); Game.I.Sfx?.TakerGrunt(impact);   // thud + ouch grunt
                     Game.I.SpawnImpactMark(new Vector3(impact.X, 0.05f, impact.Z), Vector3.Up, null, DamageType.Physical, 1.5f);   // scuff on the ground
@@ -1251,7 +1381,94 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
                 CarryMove(dt); moveAmt = 0.35f; CarryTick(dt);
                 break;
         }
-        if (_creature != null) { _creature.IdlePose = _takerState == 2 ? 1 : 0; _creature.Animate(dt, _takerState == 2 ? 0f : moveAmt); }
+        if (_creature != null)
+        {
+            if (AuthBiped) DriveTakerAnim(dt, moveAmt);
+            else { _creature.IdlePose = _takerState == 2 ? 1 : 0; _creature.Animate(dt, _takerState == 2 ? 0f : moveAmt); }
+        }
+    }
+
+    // (HARNESS) force a specific biped clip/state for deterministic capture, bypassing the AI. null = normal AI.
+    private string _dbgBiped = null;
+    public void DebugBiped(string canon) { _dbgBiped = canon; }
+    public int DebugClipCount => _creature != null ? _creature.BipedClipCount : -1;   // (HARNESS) how many action clips this biped resolved (10 = full set)
+    public void DebugWince(int variant) { _dbgBiped = "walk"; _creature?.Wince(variant); }   // (HARNESS) force a hurt flinch of the given variant
+    // (HARNESS) THE HOLLOW MOON: drive one specific attack through the REAL wind-up→telegraph→fire path, bypassing only the
+    // cooldown/range gates. Everything else (clip, gesture, hand glow, lanes, shout, the actual damage) runs as it would in a fight.
+    public void DebugBossPattern(int pat, float dur = 1.2f)
+    {
+        var to = _tgt - GlobalPosition; to.Y = 0f;
+        if (to.LengthSquared() < 0.01f) { to = -GlobalTransform.Basis.Z; to.Y = 0f; }
+        var flat = to.LengthSquared() > 0.01f ? to.Normalized() : Vector3.Forward;
+        _bossAoeReach = pat == 8 ? DashDist : (pat == 5 || pat == 7 ? 0f : 14f);
+        if (pat == 8) _dashDir = flat;
+        BeginBossCharge(pat, dur, flat, flat, Mathf.Max(_bossAoeReach, 12f), false);
+    }
+    public bool DebugBossWinding => _bossCharging;
+    public string DebugBossClipState => _creature == null ? "no creature"
+        : $"{_creature.DebugPlayingClip}@{_creature.DebugPlaySpeed:0.00}x playing={_creature.DebugApPlaying}";
+    public bool DebugCasting => _creature != null && _creature.Casting;      // (HARNESS) a one-shot cast clip owns the body right now
+    public float DebugFootGap => _creature != null ? _creature.DebugFootGap / Mathf.Max(0.01f, Radius) : 0f;   // foot offset in RADII, so it compares across body sizes
+    public string DebugCastState => $"hold={_castHoldT:0.00} wind={_castWindT:0.00} pend={_castPend} healCd={_healCd:0.00}";
+    public bool DebugHasClip(string canon) => _creature != null && _creature.HasBipedClip(canon);
+    public bool DebugBossDashing => _dashT > 0f;
+    public float DebugDashPushed => _dashMoved;   // distance the dash itself applied (net displacement can be less if terrain blocked him)
+    public int DebugTripleLeft => _tripleLeft;    // charges remaining in the current phase-2 three-charge set
+    public int DebugP2Stage => _p2Stage;          // 0 none, 1 prone, 2 rising, 3 laughing advance
+    public bool DebugVortexUp => _vortex != null && GodotObject.IsInstanceValid(_vortex);
+    public bool DebugSpinPending => _spinPending;
+    public float DebugBossChargeFrac => ChargeFrac;
+    public bool DebugThrown => _thrown;              // (HARNESS) mid-fling arc?
+    public bool DebugGettingUp => _getUpT > 0f;      // (HARNESS) in the downed→rising window?
+    public void DebugFling(Vector3 vel) { _dbgBiped = null; Fling(vel); }   // (HARNESS) REAL fling through the full arc/land/get-up path
+    public void DebugClimbPeel(Vector3 push)         // (HARNESS) REAL crit/knock-off-a-wall: mark climbing, then peel → Fling(fromClimb) → climb-slip fall
+    {
+        _dbgBiped = null; _thrown = false;
+        _climbing = true; _climbDir = Vector3.Forward;
+        PeelOffWall(push);
+    }
+    private void DebugBipedTick(float dt)
+    {
+        float move = 0f;
+        switch (_dbgBiped)
+        {
+            case "walk": _creature.BipedReach(0f); _creature.BipedLoco(false); move = 0.5f; break;
+            case "run": _creature.BipedReach(0f); _creature.BipedLoco(true); break;
+            case "reach": _creature.BipedReach(1f); _creature.BipedLoco(false); move = 0.4f; break;   // grab-arms telegraph while walking
+            case "climb": _creature.BipedReach(0f); _creature.BipedClimb(); break;
+            // "fall"/"walldown"/"standup": the state was TRIGGERED once by DebugBipedStart — just advance + hold here
+        }
+        _creature.Animate(dt, move);
+    }
+    // one-shot / transient states must be TRIGGERED once (not re-set every frame). Call this at the checkpoint, then hold with DebugBiped.
+    public void DebugBipedStart(string canon)
+    {
+        _dbgBiped = canon;
+        if (!AuthBiped) return;
+        switch (canon)
+        {
+            case "fall": _creature.BipedReach(0f); _creature.BipedAirborne(false); break;
+            case "climbfall": _dbgBiped = "fall"; _creature.BipedReach(0f); _creature.BipedAirborne(true); break;
+            case "walldown": _creature.BipedReach(0f); _creature.BipedWallSlam(); break;
+            case "standup": _creature.BipedReach(0f); _creature.BipedGetUp(4); break;
+        }
+    }
+    private int _wallSlamPhase = 0;   // taker wall-stun: 0 = slammed down (falling_down), 1 = getting up (stand-up 4)
+    // Authored taker: raise the grab-arms while winding up / dashing / carrying, RUN during the dash, and let the wall-slam play
+    // its falling_down → stand-up-4 recovery. The melee punch (state 0) is the ordinary one-arm slash fired by MeleeAttack→Strike.
+    private void DriveTakerAnim(float dt, float moveAmt)
+    {
+        _creature.BipedReach(_takerState == 4 || _takerState == 1 || _takerState == 3 ? 1f : 0f);   // arms forward: wind-up, dash, carry; down otherwise
+        if (_climbing && _takerState == 0) _creature.BipedClimb();
+        else switch (_takerState)
+        {
+            case 1: _creature.BipedLoco(true); break;    // dash → run clip
+            case 2:                                       // wall-stun: falling_down (phase 0) → stand-up-4 (phase 1)
+                if (_wallSlamPhase == 0 && _creature.BipedOneShotDone) { _creature.BipedGetUp(4); _wallSlamPhase = 1; }
+                break;
+            default: _creature.BipedLoco(false); break;   // approach / wind-up / carry → walk (arms up via reach when applicable)
+        }
+        _creature.Animate(dt, moveAmt);
     }
 
     // carry: move away from any OTHER player in line of sight (routing around corners); wander if none can see him
@@ -1338,10 +1555,13 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         else if (_type == "sentinel" || _type == "phalanx") kind = CreatureKind.Orc;   // (NEW) the ward-bearer is a heavy
         else if (_type == "archer") kind = CreatureKind.Goblin;                        // (NEW) wiry archers behind the line
         else if (_type == "flyer" || _type == "diver") kind = CreatureKind.Mosquito;
-        else if (_type == "zapper") kind = CreatureKind.Zapper;
         else if (_type == "bomber") kind = CreatureKind.Bomber;
-        else if (_type == "caster" || _type == "healer" || _type == "hexer" || _type == "totem" || _type == "wardbane") kind = CreatureKind.Spider;
-        else if (_type == "swarmer" || _type == "taker") kind = CreatureKind.Zombie;   // (NEW) shambling zombie / big kidnapper
+        // (NEW) THE WITHERED KING body carries the grove's whole spellcaster family: the arcane caster, the stunner, the
+        // healer, the empowering totem, the hexer and the dispeller.
+        else if (_type == "caster" || _type == "zapper" || _type == "healer" || _type == "totem"
+              || _type == "hexer" || _type == "wardbane") kind = CreatureKind.Withered;
+        else if (_type == "swarmer") kind = CreatureKind.Zombie;   // (NEW) shambling zombie
+        else if (_type == "taker") kind = CreatureKind.Taker;      // (NEW) big kidnapper — authored GLB with the full action set (run/fall/climb/stand-up)
         else if (_type == "jtroll") kind = CreatureKind.Troll;          // (NEW jungle) hulking troll bruiser
         else if (_type == "ptero") kind = CreatureKind.Pterodactyl;     // (NEW jungle) flying stunner
         else if (_type == "bat") kind = CreatureKind.Bat;               // (NEW jungle) diver
@@ -1515,7 +1735,10 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
 
         if (Remote)
         {
-            if (_bossCharging) { _bossChargeT -= dt; if (_bossChargeT <= 0f) _bossCharging = false; }   // run the attack-timer bar on the client proxy (NEW)
+            if (_bossCharging) { _bossChargeT -= dt; if (_bossChargeT <= 0f) { _bossCharging = false; FireBossAnim(_bossPatPending); } }   // run the attack-timer bar on the client proxy (NEW)
+            UpdateBossAnim(dt);   // (HOLLOW MOON) same gesture/glow telegraph on the proxy — clients must read the wind-up too
+            UpdateCastAnim(dt);   // (NEW) …and run out the cast clip the host told us about, so the proxy returns to its walk
+            UpdateRemoteSwing(dt);   // (MP FIX) …and the melee wind-up + strike, so the little ones visibly ATTACK on a client
             if (IsBoss) _bossHeat = Mathf.MoveToward(_bossHeat, Mathf.Clamp(0.12f + 0.66f * (1f - Hp / MaxHp), 0f, 1f), dt * 0.5f);   // (NEW) HP-based heat estimate for the HUD
             // client-side ghost: follow the host's reported position; animate from that motion
             var prev = GlobalPosition;
@@ -1531,15 +1754,25 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             {
                 if (_rThrown)   // networked ragdoll tumble while airborne — position follows the host arc above (NEW)
                 {
-                    _creature.RotateX(_tumbleX * dt); _creature.RotateZ(_tumbleZ * dt);
+                    if (AuthBiped) _creature.Animate(dt, 0f);   // (NEW) airborne fall CLIP instead of the ragdoll spin
+                    else { _creature.RotateX(_tumbleX * dt); _creature.RotateZ(_tumbleZ * dt); }
                 }
                 else if (_getUpT > 0f)   // networked topple → rise after landing (NEW)
                 {
                     _getUpT -= dt;
-                    float px = Mathf.LerpAngle(_creature.Rotation.X, 0f, dt * 9f);
-                    float pz = Mathf.LerpAngle(_creature.Rotation.Z, 0f, dt * 9f);
-                    _creature.Rotation = new Vector3(px, _creature.Rotation.Y, pz);
-                    if (_getUpT <= 0f) { _getUpT = 0f; _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0); }
+                    if (AuthBiped)   // (NEW) stand-up CLIP; end as soon as it finishes
+                    {
+                        _creature.Animate(dt, 0f);
+                        if (_creature.BipedOneShotDone) _getUpT = 0f;
+                        if (_getUpT <= 0f) _creature.BipedLoco(false);
+                    }
+                    else
+                    {
+                        float px = Mathf.LerpAngle(_creature.Rotation.X, 0f, dt * 9f);
+                        float pz = Mathf.LerpAngle(_creature.Rotation.Z, 0f, dt * 9f);
+                        _creature.Rotation = new Vector3(px, _creature.Rotation.Y, pz);
+                        if (_getUpT <= 0f) { _getUpT = 0f; _creature.Rotation = new Vector3(0, _creature.Rotation.Y, 0); }
+                    }
                 }
                 else
                 {
@@ -1548,6 +1781,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
                         float yaw = Mathf.Atan2(mv.X, mv.Z);
                         _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, yaw, dt * 8f), 0);
                     }
+                    if (AuthBiped) _creature.BipedLoco(false);   // (NEW) proxies just walk/shamble (host drives the special states via throw/land events)
                     _creature.Animate(dt, Mathf.Clamp(moved / (dt * 6f + 1e-5f), 0f, 1.5f));
                 }
             }
@@ -1580,6 +1814,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             _popAccum = 0f; _popAmp = false; _popCrit = false; _popT = 0.28f;
         }
         if (RootT > 0) RootT -= dt;
+        if (ShockT > 0f) ShockT -= dt;   // (HAUNT STORM) electric stun just runs out — no thaw/shatter tail
         if (FrozenT > 0f)   // (NEW) frozen countdown → the block melts across its life, then a light crack on expiry
         {
             FrozenT -= dt;
@@ -1610,7 +1845,25 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             if (_freezeExpT <= 0f) { FreezeStacks = 0f; _freezeThreshMul = 1f; _freezeDurBonus = 0f; }
         }
         if (MarkT > 0) MarkT -= dt; else MarkAmp = 1f;
+        if (ConduitT > 0f) ConduitT -= dt;   // (NEW) conduit brand self-expires (so cross-witch producers don't need the Arcane-only mark manager)
         if (CurseT > 0f) { CurseT -= dt; if (CurseT <= 0f) { CurseGroup = 0; CurseStacks = 0f; } }   // (NEW) curse fades → drop the tether + stacks
+        if (DoomT > 0f) { DoomT -= dt; if (DoomT <= 0f) DetonateDoom(); }   // (DOOM) the fuse. Every application refreshes it, so a foe she's actively feeding never goes off on its own
+        if (PuppetT > 0f)   // (PUPPET) the leash — it also drops the moment its victim dies, so it never swings at a corpse
+        {
+            PuppetT -= dt;
+            if (PuppetT <= 0f || PuppetTgt == null || PuppetTgt.Dead || !GodotObject.IsInstanceValid(PuppetTgt))
+            {
+                PuppetT = 0f; PuppetTgt = null; _puppetFeed = 0f;
+                if (_puppetFinale) { _puppetFinale = false; DetonateDoom(1f, true); }   // Leg Grand Finale: the music stops and every dancer goes off at once
+            }
+        }
+        if (RoutT > 0f) RoutT -= dt;
+        if (_doomWalking)   // (DOOM WALKER) it has ~2s to reach someone, then it lets go wherever it stands
+        {
+            _doomWalkT -= dt;
+            bool arrived = Puppeted && GlobalPosition.DistanceTo(PuppetTgt.GlobalPosition) < Radius + PuppetTgt.Radius + 1.2f;
+            if (_doomWalkT <= 0f || arrived || !Puppeted) ReleaseDoomWalk();
+        }
         if (_bleedT > 0f)
         {
             if (!_bleedPersist) _bleedT -= dt;   // (BLOOD ROT mod) persistent rot never runs out — it bleeds until death
@@ -1648,10 +1901,16 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (PhoenixHeld) { GlobalPosition = PhoenixHoldPos; RootT = Mathf.Max(RootT, 0.2f); return; }   // (PHOENIX) carried by the phoenix dive — locked in place; skips all AI/attack/shoot below so it can't act
         if (_thrown) { UpdateThrown(dt); return; }   // airborne fling owns movement; skip AI + ground-follow (NEW)
         if (_getUpT > 0f) { UpdateGetUp(dt); return; }   // downed → rising; stay staggered + open (NEW)
+        if (_dbgBiped != null && AuthBiped) { DebugBipedTick(dt); return; }   // (HARNESS) hold a forced biped clip for inspection; skip AI
 
         var p = Game.I.Player;
         if (p == null) return;
         _tgt = Game.I.ResolveEnemyTarget(GlobalPosition, _behav == EBehav.Melee, out _tgtPeer, out _tgtIsMinion);   // melee foes can peel onto ents
+        _tgtIsEnemy = false;
+        if (Puppeted)   // (PUPPET) point it at its own ally and let every other system — flank, reach, wind-up, aim — run untouched
+        { _tgt = PuppetTgt.GlobalPosition; _tgtPeer = 0; _tgtIsMinion = false; _tgtIsEnemy = true; }
+        if (RoutT > 0f)   // (ROUT) panic outranks everything: chase a point behind yourself and your own legs do the fleeing
+        { _tgt = GlobalPosition + _routDir * 40f; _tgtPeer = 0; _tgtIsMinion = false; _tgtIsEnemy = false; }
         Vector3 realTarget = _tgt;   // (NEW) the actual player/ent, before corridor retargeting (for vision + hunt speed)
 
         // (#3) self-track the target's velocity so fast foes can LEAD it. Works for any target (player/ally/minion); the
@@ -1686,7 +1945,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         // (REMOVED the keep-STAIRS detour: routing every ground foe to one ramp base was unreliable — half of them milled
         // around a spot nowhere near the stairs. Foes now scale the wall directly instead, slowly and at their own peril.)
         if (_hasteT > 0f) _hasteT -= dt;
-        float spdMul = ((RootT > 0 || FrozenT > 0f) ? 0f : (SlowT > 0 ? SlowMul : 1f)) * (_hasteT > 0f ? 1.4f : 1f) * (Game.I.InWater(GlobalPosition, GlobalPosition.Y - Radius) ? 0.7f : 1f) * (_climbing ? 0.5f : 1f);   // frozen/rooted → held in place; totem haste; hip-deep water wades them down; scaling a wall is half speed (NEW)
+        float spdMul = ((RootT > 0 || FrozenT > 0f || ShockT > 0f) ? 0f : (SlowT > 0 ? SlowMul : 1f)) * (_hasteT > 0f ? 1.4f : 1f) * (RoutT > 0f ? 1.3f : 1f) * (Game.I.InWater(GlobalPosition, GlobalPosition.Y - Radius) ? 0.7f : 1f) * (_climbing ? 0.5f : 1f);   // frozen/rooted → held in place; totem haste; hip-deep water wades them down; scaling a wall is half speed (NEW)
         if (Affix == 3) { _affixTick -= dt; if (_affixTick <= 0f) { _affixTick = 0.8f; VampHeal(); } }   // vampiric
         float pdist = (_tgt - GlobalPosition).Length();
         // catch-up speed ONLY for enemies that close distance — never boost kiters/fleers (they'd outrun you forever)
@@ -1765,12 +2024,13 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
                 AnimStep(dt, spdMul);
             }
         }
+        UpdateCastAnim(dt);   // (NEW) advance any authored cast clip + fire what its wind-up owes
 
         if (!Remote && _type == "swarmer")
         {
             if (_screamT > 0f) _screamT -= dt;
             ulong znow = Time.GetTicksMsec();
-            if (znow - _lastZombieMs > 380 && GD.Randf() < 0.5f)
+            if (znow - _lastZombieMs > 800 && GD.Randf() < 0.3f)   // (QUIETER) global groan cadence roughly halved so a horde isn't a constant moan
             {
                 _lastZombieMs = znow;
                 if (!_alerted && _idlePose == 3) Game.I.Sfx?.ZombieSnicker(GlobalPosition);   // snickering idlers chuckle
@@ -1778,7 +2038,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             }
         }
 
-        if (!swarmerIdle && !takerActive && FrozenT <= 0f)   // (NEW) FROZEN = a total lockout: no moving, firing, casting, diving, or abilities — encased in ice
+        if (!swarmerIdle && !takerActive && FrozenT <= 0f && ShockT <= 0f)   // (NEW) FROZEN = a total lockout: no moving, firing, casting, diving, or abilities — encased in ice. SHOCKED (Haunt bolt) locks out the same way.
         switch (_behav)
         {
             case EBehav.Melee: MoveMelee(p, dt, spdMul); break;
@@ -1796,7 +2056,13 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             case EBehav.Totem: MoveTotem(p, dt, spdMul); break;
             case EBehav.Phalanx: MovePhalanx(p, dt, spdMul); break;   // (NEW) warded formation: siege line while warded, charging bruiser once broken
             case EBehav.Archer: MoveArcher(p, dt, spdMul); break;     // (NEW) volleys from inside the ward; cowers/re-enlists once it breaks
-            case EBehav.Boss: if (!_bossCharging) MoveMelee(p, dt, spdMul * Mathf.Lerp(1f, 1.5f, _bossHeat)); BossFire(p, dt); break;   // freeze while telegraphing; hotter → faster (NEW)
+            case EBehav.Boss:
+                if (_p2Stage == 1 || _p2Stage == 2 || _spinT > 0f) { }                            // (PHASE 2) down / rising / planted and spinning — no locomotion
+                else if (_p2Stage == 3) BossLaughAdvance(dt);                                     // (PHASE 2) the unsteady laughing walk-in after he stands up
+                else if (_dashT > 0f) BossDashRun(dt);                                            // (NEW) the head-down dash owns his movement
+                else if (!_bossCharging) MoveMelee(p, dt, spdMul * Mathf.Lerp(1f, 1.5f, _bossHeat));   // freeze while telegraphing; hotter → faster (NEW)
+                BossFire(p, dt);
+                break;
         }
 
         // vertical: ground enemies follow the surface and climb ramps/walls toward an elevated player
@@ -1927,9 +2193,31 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             _swinging = true; _atkWind = WindUpDur;
             ulong now = Time.GetTicksMsec();
             if (now - _lastGrowlMs > 200) { _lastGrowlMs = now; Game.I.Sfx?.EnemyGrowl(GlobalPosition); }   // audible tell
+            // (MP FIX) tell the clients to swing too. The snapshot carries position/HP/status but NOTHING about
+            // attacking, and StatusMask has no free bits left — so melee foes slid silently into a client and the
+            // damage arrived with no wind-up, no tell and no animation. This is the same channel the casters use.
+            if (!Remote) Game.I.NetMgr?.BroadcastEnemySwing(NetId, WindUpDur);
             return true;
         }
         return false;
+    }
+
+    // client proxy: replay a melee wind-up + strike the host just started, so the swing READS on this machine.
+    // Purely cosmetic — the damage is the host's and arrives over DamagePlayer.
+    public void RemoteSwing(float wind)
+    {
+        if (!Remote || _creature == null) return;
+        _swinging = true; _atkWind = Mathf.Max(0.05f, wind);
+        ulong now = Time.GetTicksMsec();
+        if (now - _lastGrowlMs > 200) { _lastGrowlMs = now; Game.I.Sfx?.EnemyGrowl(GlobalPosition); }
+    }
+    // drives the proxy's wind-up each frame and lands the visual strike at the end (no damage — host-authoritative)
+    private void UpdateRemoteSwing(float dt)
+    {
+        if (!_swinging) return;
+        _atkWind -= dt;
+        _creature?.SetSwing(Mathf.Clamp(1f - _atkWind / WindUpDur, 0f, 1f));
+        if (_atkWind <= 0f) { _swinging = false; _creature?.SetSwing(0f); _creature?.Strike(); }
     }
 
     // Keep enemies out of players' bodies so they can't walk through you or clip the camera. Runs on
@@ -1956,6 +2244,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private void AnimStep(float dt, float amt)
     {
         if (_creature == null) return;
+        if (AuthBiped) { if (_climbing) _creature.BipedClimb(); else _creature.BipedLoco(false); }   // (NEW) scaling a wall → climb clip; else walk/shamble
         _animAcc += dt;
         float gate = (Game.I != null && Game.I.Enemies.Count > 40) ? 0.03f + (GetInstanceId() % 3) * 0.004f : 0f;
         if (_animAcc < gate) return;
@@ -2014,13 +2303,17 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         }
         if (Dmg > 0 && dist < Radius + 1.4f && _touchCd <= 0f && VertReach()) { HitTarget(Dmg); _touchCd = 0.7f * Pace; }
 
-        // fire
+        // fire — the mage cast animation (cast4) covers the wind-up on any body that has it; see BeginCast
         if (charged)
         {
             if (_chargeT > 0f) { _chargeT -= dt; if (_chargeT <= 0f) FireAt(p, _boltSpeed, _boltDmg, _boltRadius); }
-            else if (_fireCd <= 0f && dist < _range) { _chargeT = _chargeDur; _fireCd = _fireEvery * Pace; }
+            else if (_fireCd <= 0f && dist < _range) { _chargeT = _chargeDur; _fireCd = _fireEvery * Pace; BeginCastAnim("cast4", _chargeDur, _fireCd); }   // (NEW) sieger: its existing charge IS the wind-up
         }
-        else if (_fireCd <= 0f && dist < _range) { FireAt(p, _boltSpeed, _boltDmg, _boltRadius); _fireCd = _fireEvery * Pace; }
+        else if (_castWindT <= 0f && _fireCd <= 0f && dist < _range)
+        {
+            _fireCd = _fireEvery * Pace;
+            BeginCast("cast4", Mathf.Min(CastWind, _fireCd * 0.5f), 1, _fireCd);
+        }
     }
 
     // (NEW) croc: kite to range, then LOB a timed bomb that arcs onto the target's feet and blasts ~2s after landing
@@ -2110,14 +2403,22 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (spdMul > 0f) { var np = GlobalPosition + AvoidBlockers(want) * Speed * _catchMul * spdMul * dt; GlobalPosition = ClampArena(np); }   // (NEW) steer around trunks
 
         _healCd -= dt;
-        if (_healCd <= 0f && ally != null && ally.GlobalPosition.DistanceTo(GlobalPosition) < 12f)
+        if (_healCd <= 0f && _castWindT <= 0f && ally != null && ally.GlobalPosition.DistanceTo(GlobalPosition) < 12f)
         {
-            ally.Heal(_healAmt);
             _healCd = _healEvery * Pace;
-            var v = new Vfx(); Game.I.AddChild(v);
-            v.GlobalPosition = ally.GlobalPosition + new Vector3(0, ally.Radius, 0);
-            v.Init(new SphereMesh { Radius = ally.Radius * 0.6f, Height = ally.Radius * 1.2f }, DamageTypes.Col(DamageType.Holy), 0.4f, 2f);
+            BeginCast("cast", Mathf.Min(CastWind, _healCd * 0.5f), 2, _healCd);   // (NEW) the mage cast plays the mend; the heal lands on its release frame
         }
+    }
+
+    // the mend itself — re-resolves its target at the release frame, so a mid-cast death just wastes the cast
+    private void HealPulse()
+    {
+        Enemy ally = NearestAlly();
+        if (ally == null || ally.GlobalPosition.DistanceTo(GlobalPosition) > 14f) return;
+        ally.Heal(_healAmt);
+        var v = new Vfx(); Game.I.AddChild(v);
+        v.GlobalPosition = ally.GlobalPosition + new Vector3(0, ally.Radius, 0);
+        v.Init(new SphereMesh { Radius = ally.Radius * 0.6f, Height = ally.Radius * 1.2f }, DamageTypes.Col(DamageType.Holy), 0.4f, 2f);
     }
 
     private Vector3 _fleeTarget;
@@ -2209,7 +2510,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private int _bossPatPending = 0;
     private Vector3 _bossAim = Vector3.Forward, _bossFlatDir = Vector3.Forward;
     public bool IsCharging => _bossCharging;                                                                   // HUD: boss winding up an attack (NEW)
-    public string BossAttackName => _bossPatPending switch { 1 => "RADIAL BURST", 3 => "NOVA", 4 => "PESTILENCE", 5 => "STOMP", 6 => "ROCK THROW", 7 => "MINES", _ => "VOLLEY" };   // (NEW) attack meter label
+    public string BossAttackName => _bossPatPending switch { 1 => "RADIAL BURST", 3 => "NOVA", 4 => "PESTILENCE", 5 => "STOMP", 6 => "ROCK THROW", 7 => "MINES", 8 => "CHARGE", _ => "VOLLEY" };   // (NEW) attack meter label
     // (NEW) hitting high — the head or a shoulder goblin — always crits THE HOLLOW MOON
     public bool IsCritZone(Vector3 hitPos)
     {
@@ -2265,6 +2566,223 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     };
     private Vector3 PopupPos => IsBoss ? GlobalPosition + new Vector3(0f, Radius * 2.7f, 0f) : GlobalPosition;   // (NEW) float boss numbers above the huge model
     public float ChargeFrac => _bossChargeDur > 0.0001f ? Mathf.Clamp(1f - _bossChargeT / _bossChargeDur, 0f, 1f) : 0f;   // HUD: 0→1 attack-timer (NEW)
+    // ---- head-down charge: every 20% of his max HP the coven strips off him, he answers with 30u of shoulder ----
+    // ======================= THE HOLLOW MOON — PHASE 2 =======================
+    // Killing him the first time doesn't kill him: he plays the fall-forward clip, lies there laughing, gets back up on
+    // half a health bar and fights harder. Everything below is host-authoritative; clients mirror via Net.BroadcastBossPhase2.
+    public const float P2HpFrac = 0.5f;        // his phase-2 pool = half his phase-1 max. Every threshold below is a % of THAT.
+    public const float P2DamageMul = 1.5f;     // the ONLY damage multiplier phase 2 adds — `enraged` gives projectiles, never damage
+    public const float P2SpeedMul = 1.35f;
+    private const float P2GroundDur = 5f;      // prone on the death clip's final frame…
+    private const float P2LaughAt = 3f;        // …starting to laugh 3s in
+    private const float P2WalkDur = 3f;        // then the unsteady laughing advance after standing up
+    public const float SpinDur = 10f;
+    private const float SpinDpsFrac = 0.035f;  // ~3.5% of a witch's max HP per second while caught — enough that 10s in
+                                               // the funnel strips her shield AND bites HP, so the finisher lands raw
+
+    public int BossPhase = 1;
+    private float _p2Dmg = 1f;                          // 1 in phase 1, P2DamageMul in phase 2
+    public bool Invuln = false;                         // revival sequence + the whole spin; drives the HUD read-out
+    public bool BossInvuln => Invuln;
+    private int _p2Stage = 0;                           // revival: 0 none, 1 prone, 2 rising, 3 laughing advance
+    private float _p2T = 0f;
+    private bool _p2Laughed = false;
+    private int _tripleLeft = 0;                        // charges left in the current 3x set
+    private int _step25 = 0, _step33 = 0;               // how many 25%/33% thresholds have fired
+    private long _lastDashPeer = long.MinValue;         // who the previous charge in this set went at (so the next picks someone else)
+    private bool _spinPending = false;                  // threshold crossed — he finishes the charges, THEN spins (owner's call)
+    private float _spinT = 0f;
+    private BossVortex _vortex;
+    public bool BossSpinning => _spinT > 0f;
+    public bool BossReviving => _p2Stage != 0;
+
+    // (named _dash* rather than _charge* so it never reads as the existing _bossChargeT/_bossChargeDur WIND-UP timers)
+    public const float DashDist = 30f;           // how far he travels
+    private const float DashDur = 0.72f;         // …and how fast he covers it
+    private int _hpStep = 0;                     // how many 20% thresholds have already fired (0-4)
+    private bool _dashArmed = false;             // a threshold was crossed; the next BossFire launches it
+    private float _dashT = 0f;                   // >0 while the dash is actually running
+    private Vector3 _dashDir = Vector3.Forward;
+    private float _dashMoved = 0f;               // how far the dash itself has pushed him (vs. where he ended up)
+    private readonly System.Collections.Generic.HashSet<long> _dashHit = new();   // one hit per warden per charge
+    public bool BossDashing => _dashT > 0f;
+
+    // Called from Hurt(). PHASE 1: arm a single charge each time he crosses another 20% boundary.
+    // PHASE 2: that single charge is retired — instead every 25% arms a THREE-charge set, and every 33% arms the spin.
+    private void NoteChargeThreshold()
+    {
+        if (_type != "boss" || MaxHp <= 0f || Dead) return;
+        if (BossPhase == 1)
+        {
+            int step = Mathf.Clamp(Mathf.FloorToInt((1f - Hp / MaxHp) / 0.2f + 0.0001f), 0, 4);
+            if (step <= _hpStep) return;
+            _hpStep = step;
+            _dashArmed = true;
+            return;
+        }
+        int s25 = Mathf.Clamp(Mathf.FloorToInt((1f - Hp / MaxHp) / 0.25f + 0.0001f), 0, 4);
+        if (s25 > _step25) { _step25 = s25; _tripleLeft = 3; _lastDashPeer = long.MinValue; }
+        int s33 = Mathf.Clamp(Mathf.FloorToInt((1f - Hp / MaxHp) / (1f / 3f) + 0.0001f), 0, 3);
+        if (s33 > _step33)
+        {
+            _step33 = s33;
+            // (OWNER'S CALL) finish-then-spin: he goes untouchable the INSTANT the threshold is crossed, rides out any
+            // charges he's mid-way through, then spins — and only becomes vulnerable again once the spin ends.
+            _spinPending = true;
+            Invuln = true;
+            Game.I?.NetMgr?.BroadcastBossPhase2(NetId, BossPhase, 1);
+        }
+    }
+
+    // ---- phase 1 "death": he doesn't die, he falls, laughs, and gets back up on half a bar ----
+    private void EnterPhase2()
+    {
+        BossPhase = 2;
+        Dead = false;
+        MaxHp *= P2HpFrac;                 // the phase-2 pool; every threshold above is a % of this
+        Hp = MaxHp;
+        _p2Dmg = P2DamageMul;
+        Dmg *= P2DamageMul; _boltDmg *= P2DamageMul;   // contact + projectile; the explicit AoE numbers multiply at their sites
+        Speed *= P2SpeedMul;
+        _hpStep = 4; _dashArmed = false; _dashT = 0f;  // the single 20% charge is retired in phase 2
+        _step25 = 0; _step33 = 0; _tripleLeft = 0; _spinPending = false;
+        _bossCharging = false; _bossChargeT = 0f;
+        Invuln = true;                                  // …for the whole fall → prone → rise → laughing-advance window
+        _p2Stage = 1; _p2T = P2GroundDur; _p2Laughed = false;
+        _creature?.BossDie();                           // the fall-forward clip; it holds its final frame when it ends
+        // NOTE: the aura is NOT lit here. He's still a corpse as far as the coven knows — it ignites when he stands up,
+        // which is the reveal. See the stage 2 -> 3 transition in UpdatePhase2.
+        Game.I?.Sfx?.BossRoar(GlobalPosition);
+        Game.I?.Hud?.Banner("THE HOLLOW MOON RISES AGAIN");
+        Game.I?.NetMgr?.BroadcastBossPhase2(NetId, 2, 1);
+        SayBossVox("YOU THOUGHT THAT WAS ALL?", new Color(0.75f, 0.5f, 1f), 3f);
+    }
+
+    // the revival sequence + the spin, ticked every frame from BossFire (host) and mirrored on proxies
+    private void UpdatePhase2(float dt)
+    {
+        if (_p2Stage != 0)
+        {
+            _p2T -= dt;
+            if (_p2Stage == 1)                                  // prone on the clip's last frame
+            {
+                if (!_p2Laughed && _p2T <= P2GroundDur - P2LaughAt)
+                { _p2Laughed = true; Game.I?.Sfx?.TakerLaugh(GlobalPosition); SayBossVox("HEH... HEH HEH...", new Color(0.75f, 0.5f, 1f), 2.2f); }
+                if (_p2T <= 0f) { _p2Stage = 2; _creature?.BossPlay("standup", 1f); }
+            }
+            else if (_p2Stage == 2)                             // Stand_Up8 — end as soon as the clip finishes
+            {
+                if (_creature != null && _creature.BipedOneShotDone)
+                { _p2Stage = 3; _p2T = P2WalkDur; _creature.BossEndClip(); _creature.SetPhase2(); Game.I?.Sfx?.TakerLaugh(GlobalPosition); }
+                else if (_p2T < -4f) { _p2Stage = 3; _p2T = P2WalkDur; _creature?.BossEndClip(); _creature?.SetPhase2(); }   // safety net if the clip never reports done
+            }
+            else                                                 // laughing advance on the unsteady walk
+            {
+                if (_p2T <= 0f)
+                {
+                    _p2Stage = 0; Invuln = false;
+                    _tripleLeft = 3; _lastDashPeer = long.MinValue;   // …straight into the first three-charge set
+                    Game.I?.NetMgr?.BroadcastBossPhase2(NetId, 2, 0);
+                }
+            }
+            return;
+        }
+        if (_spinT > 0f)
+        {
+            _spinT -= dt;
+            if (_vortex != null && GodotObject.IsInstanceValid(_vortex)) _vortex.Follow(GlobalPosition);
+            _creature?.SetHandGlow(1f);
+            // He has no authored spin clip, so WHIP the whole model — fast enough that the pose can't be read — and let
+            // the tightened aura + funnel core swallow most of his silhouette. Ramps in so it doesn't snap.
+            if (_creature != null)
+            {
+                float ramp = Mathf.Clamp((SpinDur - _spinT) / 0.7f, 0f, 1f);
+                _creature.RotateY(dt * 26f * ramp);
+            }
+            if (_spinT <= 0f)
+            {
+                _vortex = null;
+                Invuln = false;
+                _creature?.SetHandGlow(0f);
+                _creature?.SetSpinning(false);
+                Game.I?.NetMgr?.BroadcastBossPhase2(NetId, 2, 0);
+            }
+        }
+    }
+
+    // he plants and spins up; the vortex node owns the drag, the grind and the finishing stomp
+    private void HostStartSpin()
+    {
+        _spinPending = false;
+        _spinT = SpinDur;
+        Invuln = true;
+        _bossCharging = false; _dashT = 0f;
+        var pl = Game.I?.Player;
+        float dps = (pl != null ? pl.S.MaxHp : 120f) * SpinDpsFrac;
+        _vortex = new BossVortex();
+        Game.I.AddChild(_vortex);
+        _vortex.Init(GlobalPosition, SpinDur, dps, hostSim: true);
+        _creature?.SetSpinning(true);
+        Game.I.NetMgr?.BroadcastBossVortex(GlobalPosition, SpinDur, dps);
+        Game.I.NetMgr?.BroadcastBossPhase2(NetId, 2, 1);
+        SayBossVox("COME TO ME!", new Color(0.75f, 0.5f, 1f), 2f);
+        Game.I.Sfx?.BossRoar(GlobalPosition);
+        Game.I.Hud?.Banner("THE VORTEX PULLS — GET OUT");
+    }
+
+    // Stage 3 of the revival: he lurches toward the coven on the unsteady walk, still laughing, still untouchable.
+    // Deliberately slow — this is the "oh no, he's getting up" beat, not an attack.
+    private void BossLaughAdvance(float dt)
+    {
+        var to = _tgt - GlobalPosition; to.Y = 0f;
+        if (to.LengthSquared() < 0.01f) return;
+        var dir = to.Normalized();
+        GlobalPosition += dir * (Speed * 0.45f) * dt;
+        if (_creature != null)
+            _creature.Rotation = new Vector3(0, Mathf.LerpAngle(_creature.Rotation.Y, Mathf.Atan2(dir.X, dir.Z), dt * 5f), 0);
+        if (_p2Laughed && GD.Randf() < dt * 0.7f) Game.I?.Sfx?.TakerLaugh(GlobalPosition);   // ~0.7 cackles/sec while he closes
+    }
+
+    // next charge target: the nearest LIVING witch that isn't the one the previous charge in this set went at
+    private Vector3 NextTripleTarget()
+    {
+        Vector3 best = _tgt; float bestD = float.MaxValue; long bestPeer = long.MinValue; bool found = false;
+        void Consider(long peer, Vector3 pos)
+        {
+            if (peer == _lastDashPeer) return;
+            float d = new Vector2(pos.X - GlobalPosition.X, pos.Z - GlobalPosition.Z).LengthSquared();
+            if (d < bestD) { bestD = d; best = pos; bestPeer = peer; found = true; }
+        }
+        var pl = Game.I?.Player;
+        if (pl != null && !pl.Downed) Consider(Game.I.LocalPeer, pl.GlobalPosition);
+        if (Game.I?.NetMgr != null && Game.I.NetMgr.Active)
+            foreach (var (peer, pos) in Game.I.NetMgr.AliveAllyPositions()) Consider(peer, pos);
+        if (!found) { _lastDashPeer = long.MinValue; return _tgt; }   // solo (or everyone else down) → same witch again
+        _lastDashPeer = bestPeer;
+        return best;
+    }
+
+    // the dash: he plows forward on his own vector, shoving aside any warden he clips. Host-authoritative; clients see the
+    // proxy slide because the host streams his position as usual.
+    private void BossDashRun(float dt)
+    {
+        float move = Mathf.Min(dt, _dashT);   // don't overshoot the clock on the last frame — he must cover exactly DashDist
+        _dashT -= dt;
+        var prev = GlobalPosition;
+        float step = (DashDist / DashDur) * move;
+        GlobalPosition += _dashDir * step;
+        _dashMoved += step;   // what the dash PUSHED, vs. where he ended up (terrain/structure resolve can shorten the latter)
+        if (!Remote)
+            Game.I.NetMgr?.ChargeSweep(prev, GlobalPosition, Radius + 2.6f, (30f + Game.I.Wave * 1.4f) * _p2Dmg, 26f, _dashHit);
+        if (GD.Randf() < 0.55f) Game.I.SpawnDust(new Vector3(GlobalPosition.X, GlobalPosition.Y - Radius, GlobalPosition.Z), Vector3.Up);
+        if (_dashT <= 0f)
+        {
+            Game.I.VfxRing(GlobalPosition, new Color(0.85f, 0.35f, 0.25f), 6f, 0.45f);
+            Game.I.SpawnGroundSpikes(GlobalPosition, 6f, 9, new Color(0.7f, 0.4f, 0.2f), 0.4f);
+            Game.I.Sfx?.Thud(GlobalPosition, net: false);
+        }
+    }
+
     private void BossFire(Player p, float dt)
     {
         // real-time heat: biggest driver is missing HP; recent player DPS nudges it up. Smoothly tracked so it ramps.
@@ -2274,7 +2792,16 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         _bossNovaCd -= dt; _bossPestCd -= dt; _bossStompCd -= dt;
         _bossRockCd -= dt; _bossMineCd -= dt; if (_goblinBufferCd > 0f) _goblinBufferCd -= dt;
         if (_critVoxCd > 0f) _critVoxCd -= dt;
-        if (_creature != null) _creature.StompWind = (_bossCharging && _bossPatPending == 5 && _bossChargeDur > 0.01f) ? Mathf.Clamp(1f - _bossChargeT / _bossChargeDur, 0f, 1f) : 0f;   // (NEW) raise the good leg through the stomp wind-up
+        UpdateBossAnim(dt);   // (HOLLOW MOON) authored clip + procedural gesture + hand-glow telegraph
+        if (BossPhase == 2)
+        {
+            UpdatePhase2(dt);
+            if (_p2Stage != 0 || _spinT > 0f) return;   // reviving or spinning: he does nothing else
+            // finish-then-spin: the pending spin only fires once the current charge set is spent (and he's untouchable meanwhile)
+            if (_spinPending && _tripleLeft <= 0 && _dashT <= 0f && !_bossCharging) { HostStartSpin(); return; }
+        }
+        if (_creature != null && !_hollowAnim) _creature.StompWind = (_bossCharging && _bossPatPending == 5 && _bossChargeDur > 0.01f) ? Mathf.Clamp(1f - _bossChargeT / _bossChargeDur, 0f, 1f) : 0f;   // (NEW) raise the good leg through the stomp wind-up (procedural body only — the authored boss has a real stomp clip)
+        if (_dashT > 0f) return;   // (CHARGE) mid-dash: no new attacks, no re-aim — he's committed
         Vector3 to = _tgt - GlobalPosition; to.Y = 0;
         float dist = to.Length();
         bool enraged = Hp < MaxHp * 0.5f;
@@ -2292,6 +2819,8 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             if (_bossChargeT > 0f) return;        // still telegraphing — boss is held (see the behavior switch)
             _bossCharging = false;
             FireBossPattern(_bossPatPending, _bossEnraged, _bossAim, _bossFlatDir);
+            FireBossAnim(_bossPatPending);
+            if (_bossPatPending == 8) { _fireCd = Mathf.Max(_fireCd, 1.2f); return; }   // (CHARGE) the dash itself is the recovery
             if (_bossPatPending == 3) { _bossNovaCd = Mathf.Lerp(4.5f, 2.5f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.6f); }   // hotter → recasts sooner
             else if (_bossPatPending == 4) { _bossPestCd = Mathf.Lerp(20f, 12f, _bossHeat); _goblinBufferCd = Mathf.Lerp(15f, 10f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.8f); }   // pestilence 20→12s (goblin)
             else if (_bossPatPending == 5) { _bossStompCd = Mathf.Lerp(10f, 6f, _bossHeat); _fireCd = Mathf.Max(_fireCd, 0.8f); }   // stomp 10→6s
@@ -2302,6 +2831,29 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         }
 
         bool hollow = _type == "boss";   // the new abilities belong to THE HOLLOW MOON only (not the mini-boss)
+        // (PHASE 2) TRIPLE CHARGE — every 25% of his pool he runs three back-to-back charges, each at the nearest witch
+        // he did NOT just hit. He stays vulnerable throughout; this is his pressure tool, not a safe window.
+        if (hollow && BossPhase == 2 && _tripleLeft > 0 && _dashT <= 0f)
+        {
+            _tripleLeft--;
+            var tgt = NextTripleTarget();
+            var cd = tgt - GlobalPosition; cd.Y = 0f;
+            cd = cd.LengthSquared() > 0.01f ? cd.Normalized() : _bossFlatDir;
+            _dashDir = cd;
+            BeginBossCharge(8, 0.85f, cd, cd, DashDist, enraged);   // shorter tell than phase 1 — he's faster now
+            return;
+        }
+        // HEAD-DOWN CHARGE — armed every time the coven takes another 20% of his pool off him (see NoteChargeThreshold).
+        // Outranks everything else: it's the punish for burning him down. 30u of shoulder, dodgeable if you read the lane.
+        if (hollow && BossPhase == 1 && _dashArmed && _dashT <= 0f)
+        {
+            _dashArmed = false;
+            var cd = to; cd.Y = 0f;
+            cd = cd.LengthSquared() > 0.01f ? cd.Normalized() : _bossFlatDir;
+            _dashDir = cd;
+            BeginBossCharge(8, 1.15f, cd, cd, DashDist, enraged);
+            return;
+        }
         // AoE STOMP — only if a witch is in close range; 3s telegraphed wind-up (red ring around the boss)
         if (hollow && _bossStompCd <= 0f && dist < Radius + 8f) { BeginBossAoe(5, GlobalPosition, 3f); return; }
         // ROCK THROW (orc) — hurl a rock at the nearest witch; 3s telegraphed wind-up (red landing circle) — stuns on hit
@@ -2332,11 +2884,184 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         BeginBossCharge(pat, dur, flatDir, flatDir, reach, false);
     }
 
+    // ================= THE HOLLOW MOON: authored attack animation + procedural gestures + hand-glow telegraph =================
+    // Runs identically on the host and on client proxies (RemoteBossTell feeds it the same pattern + duration), so co-op
+    // players see the same wind-up. The hand glow lights the moment a wind-up starts and holds until the attack resolves —
+    // it IS part of the telegraph, on top of the existing danger lanes/rings.
+    private const float AnimFirePoint = 0.72f;   // the volley lands ~72% into its clip; the remainder plays as follow-through
+    private float _atkTail = 0.3f;               // how long that follow-through lasts for the clip currently playing
+    private float _atkHoldT = 0f;                // >0 while the follow-through runs (boss has fired, glow still lit)
+    private float _relT = 0f;                    // 0→1 release ramp for the PROCEDURAL gestures (rock hurl / mine signal)
+    private bool _hollowAnim => _type == "boss" && _creature != null && _creature.IsAuthoredHollow;
+
+    // Which authored clip covers which pattern. Only 7 (mines) is absent — that one is the procedural arm-raise/signal
+    // gesture in BossGestureMod. The rock throw shares pestilence's grip-and-throw clip: a procedural overhead lift read
+    // badly next to the authored animation, so the boulder now just materialises in front of him and the clip hurls it.
+    private static string BossClipFor(int pat) => pat switch
+    {
+        0 => "cast6", 2 => "cast6",   // aimed volley + heavy burst
+        1 => "cast1", 3 => "cast1",   // radial burst + close nova
+        4 => "gripthrow",             // pestilence
+        6 => "gripthrow",             // rock throw — same grab-and-hurl motion, different payload
+        5 => "stomp",
+        8 => "charge",
+        _ => null,
+    };
+
+    private void BeginBossAnim(int pat, float dur)
+    {
+        // (RETROFIT) the MINI-BOSS rides the ogre body, which has the withered king's mage cast grafted onto it — every
+        // pattern it can pick (0-3) is a bolt volley, so the whole wind-up plays as a cast instead of a walk cycle.
+        // net:false — BroadcastBossTell already replays this exact call on every proxy, so a second RPC is waste.
+        if (!_hollowAnim) { BeginCastAnim("cast4", dur, net: false); return; }
+        _creature.SetHandGlow(1f);
+        _atkHoldT = 0f; _relT = 0f;
+        _creature.SetGesture(0f, 0f);
+        _creature.ShowHeldRock(false);
+        string clip = BossClipFor(pat);
+        if (clip == null)
+        {
+            // Procedural gesture (mines): the arms are posed on top of LOCOMOTION. Drop any attack clip still holding its
+            // last frame first, or the gesture layers onto a frozen cast pose and he looks broken.
+            _creature.BossEndClip();
+            _atkTail = 0.28f;
+            return;
+        }
+        float len = _creature.BossClipLength(clip);
+        float sp = len > 0.05f ? Mathf.Clamp(len * AnimFirePoint / Mathf.Max(0.05f, dur), 0.3f, 3.5f) : 1f;
+        _creature.BossPlay(clip, sp);
+        _atkTail = len > 0.05f ? Mathf.Min(0.9f, len * (1f - AnimFirePoint) / sp) : 0.3f;
+    }
+
+    // the wind-up finished and the attack went off — start the release ramp + the follow-through window
+    private void FireBossAnim(int pat)
+    {
+        if (!_hollowAnim) return;
+        _atkHoldT = Mathf.Max(0.18f, _atkTail);
+        _relT = 0f;
+        if (pat == 6) _creature.ShowHeldRock(false);   // the boulder is now a real BossRock in flight
+    }
+
+    private void EndBossAnim()
+    {
+        if (!_hollowAnim) return;
+        _atkHoldT = 0f; _relT = 0f;
+        _creature.SetHandGlow(0f);
+        _creature.SetGesture(0f, 0f);
+        _creature.ShowHeldRock(false);
+        _creature.BossEndClip();
+    }
+
+    // per-frame gesture/glow drive — called from BossFire (host) and from the Remote proxy branch (clients)
+    private void UpdateBossAnim(float dt)
+    {
+        if (!_hollowAnim) return;
+        if (_bossCharging)
+        {
+            float p = _bossChargeDur > 0.01f ? Mathf.Clamp(1f - _bossChargeT / _bossChargeDur, 0f, 1f) : 0f;
+            if (_bossPatPending == 6)        // ROCK THROW: the boulder tears itself up in front of him as the clip grips
+                _creature.ShowHeldRock(p > 0.10f, Mathf.Clamp((p - 0.10f) / 0.55f, 0.05f, 1f));
+            else if (_bossPatPending == 7)   // MINES: one arm goes straight up and waits there
+                _creature.SetGesture(Mathf.Clamp(p / 0.55f, 0f, 1f), 0f);
+            return;
+        }
+        if (_atkHoldT <= 0f) return;
+        _atkHoldT -= dt;
+        _relT = Mathf.MoveToward(_relT, 1f, dt * 5.5f);          // snap the release through in ~0.18s
+        if (_bossPatPending == 7) _creature.SetGesture(1f, _relT);   // chop the arm flat to the front: GO
+        if (_atkHoldT <= 0f) EndBossAnim();
+    }
+
+    // ================= WITHERED CASTERS: authored cast animations =================
+    // The caster family (caster / stunner / healer / empowerer) rides the withered-king GLB and owns cast + cast4 +
+    // castcharge; the ogre-bodied bolt throwers (sieger, mini-boss) get cast4 GRAFTED onto their bigger rig, retargeted
+    // to their proportions. All of them drive the same one-shot clip channel the boss uses, so the per-frame BipedLoco
+    // call can't stomp the clip halfway through.
+    //
+    // Every cast is a WIND-UP: the clip starts, and the bolt/heal/pulse lands at the clip's release frame. The cooldown
+    // is started when the wind-up begins, so this costs no DPS — it just gives the attack a readable tell.
+    // The mage casts are ~2.2s clips. Squeezing one into a short wind-up by speed alone reads as a twitch, so the stretch
+    // is clamped: when the wind-up is shorter than the clip comfortably allows, the clip simply plays SLOWER than
+    // "release at 72%" and the bolt leaves while the arms are still rising. That still reads as a cast; 4x does not.
+    private const float CastWind = 0.9f;        // default wind-up for foes that used to fire instantly
+    private const float CastSpeedMax = 1.8f;    // never crush a cast faster than this
+    private const float CastTail = 0.6f;        // follow-through held after the release before he walks again
+    private float _castHoldT = 0f;   // >0 while a cast clip owns the body
+    private float _castWindT = 0f;   // >0 while a wind-up is running; the effect fires when it reaches 0
+    private int _castPend = 0;       // what the wind-up owes: 1 = bolt, 2 = heal, 3 = empower pulse
+
+    // Start `clip` stretched so its release frame lands `dur` seconds from now (dur <= 0 → play it at 1x). Returns false
+    // when this body has no such clip (procedural spiders, flyers, the jungle set) — the caller then keeps firing instantly.
+    // `cadence` = how long until this foe casts again. The follow-through is capped well inside it, or the clip eats the
+    // whole cycle and the body never visibly returns to its walk — a healer would just slide around in a mend pose.
+    private bool BeginCastAnim(string clip, float dur, float cadence = 0f, bool net = true)
+    {
+        if (_creature == null || !AuthBiped || !_creature.HasBipedClip(clip)) return false;
+        float len = _creature.CastLength(clip);
+        if (len < 0.05f) return false;
+        float sp = dur > 0.05f ? Mathf.Clamp(len * AnimFirePoint / dur, 0.35f, CastSpeedMax) : 1f;
+        _creature.CastPlay(clip, sp);
+        float hold = dur > 0.05f ? Mathf.Min(len / sp, dur + CastTail) : len / sp;
+        if (cadence > 0.05f) hold = Mathf.Min(hold, cadence * 0.7f);
+        _castHoldT = hold;
+        // (MP) every cast in the game funnels through here, so this is the one place the proxies need told. Cosmetic
+        // only — the bolt/heal/curse itself is host-authoritative and already synced by its own path.
+        if (net && !Remote) Game.I?.NetMgr?.BroadcastEnemyCast(NetId, CastIdx(clip), dur, cadence);
+        return true;
+    }
+
+    // Clip identity on the wire. Kept as a tiny int so a horde of casters doesn't stream strings every 2 seconds.
+    private static int CastIdx(string clip) => clip == "cast4" ? 1 : clip == "castcharge" ? 2 : 0;
+    private static string CastClipOf(int idx) => idx == 1 ? "cast4" : idx == 2 ? "castcharge" : "cast";
+
+    // client proxy: pose to the cast the host just started. `_castPend` deliberately stays 0 — a proxy animates,
+    // it never fires anything.
+    public void RemoteCast(int idx, float dur, float cadence)
+    {
+        if (!Remote) return;
+        BeginCastAnim(CastClipOf(idx), dur, cadence, net: false);
+    }
+
+    // Begin a telegraphed cast: play the clip and owe `what` when the release frame arrives. Falls back to firing now.
+    private void BeginCast(string clip, float wind, int what, float cadence)
+    {
+        if (BeginCastAnim(clip, wind, cadence)) { _castWindT = wind; _castPend = what; }
+        else ReleaseCast(what);
+    }
+
+    private void ReleaseCast(int what)
+    {
+        switch (what)
+        {
+            case 1: FireAt(Game.I?.Player, _boltSpeed, _boltDmg, _boltRadius); break;
+            case 2: HealPulse(); break;
+            case 3: TotemPulse(); break;
+        }
+    }
+
+    private void UpdateCastAnim(float dt)
+    {
+        // FROZEN is a total lockout, so a cast caught mid-wind-up is LOST rather than fired out of a block of ice.
+        if (FrozenT > 0f && (_castWindT > 0f || _castHoldT > 0f))
+        {
+            _castWindT = 0f; _castPend = 0; _castHoldT = 0f;
+            _creature?.CastEnd();
+            return;
+        }
+        if (_castWindT > 0f)
+        {
+            _castWindT -= dt;
+            if (_castWindT <= 0f) { int w = _castPend; _castPend = 0; ReleaseCast(w); }
+        }
+        if (_castHoldT > 0f) { _castHoldT -= dt; if (_castHoldT <= 0f) _creature?.CastEnd(); }
+    }
+
     private void BeginBossCharge(int pat, float dur, Vector3 aim, Vector3 flatDir, float reach, bool enraged)
     {
         _bossCharging = true; _bossChargeT = dur; _bossChargeDur = dur; _bossPatPending = pat;
         _bossAim = aim; _bossFlatDir = flatDir; _bossEnraged = enraged;
         int idx = (int)(GD.Randf() * 997f);
+        BeginBossAnim(pat, dur);
         ShowBossTelegraph(pat, flatDir, reach, dur, enraged);
         SayBossLine(pat, idx);
         Game.I.Sfx?.BossTell(GlobalPosition);
@@ -2349,14 +3074,14 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (pat == 4)        // pestilence: lingering Nature pool at the telegraphed spot (stays until the boss dies)
         {
             var center = GlobalPosition + new Vector3(flatDir.X, 0f, flatDir.Z) * _bossAoeReach;
-            Game.I.SpawnPestilence(center, 6.5f, 6f + Game.I.Wave * 0.5f, remote: false, net: true);
-            _creature?.FireShoulder(true);   // left zombie goblin casts
+            Game.I.SpawnPestilence(center, 6.5f, (6f + Game.I.Wave * 0.5f) * _p2Dmg, remote: false, net: true);
+            if (!_hollowAnim) _creature?.FireShoulder(true);   // (legacy procedural body only) left zombie goblin casts
             Game.I.Sfx?.BossRoar(GlobalPosition);
             return;
         }
         if (pat == 5)        // AoE stomp: shockwave around the boss, stuns/hurts witches in range
         {
-            float r = 8f, dmg = 14f + Game.I.Wave * 0.9f;
+            float r = 8f, dmg = (14f + Game.I.Wave * 0.9f) * _p2Dmg;
             Game.I.NetMgr?.HurtPlayersIn(GlobalPosition, r, dmg);
             Game.I.VfxRing(GlobalPosition, new Color(1f, 0.5f, 0.15f), r, 0.5f);
             Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Zero, r, 0.5f, new Color(1f, 0.5f, 0.15f));   // ring for allies
@@ -2368,19 +3093,41 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         {
             var target = GlobalPosition + new Vector3(flatDir.X, 0f, flatDir.Z) * _bossAoeReach;
             var from = GlobalPosition + new Vector3(0f, Radius * 1.5f, 0f) + new Vector3(flatDir.X, 0f, flatDir.Z) * (Radius * 0.8f);
-            Game.I.SpawnBossRock(from, target, 20f + Game.I.Wave * 1.1f, remote: false, net: true);
+            Game.I.SpawnBossRock(from, target, (20f + Game.I.Wave * 1.1f) * _p2Dmg, remote: false, net: true);
             Game.I.Sfx?.BossRoar(GlobalPosition);
             return;
         }
         if (pat == 7)        // non-zombie goblin scatters mines around the boss
         {
-            Game.I.SpawnBossMines(GlobalPosition, 4 + Game.I.WardenCount, 14f + Game.I.Wave * 0.8f);
-            _creature?.FireShoulder(false);   // right non-zombie goblin throws
+            Game.I.SpawnBossMines(GlobalPosition, 4 + Game.I.WardenCount, (14f + Game.I.Wave * 0.8f) * _p2Dmg);
+            if (!_hollowAnim) _creature?.FireShoulder(false);   // (legacy procedural body only) right goblin throws
             Game.I.Sfx?.BossRoar(GlobalPosition);
             return;
         }
-        if (pat == 3)        // close nova
+        if (pat == 8)        // head-down charge — the wind-up is over, he goes
         {
+            _dashT = DashDur; _dashHit.Clear(); _dashMoved = 0f;
+            var cd = new Vector3(flatDir.X, 0f, flatDir.Z);
+            _dashDir = cd.LengthSquared() > 0.01f ? cd.Normalized() : Vector3.Forward;
+            Game.I.Sfx?.BossRoar(GlobalPosition);
+            Game.I.VfxRing(GlobalPosition, new Color(0.95f, 0.4f, 0.2f), 5f, 0.35f);
+            Game.I.Player?.CamKickExternal(0.7f);
+            return;
+        }
+        if (pat == 3)        // close NOVA — an arcane shockwave that throws off a ring of bolts, not just the bolts
+        {
+            // THREE nested ground shocks racing outward at different speeds, plus arcane shards kicked up out of the
+            // ground. Reads as a blast expanding THROUGH you rather than the old bare ring of bolts. Deliberately NO dome:
+            // a translucent hemisphere over a boss reads as a SHIELD, which is the opposite of what a nova should say.
+            float nr = Radius + 7f;
+            var arc = new Color(0.62f, 0.36f, 1f);
+            var hot = new Color(0.92f, 0.84f, 1f);
+            Game.I.VfxRing(GlobalPosition, hot, nr * 0.45f, 0.22f);                 // hot core, snaps out first
+            Game.I.VfxRing(GlobalPosition, arc, nr, 0.42f);                         // the shock itself, at the damage radius
+            Game.I.VfxRing(GlobalPosition, arc.Lerp(hot, 0.4f), nr * 1.35f, 0.6f);  // the overrun, trailing past it
+            Game.I.SpawnGroundSpikes(GlobalPosition, nr, 18, arc, 0.4f);            // shards torn out of the ground under him
+            Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Zero, nr, 0.42f, arc);   // allies see the same shock
+            Game.I.Player?.CamKickExternal(0.55f);
             for (int i = 0; i < 16; i++)
             {
                 Vector3 d = Vector3.Forward.Rotated(Vector3.Up, i * Mathf.Tau / 16f); d.Y = -0.18f;
@@ -2445,11 +3192,24 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
             rf.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(ring)) ring.QueueFree(); }));
         }
 
+        if (pat == 8)   // CHARGE: one WIDE lane down his whole run — you dodge by leaving the corridor, so it must read as a corridor
+        {
+            var lane = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(7.2f, 0.05f, reach) }, MaterialOverride = laneMat };
+            lane.Rotation = new Vector3(0, Mathf.Atan2(flatDir.X, flatDir.Z), 0);
+            lane.Position = new Vector3(flatDir.X * reach * 0.5f, groundY, flatDir.Z * reach * 0.5f);
+            lane.Transparency = 0.8f;
+            AddChild(lane);
+            lane.CreateTween().TweenProperty(lane, "transparency", 0.06f, dur).SetEase(Tween.EaseType.In);
+            var cf = lane.CreateTween(); cf.TweenInterval(dur + 0.12f);
+            cf.TweenCallback(Callable.From(() => { if (GodotObject.IsInstanceValid(lane)) lane.QueueFree(); }));
+            return;
+        }
         if (pat == 4) { Ring(new Vector3(flatDir.X * reach, 0f, flatDir.Z * reach), 6.5f); return; }   // pestilence landing circle
         if (pat == 5) { Ring(Vector3.Zero, 8f); return; }                                              // stomp ring around the boss
         if (pat == 6)   // rock throw: red landing circle + a boulder forming above the boss's hands (wind-up anim)
         {
             Ring(new Vector3(flatDir.X * reach, 0f, flatDir.Z * reach), 3f);
+            if (_hollowAnim) return;   // the authored boss cradles a REAL boulder between his raised hands — no stand-in needed
             var rock = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.85f, Height = 1.7f, RadialSegments = 6, Rings = 4 }, MaterialOverride = Game.Toon(new Color(0.42f, 0.38f, 0.34f), 0.95f, 0.35f, 0.05f) };
             rock.Position = new Vector3(0f, Radius * 1.5f, 0f); rock.Scale = Vector3.Zero;
             AddChild(rock);
@@ -2460,6 +3220,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (pat == 7)   // mines: red scatter ring + a green goblin charge glow (wind-up anim)
         {
             Ring(Vector3.Zero, 10f);
+            if (_hollowAnim) return;   // his own arcane hand glow is the caster tell now — the goblin's green charge is gone
             var glow = new MeshInstance3D { Mesh = new SphereMesh { Radius = 0.7f, Height = 1.4f } };
             var gm = Game.ToonEmissive(new Color(0.6f, 0.85f, 0.3f), 2.4f, 0f); gm.Transparency = BaseMaterial3D.TransparencyEnum.Alpha; gm.AlbedoColor = new Color(0.6f, 0.85f, 0.3f, 0.7f);
             glow.MaterialOverride = gm; glow.Position = new Vector3(Radius * 0.6f, Radius * 1.4f, 0f); glow.Scale = Vector3.Zero;
@@ -2497,7 +3258,8 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private static readonly string[] _bossLinesStomp = { "KNEEL!", "SHATTER!", "THE EARTH ANSWERS!", "BE CRUSHED!" };
     private static readonly string[] _bossLinesRock  = { "CATCH!", "BE STILL!", "CRUSH THEM!", "TAKE THIS!" };
     private static readonly string[] _bossLinesMine  = { "TREAD CAREFULLY!", "A GIFT, LITTLE WITCH!", "STEP LIGHTLY!", "SCATTER THEM!" };
-    private string[] BossLines(int pat) => pat switch { 1 => _bossLinesRing, 3 => _bossLinesNova, 4 => _bossLinesPest, 5 => _bossLinesStomp, 6 => _bossLinesRock, 7 => _bossLinesMine, _ => _bossLinesAimed };
+    private static readonly string[] _bossLinesCharge = { "ENOUGH!", "OUT OF MY WAY!", "I WILL BURY YOU!", "STAND STILL!" };
+    private string[] BossLines(int pat) => pat switch { 1 => _bossLinesRing, 3 => _bossLinesNova, 4 => _bossLinesPest, 5 => _bossLinesStomp, 6 => _bossLinesRock, 7 => _bossLinesMine, 8 => _bossLinesCharge, _ => _bossLinesAimed };
 
     private void SayBossLine(int pat, int idx)
     {
@@ -2506,14 +3268,15 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     }
 
     private float _critVoxCd = 0f;
-    private static readonly string[] _critHeadLines = { "AHH, MY GOBLINS!", "NOT MY SKULL!", "MY HEAD!", "ARGH — MY MOONS!" };
-    private static readonly string[] _critGobNormal = { "OW! YOU LITTLE—", "CURSE YOU, WITCH!", "MY EYE, MY EYE!", "RUDE!" };
-    private static readonly string[] _critGobZombie = { "UUUGHHH...", "OOOUCHH...", "GRAAAHHH...", "hhhngghh..." };
+    // (REWORK) the shoulder goblins are gone with the old procedural body — HE takes every hit and HE does all the talking.
+    // Head and both shoulders are still crit zones; they just no longer have their own little voices.
+    private static readonly string[] _critHeadLines = { "NOT MY SKULL!", "MY HEAD!", "ARGH — MY MOONS!", "MY FACE, WITCH!" };
+    private static readonly string[] _critShoulderLines = { "MY SHOULDER!", "AAARGH!", "YOU'LL PAY FOR THAT!", "CURSE YOU, WITCH!" };
     private static readonly string[] _bossDeathLines = { "THE OTHER MOONS WILL TAKE YOU...", "THE OTHER MOONS... WILL AVENGE ME...", "YOU CANNOT KILL... ALL OF US...", "THE MOONS... ARE MANY..." };
     private static readonly string[] _bossTaunts = { "I WANT THE WITCHES' HEADS ON A STAKE!", "BURN THE WITCHES!", "BRING ME THEIR BONES!", "SWARM THEM, MY CHILDREN!", "TEAR THEM APART!", "NO MERCY FOR THE COVEN!", "DROWN THEM IN NUMBERS!" };
     public void Taunt() { SayBossVox(_bossTaunts[GD.RandRange(0, _bossTaunts.Length - 1)], new Color(1f, 0.6f, 0.2f), 1.5f); }
 
-    // which high zone got hit: 0 none, 1 head, 2 left(zombie goblin), 3 right(normal goblin)
+    // which high zone got hit: 0 none, 1 head, 2 left shoulder, 3 right shoulder
     public int CritZone(Vector3 hitPos)
     {
         if (!IsBoss || _type != "boss") return 0;
@@ -2523,19 +3286,15 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (lp.X > Radius * 0.4f) return 3;
         return 1;
     }
-    // a crit landed high — the boss / the struck goblin yelps (throttled)
+    // a crit landed high — the boss yelps (throttled)
     public void CritHitReact(Vector3 hitPos)
     {
         if (_critVoxCd > 0f) return;
         int z = CritZone(hitPos);
         if (z == 0) return;
         _critVoxCd = 2.2f;
-        switch (z)
-        {
-            case 2: SayBossVox(_critGobZombie[GD.RandRange(0, _critGobZombie.Length - 1)], new Color(0.55f, 0.9f, 0.3f), 1.0f); break;
-            case 3: SayBossVox(_critGobNormal[GD.RandRange(0, _critGobNormal.Length - 1)], new Color(1f, 0.85f, 0.25f), 1.0f); break;
-            default: SayBossVox(_critHeadLines[GD.RandRange(0, _critHeadLines.Length - 1)], new Color(1f, 0.4f, 0.35f), 1.0f); break;
-        }
+        var lines = z == 1 ? _critHeadLines : _critShoulderLines;
+        SayBossVox(lines[GD.RandRange(0, lines.Length - 1)], new Color(1f, 0.4f, 0.35f), 1.0f);
     }
 
     private void SayBossVox(string line, Color col, float hold)
@@ -2565,6 +3324,19 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         SayBossLine(pat, idx);
         Game.I.Sfx?.BossTell(GlobalPosition);
         _bossCharging = true; _bossChargeT = dur; _bossChargeDur = dur;   // fills the attack-timer bar on the client too
+        _bossPatPending = pat; _bossFlatDir = flat;   // (FIX) the proxy needs the pattern for the HUD label AND the anim/gesture
+        BeginBossAnim(pat, dur);                      // …so clients see the same clip, gesture and hand glow as the host
+    }
+
+    // client proxy: mirror the host's phase/untouchable state so the aura, the unsteady walk and the HUD bar all match
+    public void RemoteBossPhase2(int phase, bool invuln)
+    {
+        bool wasInvuln = Invuln;
+        Invuln = invuln;
+        if (phase >= 2 && BossPhase < 2) { BossPhase = 2; _creature?.BossDie(); }
+        // the aura ignites the moment he becomes touchable again — i.e. once he's actually back on his feet, matching
+        // the host's stage 2 -> 3 transition (the host has no way to stream that sub-state, and doesn't need to)
+        if (BossPhase == 2 && wasInvuln && !invuln) { _creature?.BossEndClip(); _creature?.SetPhase2(); }
     }
 
     // ---- zapper: telegraphed lightning that drains half your shield ----
@@ -2598,6 +3370,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         {
             _zapTarget = _tgt; _zapTarget.Y = 0f;
             _zapTele = 1.05f; _fireCd = _fireEvery * Pace;
+            BeginCastAnim("castcharge", _zapTele, _fireCd);   // (NEW) the withered stunner's charged-spell clip IS the telegraph; the bolt lands on its release frame
             _zapMark = MakeZapMark(_zapTarget);
             Game.I.NetMgr?.BroadcastZap(_zapTarget, false);   // allies see the telegraph
         }
@@ -2657,6 +3430,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         else if (_hexCd <= 0f && dist < _range)
         {
             _hexTele = 1.0f; _hexCd = _fireEvery * Pace;
+            BeginCastAnim("cast", _hexTele, _hexCd);   // (NEW) same mage cast the healer/empowerer use — the curse lands on its release frame
             var cc = DamageTypes.Col(DamageType.Curse);
             Game.I.VfxRing(_tgt, cc, 3.5f, 1.0f);                              // telegraph: ring at the target — dash out before it lands
             Game.I.NetMgr?.BroadcastVfx(0, _tgt, Vector3.Up, 3.5f, 1.0f, cc); // all peers see it
@@ -2687,6 +3461,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         else if (_hexCd <= 0f && dist < _range)
         {
             _hexTele = 1.1f; _hexCd = _fireEvery * Pace;
+            BeginCastAnim("cast", _hexTele, _hexCd);   // (NEW) the dispel pulse rides the same mage cast
             var cc = new Color(0.6f, 0.3f, 0.85f);
             Game.I.VfxRing(_tgt, cc, 3.2f, 1.0f);                              // telegraph: dispel ring — break line of sight or eat the strip
             Game.I.NetMgr?.BroadcastVfx(0, _tgt, Vector3.Up, 3.2f, 1.0f, cc); // all peers see it
@@ -2704,18 +3479,23 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     {
         // stationary buffer — hastes nearby foes; you decide whether to kill it first
         _totemTick -= dt;
-        if (_totemTick <= 0f)
+        if (_totemTick <= 0f && _castWindT <= 0f)
         {
-            _totemTick = 0.9f;
-            var gc = new Color(1f, 0.8f, 0.35f);
-            Game.I.VfxRing(GlobalPosition, gc, 14f, 0.5f);                            // visible empower pulse (shows its radius)
-            Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Up, 14f, 0.5f, gc);
-            foreach (var e in Game.I.Enemies.ToArray())
-            {
-                if (e == null || e == this || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
-                if (e._behav == EBehav.Totem) continue;
-                if (GlobalPosition.DistanceTo(e.GlobalPosition) < 14f) e.ApplyHaste(1.1f);
-            }
+            _totemTick = 1.6f;   // (SLOWER) was 0.9 — the pulse now rides a real cast animation, so give the cast room to read
+            BeginCast("cast", 0.9f, 3, _totemTick);   // (NEW) the mage cast throws the empower pulse out
+        }
+    }
+
+    private void TotemPulse()
+    {
+        var gc = new Color(1f, 0.8f, 0.35f);
+        Game.I.VfxRing(GlobalPosition, gc, 14f, 0.5f);                            // visible empower pulse (shows its radius)
+        Game.I.NetMgr?.BroadcastVfx(0, GlobalPosition, Vector3.Up, 14f, 0.5f, gc);
+        foreach (var e in Game.I.Enemies.ToArray())
+        {
+            if (e == null || e == this || e.Dead || !GodotObject.IsInstanceValid(e)) continue;
+            if (e._behav == EBehav.Totem) continue;
+            if (GlobalPosition.DistanceTo(e.GlobalPosition) < 14f) e.ApplyHaste(1.9f);   // (was 1.1) outlasts the slower pulse cadence, so the aura stays unbroken
         }
     }
     public void ApplyHaste(float dur) { _hasteT = Mathf.Max(_hasteT, dur); }
@@ -2802,6 +3582,9 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     public override void _ExitTree()
     {
         if (_zapMark != null && GodotObject.IsInstanceValid(_zapMark)) _zapMark.QueueFree();
+        // (DOOM WALKER) a walker freed mid-errand — despawn, relocate, run end — must give its slot back, or the static
+        // counter leaks and walkers stop spawning for the rest of the session.
+        if (_doomWalking) { _doomWalking = false; _doomWalkersLive = Mathf.Max(0, _doomWalkersLive - 1); }
     }
 
     private void FireAt(Player p, float speed, float dmg, float radius)
@@ -2814,9 +3597,12 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
 
     private void SpawnBolt(Vector3 vel, float dmg, float radius)
     {
-        var tint = Col.Lerp(new Color(1, 1, 1), 0.25f);
+        // (PUPPET) a turned caster/archer fires its OWN projectile at its OWN ally — the shot just changes sides, and the
+        // curse tint is the tell that it isn't coming for you. This is the half of puppetry that isn't free: EnemyBolt
+        // had no owner and no enemy collision, so both live on the bolt itself.
+        var tint = _tgtIsEnemy ? DamageTypes.Col(DamageType.Curse).Lerp(Colors.White, 0.2f) : Col.Lerp(new Color(1, 1, 1), 0.25f);
         var origin = GlobalPosition + new Vector3(0, Radius * 0.6f, 0) + vel.Normalized() * (Radius + 0.5f);
-        var b = new EnemyBolt { Vel = vel, Dmg = dmg, Radius = radius, Tint = tint };
+        var b = new EnemyBolt { Vel = vel, Dmg = dmg, Radius = radius, Tint = tint, HitsEnemies = _tgtIsEnemy, OwnerPeer = _puppetOwner, Shooter = this };
         Game.I.AddChild(b);
         b.GlobalPosition = origin;
         Game.I.NetMgr?.BroadcastBolt(origin, vel, radius, tint);   // allies see a visual copy
@@ -3008,8 +3794,11 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (!marked && _markRing != null) { _markRing.QueueFree(); _markRing = null; }
         if (_markRing != null) _markRing.RotateY(dt * 2.5f);   // spin flat (NEW: was RotateZ)
 
-        // (NEW) cursed: a spinning curse ring at the feet + an overhead stack counter
-        bool cursed = Cursed;
+        // (NEW) cursed: a spinning curse ring at the feet + an overhead counter
+        // (DOOM) a foe carrying a bank shows the same furniture — the ring reads "she has hold of this one" and the label
+        // carries the READ the mechanic lives or dies on: how big the bomb is, and how long until it goes. Without a
+        // legible countdown the execute lands as a random death instead of a payoff you watched coming.
+        bool cursed = Cursed || Doomed;
         if (cursed && _curseRing == null)
         {
             _curseRing = new MeshInstance3D { Mesh = new TorusMesh { InnerRadius = Radius * 1.05f, OuterRadius = Radius * 1.28f } };
@@ -3026,7 +3815,10 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
                 _curseLabel = new Godot.Label3D { FontSize = 40, OutlineSize = 12, PixelSize = 0.006f, Billboard = BaseMaterial3D.BillboardModeEnum.Enabled, NoDepthTest = true, Modulate = DamageTypes.Col(DamageType.Curse).Lerp(Colors.White, 0.4f), OutlineModulate = new Color(0, 0, 0, 1f), Position = new Vector3(0, Radius * 2.0f, 0) };
                 AddChild(_curseLabel);
             }
-            _curseLabel.Text = "☠" + Mathf.Max(1, Mathf.RoundToInt(CurseStacks));   // just the stack count
+            // (DOOM) no overhead number — the bank is a portion of the HEALTH BAR and is drawn there (Hud.DrawEnemyBars).
+            // The foot ring stays, because "she has hold of this one" is worth reading from any angle.
+            if (Doomed) { if (_curseLabel != null) { _curseLabel.QueueFree(); _curseLabel = null; } }
+            else _curseLabel.Text = "☠" + Mathf.Max(1, Mathf.RoundToInt(CurseStacks));   // legacy curse-stack counter, until the old curse abilities are retired
         }
         else if (_curseLabel != null) { _curseLabel.QueueFree(); _curseLabel = null; }
 
@@ -3077,12 +3869,24 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         Game.I.Sfx?.DamageTick(at, false);
     }
 
-    public void Hurt(float dmg, DamageType type = DamageType.Lunar, bool fromCombo = false, bool crit = false)
+    private ulong _winceNextMs = 0;   // (WINCE) per-enemy rate-limit so a horde doesn't flinch in lockstep (timestamp — no per-frame timer needed)
+    public void Hurt(float dmg, DamageType type = DamageType.Lunar, bool fromCombo = false, bool crit = false, bool direct = false)
     {
         if (Dead) return;
+        if (_doomWalking) return;   // (DOOM WALKER) already a corpse — it can't be killed twice, credited twice, or knocked off its errand
         // (NEW PHALANX) archers are untouchable for exactly as long as their bearer's ward stands — the ward IS the
         // fight. Bounce the shot with a spark instead of a number so it reads as "blocked", not "missed".
         if (IsArcher && WardGuarded) { WardDeflect(); return; }
+        // (HOLLOW MOON PHASE 2) untouchable while he's getting back up and for the whole vortex spin. Bounce the hit with
+        // a spark instead of a number so it reads as BLOCKED, not missed — the HUD bar says the same thing.
+        if (Invuln) { WardDeflect(); return; }
+        // (WINCE) a DIRECT hit (a landed bolt/melee — NOT an AoE field or a DoT tick) makes an authored biped flinch. Purely
+        // cosmetic (no movement/AI effect), a random variant each time, and rate-limited per enemy so hordes don't sync up.
+        if (direct && dmg > 0f && AuthBiped)
+        {
+            ulong nowMs = Time.GetTicksMsec();
+            if (nowMs >= _winceNextMs) { _creature.Wince((int)(GD.Randi() % 4)); _winceNextMs = nowMs + (ulong)(450 + GD.Randi() % 500); }
+        }
         // (ECLIPSE) EVERY lunar hit the local eclipsed Lunar witch lands detonates a shadow-nova. Hooked HERE (not OnHitCore)
         // so it catches ALL her lunar damage — bolts, charged, finishers, mods, fields, projectiles — and runs on HER machine
         // (host or client: e.Hurt is called on the attacker's side), so it's MP-correct. The busy flag stops recursion.
@@ -3105,7 +3909,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (pl != null) dmg *= pl.LunarNightMul(type);   // Lunar Witch: ALL lunar damage waxes stronger at night
         _lastType = type; _lastCombo = fromCombo;
         float dealt = dmg * MarkAmp;
-        if (CurseT > 0f && (type == _curseBonusType || (int)type == _curseBonusType2)) dealt *= _curseBonusMul;   // (NEW) cursed foes take extra from the curse-bonus type(s) — Curse by default; Cursebrand adds a 2nd
+        if ((CurseT > 0f || Doomed) && (type == _curseBonusType || (int)type == _curseBonusType2)) dealt *= _curseBonusMul;   // (NEW) cursed foes take extra from the curse-bonus type(s) — Curse by default; Cursebrand adds a 2nd. (DOOM) a DOOMED foe counts too, which is what keeps Virulence/Torment/Doombrand live now that strings are gone
         if (_armorDR > 0f && !crit) dealt *= (1f - _armorDR);                 // armored: crits punch through
         // (NEW PHALANX) every point you land on the bearer feeds the ward pool first — its own HP is untouchable until
         // the barrier falls. This is the tanky "break the shield" phase; crits are still your best tool against it.
@@ -3123,9 +3927,17 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (_shield > 0f) { float s = Mathf.Min(_shield, dealt); _shield -= s; dealt -= s; }   // shielded soak
         // (REMOVED the frozen "blue bank" — frozen foes now take NORMAL damage; a charged-RMB spear SHATTERS them for a flat burst + execute, no banking step)
         Hp -= dealt;
+        NoteChargeThreshold();   // (HOLLOW MOON) crossing another 20% of his pool arms the head-down charge
         if (dealt > 0f && _lastAttackerPeer != 0) _damagers.Add(_lastAttackerPeer);   // (NEW) record every damage contributor → all earn a soul when this foe dies
         DamageInvestigate();   // (NEW) ANY damage (beam / AoE / DoT, not just projectiles) makes an idle zombie investigate the source
         Game.I.NoteEnemyDamage(dealt);   // (NEW) feeds the boss-wave DPS director + heat
+        // (EFFIGY) a share of everything she does to anything ELSE is banked on the doll's host. Gated to damage this
+        // player actually dealt, and tagged at the deepest generation so the feed can never seed a detonation chain.
+        // NOTE: host-side and single-player-attributed for now — per-peer effigies land with the Doom MP pass.
+        if (dealt > 0.5f && !_doomGuard && Game.I.Player is Player efp && efp.EffigyT > 0f && efp.EffigyTgt != null
+            && efp.EffigyTgt != this && !efp.EffigyTgt.Dead && GodotObject.IsInstanceValid(efp.EffigyTgt)
+            && _lastAttackerPeer == Game.I.LocalPeer)
+            efp.EffigyTgt.AddDoom(dealt * efp.EffigyShare, 0, DoomMaxGen);
         if (CurseGroup != 0 && !_curseShareGuard && _curseShareFrac > 0f && dealt > 0.5f)   // (NEW) tethered curse group shares this damage instance
         {
             ulong fr = Engine.GetProcessFrames();
@@ -3162,12 +3974,12 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
 
     // (NEW) owner-attributed damage — DoT ticks run on the HOST but may belong to a client's spell, so stamp the source
     // peer around the Hurt call. This keeps both the kill-contribution set AND the kill credit pointed at the DoT's caster.
-    private void HurtFrom(long owner, float dmg, DamageType type, bool fromCombo = false)
+    private void HurtFrom(long owner, float dmg, DamageType type, bool fromCombo = false, bool crit = false)
     {
-        if (Game.I == null) { Hurt(dmg, type, fromCombo); return; }
+        if (Game.I == null) { Hurt(dmg, type, fromCombo, crit); return; }
         long prev = Game.I.AttackerPeer;
         Game.I.AttackerPeer = owner != 0 ? owner : Game.I.LocalPeer;
-        Hurt(dmg, type, fromCombo);
+        Hurt(dmg, type, fromCombo, crit);
         Game.I.AttackerPeer = prev;
     }
 
@@ -3234,6 +4046,132 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
                 if (o != null && !o.Dead && GodotObject.IsInstanceValid(o) && o.CurseGroup == grp) { o.CurseGroup = 0; }
         if (CurseStacks <= 0f) CurseT = 0f;
         Game.I.SpawnGroundSigil(GlobalPosition, 2.5f, DamageTypes.Col(DamageType.Curse));
+    }
+
+    // ---- DOOM ----------------------------------------------------------------------------------------------------
+    // The HP this foe cannot be executed past in one go. 0 for everything ordinary (so an execute just kills it), and
+    // the boss's next authored gate for him: phase 1 arms a head-down charge every 20% (NoteChargeThreshold), phase 2
+    // arms the untouchable vortex-spin every 1/3. Punching him to the next gate hands the fight back to authored
+    // content instead of deleting it — and it means the execute is never switched off, only re-aimed.
+    public float DoomFloorHp()
+    {
+        if (_type != "boss" || Dead || MaxHp <= 0f) return 0f;
+        float band = BossPhase == 1 ? 0.2f : (1f / 3f);
+        int idx = Mathf.CeilToInt(Hp / MaxHp / band - 0.0001f) - 1;   // the next boundary STRICTLY below where he is now
+        return Mathf.Max(0f, idx * band * MaxHp);
+    }
+
+    // Bank Doom. `gen` is the chain depth (0 = a player applied it); `owner` is the peer credited when it goes off.
+    public void AddDoom(float amt, long owner = 0, int gen = 0)
+    {
+        if (amt <= 0f) return;
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 10, amt, 0f, 0f); return; }   // clients route to the host, which owns the bank
+        if (Dead || Invuln) return;                                                    // untouchable windows swallow it, like every other damage source
+        DoomBank += amt;
+        DoomT = DoomFuse;                                    // every application refreshes the fuse — she is the one who decides when it ends
+        // carry the caster's curse-bonus profile the way AddCurse does, so her "+% damage to doomed" perks actually land
+        if (Game.I != null && Game.I.Player is Player dp)
+        {
+            _curseBonusType = dp.CurseBonusType; _curseBonusMul = dp.CurseBonusMul; _curseBonusType2 = dp.CurseBonusType2;
+            _doomSpreadMul = dp.DoomSpreadMul();   // (FRAY) stamped at application so a fuse pop spreads by it too
+            _doomSpreadR = dp.DoomSpreadRadius;    // …and her B column's blast reach travels with the bank the same way
+        }
+        _doomGen = Mathf.Max(_doomGen, gen);                 // a bank fed by a splash carries the deeper generation, so it can't restart the chain
+        if (owner != 0) _doomOwner = owner;
+        else if (_doomOwner == 0 && Game.I != null) _doomOwner = Game.I.AttackerPeer != 0 ? Game.I.AttackerPeer : Game.I.LocalPeer;
+        if (DoomBank >= Hp - DoomFloorHp()) DetonateDoom();   // the execute: it's covered the distance, so don't make the player wait out the fuse
+    }
+
+    // (PUPPET) turn this foe on one of its own for `dur`. Bosses are never turned — they're far too authored to hand the
+    // wheel to — but they can still be doomed, which is what keeps her mechanic alive in a fight with nothing to puppet.
+    public void Puppet(Enemy at, float dur, long owner = 0, float doomFeed = 0f, bool finale = false)
+    {
+        if (at == null || at == this || at.Dead || !GodotObject.IsInstanceValid(at)) return;
+        // a client's Danse Macabre / Turncoat must still turn foes — route it to the host, which owns every enemy's AI.
+        // The victim travels as its NetId in a float, which is exact well past any id this game will ever mint.
+        if (Remote) { Game.I.NetMgr?.ReportStatus(NetId, 11, at.NetId, dur, doomFeed); return; }
+        if (Dead || IsBoss) return;
+        PuppetTgt = at;
+        PuppetT = Mathf.Max(PuppetT, dur);
+        _puppetFeed = Mathf.Max(_puppetFeed, doomFeed);
+        _puppetFinale |= finale;
+        _puppetOwner = owner != 0 ? owner : (Game.I != null ? (Game.I.AttackerPeer != 0 ? Game.I.AttackerPeer : Game.I.LocalPeer) : 0);
+    }
+
+    // Let the carried blast go where it now stands, then finish dying for real.
+    private void ReleaseDoomWalk()
+    {
+        _doomWalking = false;
+        _doomWalkersLive = Mathf.Max(0, _doomWalkersLive - 1);
+        float payload = _doomWalkPayload; _doomWalkPayload = 0f;
+        long owner = _doomOwner;
+        Vector3 at = GlobalPosition;
+        PuppetT = 0f; PuppetTgt = null;
+        if (payload > 0.01f)
+            foreach (var o in Game.I.Enemies.ToArray())
+            {
+                if (o == null || o == this || o.Dead || o.Remote || !GodotObject.IsInstanceValid(o)) continue;
+                if (new Vector2(o.GlobalPosition.X - at.X, o.GlobalPosition.Z - at.Z).Length() > _doomSpreadR * _doomSpreadMul + o.Radius) continue;
+                o.AddDoom(payload, owner, DoomMaxGen);   // delivered at the deepest generation — arriving must not restart a chain
+            }
+        Game.I.SpawnGroundSigil(at, 3.4f, DamageTypes.Col(DamageType.Curse));
+        Game.I.NetMgr?.BroadcastVfx(58, at, Vector3.Up, 3.6f, 0f, DamageTypes.Col(DamageType.Curse));
+        Game.I.Sfx?.CurseCrush(at);
+        Hp = 0f;
+        Die();
+    }
+
+    // Damage one foe deals to another under her control. Public so a turned archer's BOLT routes through the same
+    // attribution path as a turned brute's slash. Typed Curse deliberately: it's her doing, and it feeds her own mechanic.
+    public void PuppetHurt(long owner, float dmg) => HurtFrom(owner, dmg, DamageType.Curse, false);
+
+    // Set it off. Deals the bank (clamped so it can't punch past the floor in one go), splashes a share around, and
+    // clears. `frac` is how much of the bank goes — her charged release picks 10%→100%; the fuse always passes 1.
+    public void DetonateDoom(float frac = 1f, bool crit = false, float spreadMul = 1f)
+    {
+        if (Remote || Dead || _doomGuard || DoomBank <= 0.01f) return;
+        ulong fr = Engine.GetProcessFrames();
+        if (fr != _doomFrame) { _doomFrame = fr; _doomBudget = 24; _doomWarned = false; }   // per-frame ceiling on detonations…
+        if (_doomBudget <= 0)
+        {
+            if (!_doomWarned) { _doomWarned = true; GD.PushWarning($"[perf] doom detonation budget exhausted this frame ({Game.I.Enemies.Count} enemies) — deferring the rest to the next frame"); }
+            DoomT = Mathf.Max(DoomT, 0.02f);   // …and the overflow is DEFERRED, not dropped — it still all goes off, just spread over frames
+            return;
+        }
+        _doomBudget--;
+        float take = Mathf.Clamp(frac, 0f, 1f) * DoomBank;
+        DoomBank -= take;
+        if (DoomBank <= 0.01f) { DoomBank = 0f; DoomT = 0f; } else DoomT = DoomFuse;   // a partial release re-arms the fuse on the remainder
+        int gen = _doomGen;
+        long owner = _doomOwner;
+        var col = DamageTypes.Col(DamageType.Curse);
+        Vector3 at = GlobalPosition;
+        // The splash is staged BEFORE the killing blow, because if this detonation kills, Die() hands the payload to a
+        // walker instead of dropping it here — the corpse carries it into the crowd rather than wasting it on empty ground.
+        float spread = Mathf.Clamp(spreadMul * _doomSpreadMul, 0.2f, 4f);
+        float splash = gen < DoomMaxGen ? take * Mathf.Min(0.6f, DoomSplashFrac * spread) : 0f;
+        float splashR = _doomSpreadR * spread;
+        int seedCap = Game.I != null && Game.I.Player != null ? Mathf.Max(2, Game.I.Player.MaxLinks) : 6;   // her B column = how many a blast seeds
+        _doomWalkPayload = splash;
+        _doomGuard = true;
+        HurtFrom(owner, Mathf.Min(take, Mathf.Max(0f, Hp - DoomFloorHp())), DamageType.Curse, true, crit);   // clamped: never overshoot the next gate. The whole lump crits as one, which is the premium that makes banking worth it
+        _doomGuard = false;
+        if (!_doomWalking && splash > 0.01f)   // it survived (or no walker slot was free) → the splash lands right here
+        {
+            _doomWalkPayload = 0f;
+            int seeded = 0;
+            foreach (var o in Game.I.Enemies.ToArray())
+            {
+                if (seeded >= seedCap) break;
+                if (o == null || o == this || o.Dead || o.Remote || !GodotObject.IsInstanceValid(o)) continue;
+                if (new Vector2(o.GlobalPosition.X - at.X, o.GlobalPosition.Z - at.Z).Length() > splashR + o.Radius) continue;
+                o.AddDoom(splash, owner, gen + 1);
+                seeded++;
+            }
+        }
+        Game.I.SpawnGroundSigil(at, Mathf.Max(2f, splashR), col);   // the sigil IS the tell for how far this blast carried
+        Game.I.NetMgr?.BroadcastVfx(58, at, Vector3.Up, Mathf.Max(2f, splashR), 0f, col);
+        Game.I.Sfx?.CurseCrush(at);
     }
 
     // add freeze stacks (routes to host if a client applies it). Reaching the HP-scaled threshold encases the enemy in ice.
@@ -3349,6 +4287,22 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
     private readonly System.Collections.Generic.HashSet<long> _damagers = new();   // (NEW) EVERY peer that dealt any damage to this foe — for contribution-based soul credit on death
     private void Die()
     {
+        // (HOLLOW MOON) his first "death" is a fake-out — no orbs, no rewards, no lair payout. Intercepted HERE rather than
+        // in Hurt so every kill path (bolts, shatter, execute, Explode) funnels through it.
+        if (_type == "boss" && BossPhase == 1 && !Remote) { Hp = 0f; EnterPhase2(); return; }
+        // (DOOM WALKER) …and for the same reason, a foe that died holding an undelivered blast gets one last walk. It
+        // keeps its own gait and its own animations — it just has somewhere to be.
+        if (!Remote && !_doomWalking && _doomWalkPayload > 0.01f && _doomWalkersLive < DoomWalkerCap && !IsBoss)
+        {
+            var carry = NearestAlly();
+            if (carry != null)
+            {
+                _doomWalking = true; _doomWalkT = 2f; _doomWalkersLive++;
+                Hp = 1f;                                   // stay upright long enough to deliver; Hurt ignores it from here
+                Puppet(carry, 2f, _doomOwner);             // its own legs carry it — the same target override the living use
+                return;
+            }
+        }
         Dead = true;
         Fx.SparkBurst(GlobalPosition + Vector3.Up * Radius * 0.5f, Vector3.Up, Col.Lerp(Colors.White, 0.3f), Radius * 0.5f, 8);   // (PHASE 3) GPU shard death-pop
         Game.I?.CreditKill(_lastAttackerPeer, Game.I != null && Game.I.IsNight);   // (NEW) exact MP kill attribution (host/solo only reaches Die)
@@ -3366,6 +4320,7 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         if (_splitter) { for (int i = 0; i < 2; i++) Game.I.SpawnEnemyAt("spawnling", GlobalPosition); }   // splitter: spawn two (host → synced)
         Game.I.Player?.OnBloodAuraKill(GlobalPosition);        // local blood witch: ANY death in her aura banks a stack
         Game.I.NetMgr?.BroadcastEnemyDeath(GlobalPosition);   // ally blood witches check their own aura too
+        if (!Remote) Game.I.NetMgr?.NoteEnemyDeath(NetId);    // (MP FIX) the id goes out in the next snapshot; clients reap ONLY on this, since absence now just means "capped out of the packet"
         // a bleeding victim ruptures; a ROT victim also spreads the bleed to nearby foes (Blood Rot chains)
         if (_bleedT > 0f)
         {
@@ -3449,14 +4404,20 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         QueueFree();
     }
 
-    // THE HOLLOW MOON dies: a death cry + a final line, his shoulder goblins burst (red + green), he topples onto
-    // his back, then his hollow body ruptures in rot & blood as he screams. Frees itself when the sequence ends.
+    // THE HOLLOW MOON dies: a death cry + a final line, then he pitches forward and goes down (the authored
+    // Shot_and_Fall_Forward clip), his hollow body rupturing in rot & blood mid-fall. Frees itself when the sequence ends.
     private void BossDeathSequence()
     {
         Game.I.Sfx?.BossRoar(GlobalPosition);   // opening death cry
         SayBossVox(_bossDeathLines[GD.RandRange(0, _bossDeathLines.Length - 1)], new Color(1f, 0.35f, 0.35f), 3f);
 
-        if (_creature != null)
+        if (_hollowAnim)
+        {
+            _dashT = 0f;
+            _creature.BossDie();                // the fall-forward clip drives the whole topple; no tween needed
+            Game.I.SpawnBloodMist(GlobalPosition + new Vector3(0f, Radius, 0f), Radius * 1.2f);
+        }
+        else if (_creature != null)
         {
             var zp = _creature.ShoulderPos(true);   // left = zombie goblin → GREEN blood mist
             var np = _creature.ShoulderPos(false);  // right = non-zombie goblin → RED blood
@@ -3486,3 +4447,4 @@ public partial class Enemy : Node3D, Grove.Dev.Ai.IAiObservable
         GetTree().CreateTimer(2.7f).Timeout += () => { if (GodotObject.IsInstanceValid(this)) QueueFree(); };
     }
 }
+

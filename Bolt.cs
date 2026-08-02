@@ -404,7 +404,7 @@ public partial class Bolt : Node3D
                     if (!bcrit && Src != null && e.IsCritZone(GlobalPosition)) { bdmg *= Src.CritMult(); bcrit = true; }   // (NEW) head / shoulder-goblin hits always crit THE HOLLOW MOON
                     if (bcrit) e.CritHitReact(GlobalPosition);   // boss/goblin yelp (crit ping is played centrally in Hurt)
                     if (FrostSpear && FrostSpearFull && e.Frozen) { e.ShatterInstant(); Game.I.MyStats.Highlight++; }   // (NEW) full-charge / Glacial Impaler shatters a frozen foe (+ Frost highlight)
-                    else e.Hurt(bdmg, DType, FromCombo, bcrit);   // the spear just damages — the BEAM does the freezing
+                    else e.Hurt(bdmg, DType, FromCombo, bcrit, direct: true);   // DIRECT projectile impact → triggers the hurt wince; the BEAM does the freezing
                     if (Vel.LengthSquared() > 0.01f) e.HitFrom(GlobalPosition - Vel.Normalized() * 25f);   // (NEW) idle zombie turns + investigates up the shot line
                     {   // (NEW) impact mark ON the enemy surface, facing outward, parented so it moves with them
                         var mn = GlobalPosition - e.GlobalPosition; mn.Y *= 0.35f;
@@ -415,7 +415,7 @@ public partial class Bolt : Node3D
                     if (Poison > 0f) e.Poison(Poison, PoisonDur);   // Verdant thorns: additive poison + slow
                     if (RootOnHit > 0f) e.Root(RootOnHit);          // full-charge thorn roots
                     Src?.OnHit(e, e.Dead, this);
-                    if (MarkOnHit > 0f) e.Mark(3f, MarkOnHit, 0);   // (OVERHAUL) Conduit Swarm: leave a conduit mark
+                    if (MarkOnHit > 0f) e.MarkConduit(3f);   // (OVERHAUL) Conduit Swarm: leave a real CONDUIT mark (was a generic hex Mark — the "conduit" name now matches the code)
                     if (Arc > 0 && !_arced)   // (OVERHAUL) Living Current: chain to nearby un-hit foes on hit
                     {
                         _arced = true; Enemy prev = e;
@@ -426,7 +426,7 @@ public partial class Bolt : Node3D
                                 if (o != null && !o.Dead && GodotObject.IsInstanceValid(o) && !_hit.Contains(o.GetInstanceId())) { float dd = prev.GlobalPosition.DistanceTo(o.GlobalPosition); if (dd < bd) { bd = dd; nxt = o; } }
                             if (nxt == null) break;
                             _hit.Add(nxt.GetInstanceId());
-                            nxt.Hurt(ArcDmg, DType, FromCombo);
+                            nxt.Hurt(ArcDmg, DType, FromCombo, false, direct: true);   // chain-arc is a direct strike too
                             Game.I.SpawnArcaneLightning(new List<Vector3> { prev.GlobalPosition + Vector3.Up, nxt.GlobalPosition + Vector3.Up }, 0.6f);
                             prev = nxt;
                         }
